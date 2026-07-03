@@ -1,0 +1,20 @@
+{
+  "Name": "SVSAP Machine Energy",
+  "Author": "Koizumi",
+  "Version": "1.2.0-alpha.2",
+  "Description": "Energy storage, generators, and powered machine systems for Stardew Valley Storage and Automation Project.",
+  "UniqueID": "Koizumi.SVSAPME",
+  "EntryDll": "SVSAPME.dll",
+  "MinimumApiVersion": "4.5.2",
+  "MinimumGameVersion": "1.6.15",
+  "Dependencies": [
+    {
+      "UniqueID": "Koizumi.SVSAP",
+      "MinimumVersion": "1.2.0-alpha.2",
+      "IsRequired": true
+    }
+  ],
+  "UpdateKeys": [
+    "GitHub:yuzeis/SVSAP-Machine-Energy"
+  ]
+}

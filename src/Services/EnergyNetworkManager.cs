@@ -1,0 +1,202 @@
+using Koizumi.SVSAP.Api;
+using Koizumi.SVSAPME.Api;
+using SVSAPME.Content;
+using SVSAPME.Models;
+using StardewModdingAPI;
+using StardewValley;
+
+namespace SVSAPME.Services;
+
+internal sealed class EnergyNetworkManager
+{
+    private readonly MachineStateRepository repository;
+    private readonly MachineRegistryService registry;
+    private readonly Func<ISvsapApi?> getSvsapApi;
+    private readonly IMonitor monitor;
+
+    public EnergyNetworkManager(
+        MachineStateRepository repository,
+        MachineRegistryService registry,
+        Func<ISvsapApi?> getSvsapApi,
+        IMonitor monitor)
+    {
+        this.repository = repository;
+        this.registry = registry;
+        this.getSvsapApi = getSvsapApi;
+        this.monitor = monitor;
+    }
+
+    public bool IsHostAuthority => Context.IsWorldReady && Context.IsMainPlayer;
+
+    public bool TryGetNetworkEnergy(Guid svsapNetworkId, out long storedWh, out long capacityWh, out SvsapmeEnergyErrorCode code)
+    {
+        storedWh = 0;
+        capacityWh = 0;
+
+        var cells = this.GetLinkedEnergyCells(svsapNetworkId).ToList();
+        if (cells.Count == 0)
+        {
+            code = SvsapmeEnergyErrorCode.NetworkUnknown;
+            return false;
+        }
+
+        foreach (var cell in cells)
+        {
+            capacityWh += Math.Max(0, cell.CapacityWh);
+            storedWh += Math.Clamp(cell.StoredWh, 0, Math.Max(0, cell.CapacityWh));
+        }
+
+        code = SvsapmeEnergyErrorCode.None;
+        return true;
+    }
+
+    public bool TryDepositWh(
+        Guid svsapNetworkId,
+        long amountWh,
+        string ownerModId,
+        string reason,
+        out long acceptedWh,
+        out SvsapmeEnergyErrorCode code,
+        out string message)
+    {
+        acceptedWh = 0;
+        if (!this.IsHostAuthority)
+            return Fail(SvsapmeEnergyErrorCode.NotHost, "Energy writes are host-authoritative.", out code, out message);
+
+        if (amountWh <= 0)
+            return Fail(SvsapmeEnergyErrorCode.InternalError, "Deposit amount must be positive.", out code, out message);
+
+        var cells = this.GetLinkedEnergyCells(svsapNetworkId)
+            .OrderBy(cell => cell.CapacityWh)
+            .ThenBy(cell => cell.MachineGuid)
+            .ToList();
+        if (cells.Count == 0)
+            return Fail(SvsapmeEnergyErrorCode.NetworkUnknown, "No active SVSAPME energy cell is linked to this network.", out code, out message);
+
+        var remaining = amountWh;
+        var touched = new List<Guid>();
+        foreach (var cell in cells)
+        {
+            var capacity = Math.Max(0, cell.CapacityWh);
+            cell.StoredWh = Math.Clamp(cell.StoredWh, 0, capacity);
+            var accepted = Math.Min(remaining, capacity - cell.StoredWh);
+            if (accepted <= 0)
+                continue;
+
+            cell.StoredWh += accepted;
+            touched.Add(cell.MachineGuid);
+            acceptedWh += accepted;
+            remaining -= accepted;
+            if (remaining <= 0)
+                break;
+        }
+
+        if (acceptedWh <= 0)
+            return Fail(SvsapmeEnergyErrorCode.StorageFull, "Network energy storage is full.", out code, out message);
+
+        foreach (var machineGuid in touched)
+            this.registry.SyncPlacedMachineState(machineGuid);
+
+        this.repository.Save();
+        code = SvsapmeEnergyErrorCode.None;
+        message = $"Accepted {acceptedWh} Wh from {ownerModId}:{reason}.";
+        return true;
+    }
+
+    public bool TryConsumeWh(
+        Guid svsapNetworkId,
+        long amountWh,
+        string ownerModId,
+        string reason,
+        bool allowPartial,
+        out long consumedWh,
+        out SvsapmeEnergyErrorCode code,
+        out string message)
+    {
+        consumedWh = 0;
+        if (!this.IsHostAuthority)
+            return Fail(SvsapmeEnergyErrorCode.NotHost, "Energy writes are host-authoritative.", out code, out message);
+
+        if (amountWh <= 0)
+            return Fail(SvsapmeEnergyErrorCode.InternalError, "Consume amount must be positive.", out code, out message);
+
+        var cells = this.GetLinkedEnergyCells(svsapNetworkId)
+            .OrderByDescending(cell => cell.CapacityWh)
+            .ThenBy(cell => cell.MachineGuid)
+            .ToList();
+        if (cells.Count == 0)
+            return Fail(SvsapmeEnergyErrorCode.NetworkUnknown, "No active SVSAPME energy cell is linked to this network.", out code, out message);
+
+        var availableWh = cells.Sum(cell => Math.Clamp(cell.StoredWh, 0, Math.Max(0, cell.CapacityWh)));
+        if (availableWh < amountWh && !allowPartial)
+            return Fail(SvsapmeEnergyErrorCode.InsufficientEnergy, $"Need {amountWh} Wh but only {availableWh} Wh is stored.", out code, out message);
+
+        var remaining = allowPartial ? Math.Min(amountWh, availableWh) : amountWh;
+        var touched = new List<Guid>();
+        foreach (var cell in cells)
+        {
+            cell.StoredWh = Math.Clamp(cell.StoredWh, 0, Math.Max(0, cell.CapacityWh));
+            var consumed = Math.Min(remaining, cell.StoredWh);
+            if (consumed <= 0)
+                continue;
+
+            cell.StoredWh -= consumed;
+            touched.Add(cell.MachineGuid);
+            consumedWh += consumed;
+            remaining -= consumed;
+            if (remaining <= 0)
+                break;
+        }
+
+        if (consumedWh <= 0)
+            return Fail(SvsapmeEnergyErrorCode.InsufficientEnergy, "No stored energy is available.", out code, out message);
+
+        foreach (var machineGuid in touched)
+            this.registry.SyncPlacedMachineState(machineGuid);
+
+        this.repository.Save();
+        code = SvsapmeEnergyErrorCode.None;
+        message = $"Consumed {consumedWh} Wh for {ownerModId}:{reason}.";
+        return true;
+    }
+
+    private IEnumerable<MachineState> GetLinkedEnergyCells(Guid svsapNetworkId)
+    {
+        var api = this.getSvsapApi();
+        if (api is null)
+            yield break;
+
+        foreach (var state in this.repository.Data.Machines.Values)
+        {
+            if (!EnergyCellRules.IsEnergyCell(state.QualifiedItemId))
+                continue;
+
+            var location = Game1.getLocationFromName(state.LocationName);
+            var tile = new Microsoft.Xna.Framework.Vector2(state.TileX, state.TileY);
+            if (location is null
+                || !location.Objects.TryGetValue(tile, out var placedObject)
+                || placedObject.QualifiedItemId != state.QualifiedItemId
+                || !Guid.TryParse(placedObject.modData.GetValueOrDefault(MachineRegistryService.MachineGuidKey), out var placedGuid)
+                || placedGuid != state.MachineGuid)
+            {
+                continue;
+            }
+
+            if (!api.TryGetLinkedEndpoint(location, tile, out var endpoint, out var code, out var message))
+            {
+                this.monitor.Log($"Skipped unlinked SVSAPME energy cell {state.MachineGuid:N}: {code} {message}", LogLevel.Trace);
+                continue;
+            }
+
+            if (endpoint is not null && endpoint.Active && endpoint.NetworkId == svsapNetworkId)
+                yield return state;
+        }
+    }
+
+    private static bool Fail(SvsapmeEnergyErrorCode errorCode, string failureMessage, out SvsapmeEnergyErrorCode code, out string message)
+    {
+        code = errorCode;
+        message = failureMessage;
+        return false;
+    }
+}
