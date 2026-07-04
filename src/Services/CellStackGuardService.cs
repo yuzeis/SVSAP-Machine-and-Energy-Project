@@ -52,6 +52,9 @@ internal sealed class CellStackGuardService
             return;
 
         var changed = this.TrackMachineItemMovement(e.Added, e.Removed, e.QuantityChanged.Select(change => change.Item));
+        if (!Context.IsMainPlayer)
+            return;
+
         this.normalizing = true;
         try
         {

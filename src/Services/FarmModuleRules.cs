@@ -50,26 +50,29 @@ internal static class FarmModuleRules
     public static FarmModuleInstallResult TryInstallModule(FarmMachineState farm, FarmTierInfo tier, string qualifiedItemId)
     {
         if (!TryGetModule(qualifiedItemId, out var module))
-            return new(false, false, "This item is not a farm module.");
+            return new(false, false, ModText.Get("hud.farm.module.notModule", "This item is not a farm module."));
 
         NormalizeInstalledModules(farm);
         if (module.Kind == FarmModuleKind.GrowthLight && CountModules(farm, FarmModuleKind.GrowthLight) >= 2)
-            return new(false, false, "A farm can install at most two growth lights.");
+            return new(false, false, ModText.Get("hud.farm.module.tooManyGrowthLights", "A farm can install at most two growth lights."));
 
         if (module.Kind == FarmModuleKind.Thermostat && CountModules(farm, FarmModuleKind.Thermostat) >= 1)
-            return new(false, false, "A farm can install at most one thermostat.");
+            return new(false, false, ModText.Get("hud.farm.module.tooManyThermostats", "A farm can install at most one thermostat."));
 
         if (module.Kind == FarmModuleKind.SlowRelease && CountModules(farm, FarmModuleKind.SlowRelease) >= 1)
-            return new(false, false, "A farm can install at most one slow-release module.");
+            return new(false, false, ModText.Get("hud.farm.module.tooManySlowRelease", "A farm can install at most one slow-release module."));
 
         var currentSlots = GetUsedSlots(farm);
         var needsNewSlot = module.Kind != FarmModuleKind.Sprinkler || CountModules(farm, FarmModuleKind.Sprinkler) == 0;
         if (needsNewSlot && currentSlots >= tier.ModuleSlots)
-            return new(false, false, "This farm has no free module slot.");
+            return new(false, false, ModText.Get("hud.farm.module.noFreeSlot", "This farm has no free module slot."));
 
         farm.InstalledModuleQualifiedItemIds.Add(qualifiedItemId);
         RecalculateModuleSnapshot(farm);
-        return new(true, true, $"Installed {GetModuleDisplayName(qualifiedItemId)}. Slots used: {GetUsedSlots(farm):N0}/{tier.ModuleSlots:N0}.");
+        return new(true, true, ModText.Get(
+            "hud.farm.module.installed",
+            "Installed {{module}}. Slots used: {{used}}/{{capacity}}.",
+            new { module = GetModuleDisplayName(qualifiedItemId), used = GetUsedSlots(farm).ToString("N0"), capacity = tier.ModuleSlots.ToString("N0") }));
     }
 
     public static bool CanBindFertilizer(FarmMachineState farm, string fertilizerQualifiedItemId)

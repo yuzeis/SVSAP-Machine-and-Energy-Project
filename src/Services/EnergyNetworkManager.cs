@@ -13,6 +13,8 @@ internal sealed class EnergyNetworkManager
     private readonly MachineRegistryService registry;
     private readonly Func<ISvsapApi?> getSvsapApi;
     private readonly IMonitor monitor;
+    private int linkedEnergyCellCacheScopeDepth;
+    private Dictionary<Guid, List<MachineState>>? linkedEnergyCellCache;
 
     public EnergyNetworkManager(
         MachineStateRepository repository,
@@ -27,6 +29,15 @@ internal sealed class EnergyNetworkManager
     }
 
     public bool IsHostAuthority => Context.IsWorldReady && Context.IsMainPlayer;
+
+    public IDisposable BeginLinkedEnergyCellCacheScope()
+    {
+        if (this.linkedEnergyCellCacheScopeDepth == 0)
+            this.linkedEnergyCellCache = this.BuildLinkedEnergyCellIndex();
+
+        this.linkedEnergyCellCacheScopeDepth++;
+        return new LinkedEnergyCellCacheScope(this);
+    }
 
     public bool TryGetNetworkEnergy(Guid svsapNetworkId, out long storedWh, out long capacityWh, out SvsapmeEnergyErrorCode code)
     {
@@ -97,7 +108,6 @@ internal sealed class EnergyNetworkManager
         foreach (var machineGuid in touched)
             this.registry.SyncPlacedMachineState(machineGuid);
 
-        this.repository.Save();
         code = SvsapmeEnergyErrorCode.None;
         message = $"Accepted {acceptedWh} Wh from {ownerModId}:{reason}.";
         return true;
@@ -154,7 +164,6 @@ internal sealed class EnergyNetworkManager
         foreach (var machineGuid in touched)
             this.registry.SyncPlacedMachineState(machineGuid);
 
-        this.repository.Save();
         code = SvsapmeEnergyErrorCode.None;
         message = $"Consumed {consumedWh} Wh for {ownerModId}:{reason}.";
         return true;
@@ -162,10 +171,52 @@ internal sealed class EnergyNetworkManager
 
     private IEnumerable<MachineState> GetLinkedEnergyCells(Guid svsapNetworkId)
     {
+        if (this.linkedEnergyCellCacheScopeDepth > 0 && this.linkedEnergyCellCache is not null)
+        {
+            return this.linkedEnergyCellCache.TryGetValue(svsapNetworkId, out var cells)
+                ? cells
+                : Enumerable.Empty<MachineState>();
+        }
+
+        return this.EnumerateLinkedEnergyCells(svsapNetworkId);
+    }
+
+    private Dictionary<Guid, List<MachineState>> BuildLinkedEnergyCellIndex()
+    {
+        var index = new Dictionary<Guid, List<MachineState>>();
+        var api = this.getSvsapApi();
+        if (api is null)
+            return index;
+
+        foreach (var (state, networkId) in this.EnumerateLinkedEnergyCellEndpoints(api))
+        {
+            if (!index.TryGetValue(networkId, out var cells))
+            {
+                cells = new List<MachineState>();
+                index[networkId] = cells;
+            }
+
+            cells.Add(state);
+        }
+
+        return index;
+    }
+
+    private IEnumerable<MachineState> EnumerateLinkedEnergyCells(Guid svsapNetworkId)
+    {
         var api = this.getSvsapApi();
         if (api is null)
             yield break;
 
+        foreach (var (state, networkId) in this.EnumerateLinkedEnergyCellEndpoints(api))
+        {
+            if (networkId == svsapNetworkId)
+                yield return state;
+        }
+    }
+
+    private IEnumerable<(MachineState State, Guid NetworkId)> EnumerateLinkedEnergyCellEndpoints(ISvsapApi api)
+    {
         foreach (var state in this.repository.Data.Machines.Values)
         {
             if (!EnergyCellRules.IsEnergyCell(state.QualifiedItemId))
@@ -188,9 +239,23 @@ internal sealed class EnergyNetworkManager
                 continue;
             }
 
-            if (endpoint is not null && endpoint.Active && endpoint.NetworkId == svsapNetworkId)
-                yield return state;
+            if (endpoint is not null && endpoint.Active)
+                yield return (state, endpoint.NetworkId);
         }
+    }
+
+    private void EndLinkedEnergyCellCacheScope()
+    {
+        if (this.linkedEnergyCellCacheScopeDepth <= 0)
+        {
+            this.linkedEnergyCellCache = null;
+            this.linkedEnergyCellCacheScopeDepth = 0;
+            return;
+        }
+
+        this.linkedEnergyCellCacheScopeDepth--;
+        if (this.linkedEnergyCellCacheScopeDepth == 0)
+            this.linkedEnergyCellCache = null;
     }
 
     private static bool Fail(SvsapmeEnergyErrorCode errorCode, string failureMessage, out SvsapmeEnergyErrorCode code, out string message)
@@ -198,5 +263,24 @@ internal sealed class EnergyNetworkManager
         code = errorCode;
         message = failureMessage;
         return false;
+    }
+
+    private sealed class LinkedEnergyCellCacheScope : IDisposable
+    {
+        private EnergyNetworkManager? owner;
+
+        public LinkedEnergyCellCacheScope(EnergyNetworkManager owner)
+        {
+            this.owner = owner;
+        }
+
+        public void Dispose()
+        {
+            if (this.owner is null)
+                return;
+
+            this.owner.EndLinkedEnergyCellCacheScope();
+            this.owner = null;
+        }
     }
 }

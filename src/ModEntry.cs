@@ -88,6 +88,7 @@ public sealed class ModEntry : Mod
             this.machineRegistryService,
             this.energyNetworkManager,
             this.machineRuntimeService,
+            this.multiplayerService,
             () => this.svsapApi,
             () => this.config);
         this.fullMatrixE2EService = new SvsapmeFullMatrixE2EService(
@@ -402,12 +403,15 @@ public sealed class ModEntry : Mod
         };
     }
 
-    private static void SyncSvsapmeCraftingRecipeUnlocks(Farmer player, ModConfig config)
+    internal static void SyncSvsapmeCraftingRecipeUnlocks(Farmer player, ModConfig config)
     {
         if (config.IsDebugRecipeCostMode())
         {
             foreach (var recipeName in ModItemCatalog.CraftingRecipes.Keys)
-                player.craftingRecipes.Remove(recipeName);
+            {
+                if (!player.craftingRecipes.ContainsKey(recipeName))
+                    player.craftingRecipes.Add(recipeName, 0);
+            }
 
             return;
         }

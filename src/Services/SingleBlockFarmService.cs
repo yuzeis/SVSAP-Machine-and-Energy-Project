@@ -2,6 +2,7 @@ using Koizumi.SVSAP.Api;
 using Microsoft.Xna.Framework;
 using SVSAPME.Content;
 using SVSAPME.Models;
+using SVSAPME.UI;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
@@ -56,17 +57,10 @@ internal sealed class SingleBlockFarmService
         var held = Game1.player.CurrentItem;
         if (held is null || held.Stack <= 0)
         {
-            var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
-            if (this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
-                && TryReadMachineGuid(placedObject, out var statusGuid)
-                && this.repository.TryGet(statusGuid, out var statusState))
-            {
-                Game1.addHUDMessage(new HUDMessage(FarmModuleRules.DescribeModules(statusState.Farm, tier), HUDMessage.newQuest_type));
-            }
+            if (this.TryOpenFarmStatusMenu(placedObject, location, tile))
+                this.Suppress(e);
             else
-            {
                 Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.farm.holdSupportedItem", "Hold a supported seed, fertilizer, sprinkler, or farm module."), HUDMessage.error_type));
-            }
 
             return;
         }
@@ -123,6 +117,167 @@ internal sealed class SingleBlockFarmService
         });
     }
 
+    private bool TryOpenFarmStatusMenu(SObject placedObject, GameLocation location, Vector2 tile)
+    {
+        if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
+            || !TryReadMachineGuid(placedObject, out var machineGuid)
+            || !this.repository.TryGet(machineGuid, out var state))
+        {
+            return false;
+        }
+
+        Game1.activeClickableMenu = new SvsapmeStatusMenu(
+            placedObject.DisplayName,
+            () => this.BuildFarmStatusLines(placedObject, location, tile, state));
+        return true;
+    }
+
+    private IReadOnlyList<string> BuildFarmStatusLines(SObject placedObject, GameLocation location, Vector2 tile, MachineState state)
+    {
+        var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
+        var modules = SingleBlockFarmRules.GetModuleSnapshot(state.Farm);
+        var occupied = SingleBlockFarmRules.CountOccupied(state.Farm);
+        var lines = new List<string>
+        {
+            ModText.Get("ui.farm.name", "Farm: {{name}}", new { name = placedObject.DisplayName }),
+            ModText.Get("ui.farm.location", "Location: {{location}} ({{x}}, {{y}})", new { location = location.NameOrUniqueName, x = tile.X.ToString("0"), y = tile.Y.ToString("0") }),
+            ModText.Get("ui.farm.plots", "Plots: {{occupied}}/{{capacity}}", new { occupied = occupied.ToString("N0"), capacity = tier.Plots.ToString("N0") }),
+            ModText.Get("ui.farm.moduleSlots", "Module slots: {{used}}/{{capacity}}", new { used = FarmModuleRules.GetUsedSlots(state.Farm).ToString("N0"), capacity = tier.ModuleSlots.ToString("N0") }),
+            ModText.Get("ui.farm.seedsStored", "Seeds stored: {{count}}", new { count = state.Farm.InternalSeedCount.ToString("N0") }),
+            ModText.Get("ui.farm.fertilizerStored", "Fertilizer stored: {{count}}", new { count = state.Farm.InternalFertilizerCount.ToString("N0") }),
+            ModText.Get("ui.farm.modules", "Modules: {{modules}}", new { modules = FormatModules(state.Farm) }),
+            ModText.Get("ui.farm.sprinklerCoverage", "Sprinkler coverage: {{covered}}/{{capacity}}", new { covered = Math.Min(state.Farm.SprinklerCoveredPlots, tier.Plots).ToString("N0"), capacity = tier.Plots.ToString("N0") }),
+            ModText.Get("ui.farm.moduleFactors", "Light factor: {{light}}; thermostat: {{thermostat}}; slow release: {{slowRelease}} plot-cycles/fertilizer", new { light = (state.Farm.LightFactorPermille / 1000m).ToString("0.###"), thermostat = (state.Farm.HasThermostat ? state.Farm.ThermostatFactorPermille / 1000m : 0).ToString("0.###"), slowRelease = state.Farm.SlowReleaseCoveragePerFertilizer.ToString("N0") })
+        };
+
+        if (FarmCropCatalog.TryGetBySeed(state.Farm.BoundSeedQualifiedItemId, out var crop))
+        {
+            lines.Add(ModText.Get("ui.farm.crop", "Crop: {{crop}} ({{seed}} -> {{harvest}})", new { crop = crop.DisplayName, seed = FormatItem(crop.SeedQualifiedItemId), harvest = FormatItem(crop.HarvestQualifiedItemId) }));
+            lines.Add(ModText.Get("ui.farm.seasons", "Seasons: {{seasons}}; growth {{growth}} day(s); regrow {{regrow}}", new { seasons = string.Join(", ", crop.Seasons), growth = crop.BaseGrowthDays.ToString("N0"), regrow = crop.RegrowDays.ToString("N0") }));
+            lines.Add(ModText.Get("ui.farm.progress", "Progress: {{progress}}", new { progress = FormatFarmProgress(state.Farm, crop) }));
+        }
+        else
+        {
+            lines.Add(ModText.Get("ui.farm.cropNone", "Crop: none bound"));
+        }
+
+        lines.Add(string.IsNullOrWhiteSpace(state.Farm.BoundFertilizerQualifiedItemId)
+            ? ModText.Get("ui.farm.fertilizerNone", "Fertilizer: none bound")
+            : ModText.Get("ui.farm.fertilizer", "Fertilizer: {{item}}", new { item = FormatItem(state.Farm.BoundFertilizerQualifiedItemId) }));
+
+        if (state.OutputBuffer.Count > 0)
+            lines.Add(ModText.Get("ui.farm.outputBuffer", "Output buffer: {{items}}", new { items = FormatBufferedItems(state.OutputBuffer) }));
+
+        var api = this.getSvsapApi();
+        if (api is not null
+            && TryReadMachineGuid(placedObject, out var machineGuid)
+            && TryGetActiveEndpoint(api, new MachineLocation(machineGuid, location.NameOrUniqueName, tile, placedObject.QualifiedItemId), out _, out var endpoint))
+        {
+            lines.Add(ModText.Get("ui.farm.network", "Network: {{network}}", new { network = endpoint.NetworkId.ToString("N") }));
+            if (FarmCropCatalog.TryGetBySeed(state.Farm.BoundSeedQualifiedItemId, out var plannedCrop))
+            {
+                var availableNetworkSeeds = api.GetAvailableCount(endpoint.NetworkId, plannedCrop.SeedQualifiedItemId, quality: null);
+                var availableNetworkFertilizer = string.IsNullOrWhiteSpace(state.Farm.BoundFertilizerQualifiedItemId)
+                    ? 0
+                    : api.GetAvailableCount(endpoint.NetworkId, state.Farm.BoundFertilizerQualifiedItemId, quality: null);
+                var plan = SingleBlockFarmRules.PlanDay(
+                    state.Farm,
+                    tier,
+                    plannedCrop,
+                    modules,
+                    availableNetworkSeeds,
+                    availableNetworkFertilizer,
+                    location.GetSeason().ToString(),
+                    this.getConfig().FarmEnergyCostMultiplier);
+                lines.Add(ModText.Get(
+                    "ui.farm.nextPlan",
+                    "Next daily plan: plant {{plant}}, fertilizer {{fertilizer}}, charged plots {{charged}}, cost {{cost}}, can grow today={{canGrow}}",
+                    new
+                    {
+                        plant = plan.PlannedSeedCount.ToString("N0"),
+                        fertilizer = plan.PlannedFertilizerCount.ToString("N0"),
+                        charged = plan.ChargedOccupiedPlots.ToString("N0"),
+                        cost = FormatWh(plan.RequiredWh),
+                        canGrow = FormatBool(plan.CanGrowToday)
+                    }));
+            }
+        }
+        else
+        {
+            lines.Add(api is null
+                ? ModText.Get("ui.farm.network.apiUnavailable", "Network: SVSAP API unavailable")
+                : ModText.Get("ui.farm.network.notLinked", "Network: not linked or inactive"));
+        }
+
+        return lines;
+    }
+
+    private static string FormatFarmProgress(FarmMachineState farm, FarmCropSpec crop)
+    {
+        if (farm.Plots.Count == 0)
+            return ModText.Get("ui.farm.progress.empty", "no occupied plots");
+
+        var mature = 0;
+        decimal total = 0;
+        foreach (var plot in farm.Plots)
+        {
+            var baseDays = plot.InRegrow ? crop.RegrowDays : crop.BaseGrowthDays;
+            var required = FarmGrowthRules.GetRequiredProgressUnits(baseDays);
+            if (FarmGrowthRules.IsMature(plot.ProgressUnits, baseDays))
+                mature++;
+            total += required <= 0 ? 0 : Math.Min(1m, plot.ProgressUnits / (decimal)required);
+        }
+
+        return ModText.Get(
+            "ui.farm.progress.value",
+            "{{mature}} mature, average {{average}}",
+            new { mature = mature.ToString("N0"), average = (total / farm.Plots.Count).ToString("P0") });
+    }
+
+    private static string FormatModules(FarmMachineState farm)
+    {
+        var modules = FarmModuleRules.GetInstalledModuleItems(farm)
+            .Select(FormatItem)
+            .ToList();
+        return modules.Count == 0 ? ModText.Get("ui.common.none", "none") : string.Join(", ", modules);
+    }
+
+    private static string FormatBufferedItems(IEnumerable<BufferedItemStack> stacks)
+    {
+        var parts = stacks
+            .Where(stack => stack.Stack > 0)
+            .Select(stack => $"{FormatItem(stack.QualifiedItemId)} x{stack.Stack:N0}")
+            .ToList();
+        return parts.Count == 0 ? ModText.Get("ui.common.empty", "empty") : string.Join(", ", parts);
+    }
+
+    private static string FormatItem(string qualifiedItemId)
+    {
+        if (string.IsNullOrWhiteSpace(qualifiedItemId))
+            return ModText.Get("ui.common.none", "none");
+
+        try
+        {
+            return ItemRegistry.Create(qualifiedItemId).DisplayName;
+        }
+        catch
+        {
+            return qualifiedItemId;
+        }
+    }
+
+    private static string FormatWh(long wh)
+    {
+        return $"{Math.Max(0, wh) / 1000m:0.00} kWh";
+    }
+
+    private static string FormatBool(bool value)
+    {
+        return value
+            ? ModText.Get("ui.common.yes", "yes")
+            : ModText.Get("ui.common.no", "no");
+    }
+
     private static bool TryClassifyFarmAction(string qualifiedItemId, out SvsapmeMachineActionKind actionKind, out string message)
     {
         if (FarmCropCatalog.TryGetBySeed(qualifiedItemId, out _))
@@ -147,7 +302,7 @@ internal sealed class SingleBlockFarmService
         }
 
         actionKind = SvsapmeMachineActionKind.None;
-        message = "Hold a supported seed, fertilizer, sprinkler, or farm module.";
+        message = ModText.Get("hud.farm.holdSupportedItem", "Hold a supported seed, fertilizer, sprinkler, or farm module.");
         return false;
     }
 
@@ -159,25 +314,25 @@ internal sealed class SingleBlockFarmService
         int placedByFarmingLevel)
     {
         if (!IsFarmMachine(placedObject.QualifiedItemId))
-            return new(false, false, "Target machine is not a Single-Block Farm.");
+            return new(false, false, ModText.Get("hud.farm.notFarm", "Target machine is not a Single-Block Farm."));
 
         if (!FarmCropCatalog.TryGetBySeed(seedQualifiedItemId, out var crop))
-            return new(false, false, "Hold a supported Data/Crops seed.");
+            return new(false, false, ModText.Get("hud.farm.holdSeed", "Hold a supported Data/Crops seed."));
 
         if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
             || !TryReadMachineGuid(placedObject, out var machineGuid)
             || !this.repository.TryGet(machineGuid, out var state))
         {
-            return new(false, false, "SVSAPME could not register this farm.");
+            return new(false, false, ModText.Get("hud.farm.registerFailed", "SVSAPME could not register this farm."));
         }
 
         if (!SingleBlockFarmRules.CanBindSeed(state.Farm, seedQualifiedItemId))
-            return new(false, false, "Clear the farm before changing its crop type.");
+            return new(false, false, ModText.Get("hud.farm.clearBeforeCropChange", "Clear the farm before changing its crop type."));
 
         SingleBlockFarmRules.BindSeed(state.Farm, crop, placedByFarmingLevel);
         state.Farm.InternalSeedCount++;
         this.repository.Save();
-        return new(true, true, $"{crop.DisplayName} seed loaded. Internal seeds: {state.Farm.InternalSeedCount:N0}.");
+        return new(true, true, ModText.Get("hud.farm.seedLoaded", "{{crop}} seed loaded. Internal seeds: {{count}}.", new { crop = crop.DisplayName, count = state.Farm.InternalSeedCount.ToString("N0") }));
     }
 
     internal SvsapmeMachineActionApplyResult TryLoadFertilizer(
@@ -187,25 +342,25 @@ internal sealed class SingleBlockFarmService
         string fertilizerQualifiedItemId)
     {
         if (!IsFarmMachine(placedObject.QualifiedItemId))
-            return new(false, false, "Target machine is not a Single-Block Farm.");
+            return new(false, false, ModText.Get("hud.farm.notFarm", "Target machine is not a Single-Block Farm."));
 
         if (!FarmModuleRules.IsFertilizer(fertilizerQualifiedItemId))
-            return new(false, false, "Hold Basic, Quality, or Deluxe Fertilizer.");
+            return new(false, false, ModText.Get("hud.farm.holdFertilizer", "Hold Basic, Quality, or Deluxe Fertilizer."));
 
         if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
             || !TryReadMachineGuid(placedObject, out var machineGuid)
             || !this.repository.TryGet(machineGuid, out var state))
         {
-            return new(false, false, "SVSAPME could not register this farm.");
+            return new(false, false, ModText.Get("hud.farm.registerFailed", "SVSAPME could not register this farm."));
         }
 
         if (!FarmModuleRules.CanBindFertilizer(state.Farm, fertilizerQualifiedItemId))
-            return new(false, false, "Clear the farm before changing its fertilizer type.");
+            return new(false, false, ModText.Get("hud.farm.clearBeforeFertilizerChange", "Clear the farm before changing its fertilizer type."));
 
         state.Farm.BoundFertilizerQualifiedItemId = fertilizerQualifiedItemId;
         state.Farm.InternalFertilizerCount++;
         this.repository.Save();
-        return new(true, true, $"Fertilizer loaded. Internal fertilizer: {state.Farm.InternalFertilizerCount:N0}.");
+        return new(true, true, ModText.Get("hud.farm.fertilizerLoaded", "Fertilizer loaded. Internal fertilizer: {{count}}.", new { count = state.Farm.InternalFertilizerCount.ToString("N0") }));
     }
 
     internal SvsapmeMachineActionApplyResult TryInstallModule(
@@ -215,13 +370,13 @@ internal sealed class SingleBlockFarmService
         string moduleQualifiedItemId)
     {
         if (!IsFarmMachine(placedObject.QualifiedItemId))
-            return new(false, false, "Target machine is not a Single-Block Farm.");
+            return new(false, false, ModText.Get("hud.farm.notFarm", "Target machine is not a Single-Block Farm."));
 
         if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
             || !TryReadMachineGuid(placedObject, out var machineGuid)
             || !this.repository.TryGet(machineGuid, out var state))
         {
-            return new(false, false, "SVSAPME could not register this farm.");
+            return new(false, false, ModText.Get("hud.farm.registerFailed", "SVSAPME could not register this farm."));
         }
 
         var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);

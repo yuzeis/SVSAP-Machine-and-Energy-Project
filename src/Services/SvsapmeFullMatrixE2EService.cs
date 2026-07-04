@@ -6,6 +6,7 @@ using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
 using StardewValley.Locations;
+using StardewValley.Menus;
 using StardewValley.Objects;
 using SVSAPME.Content;
 using SVSAPME.Models;
@@ -18,7 +19,9 @@ internal sealed class SvsapmeFullMatrixE2EService
     private const string EnabledEnv = "STARDEW_SVSAPME_FULL_E2E";
     private const string OutputDirEnv = "STARDEW_SVSAPME_FULL_E2E_OUTPUT";
     private const string VersionEnv = "STARDEW_SVSAPME_FULL_E2E_VERSION";
-    private const string DefaultVersionLabel = "ver1.2-alpha.2";
+    private const string FarmNameEnv = "STARDEW_SVSAPME_FULL_E2E_FARM";
+    private const string DefaultVersionLabel = "ver1.3.0-alpha.1";
+    private const int StartupTimeoutTicks = 12000;
     private const string SvsapNetworkIdKey = ModItemCatalog.SvsapUniqueId + "/NetworkId";
     private const string SvsapEndpointIdKey = ModItemCatalog.SvsapUniqueId + "/EndpointId";
 
@@ -35,11 +38,14 @@ internal sealed class SvsapmeFullMatrixE2EService
     private readonly Func<ModConfig> getConfig;
     private readonly string outputDir;
     private readonly string versionLabel;
+    private readonly string farmName;
     private readonly List<E2EResult> results = new();
     private object? svsapNetworkRepository;
 
     private bool started;
     private bool stopped;
+    private int startupTicks;
+    private int startupStage;
     private int ticks;
 
     public SvsapmeFullMatrixE2EService(
@@ -66,6 +72,9 @@ internal sealed class SvsapmeFullMatrixE2EService
         this.versionLabel = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(VersionEnv))
             ? DefaultVersionLabel
             : Environment.GetEnvironmentVariable(VersionEnv)!;
+        this.farmName = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(FarmNameEnv))
+            ? "SVSAPMEFullE2E"
+            : Environment.GetEnvironmentVariable(FarmNameEnv)!;
     }
 
     private bool IsEnabled =>
@@ -97,8 +106,15 @@ internal sealed class SvsapmeFullMatrixE2EService
 
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
     {
-        if (this.stopped || !Context.IsWorldReady || !Context.IsMainPlayer)
+        if (this.stopped)
             return;
+
+        this.startupTicks++;
+        if (!Context.IsWorldReady || !Context.IsMainPlayer)
+        {
+            this.TickStartup();
+            return;
+        }
 
         this.ticks++;
         if (this.ticks < 60)
@@ -119,6 +135,86 @@ internal sealed class SvsapmeFullMatrixE2EService
         {
             this.Stop();
         }
+    }
+
+    private void TickStartup()
+    {
+        if (this.startupTicks > StartupTimeoutTicks)
+        {
+            this.WriteNotReadyResults();
+            this.Stop();
+            return;
+        }
+
+        if (Context.IsWorldReady)
+            return;
+
+        if (this.startupStage == 0)
+        {
+            if (Game1.activeClickableMenu is not TitleMenu || TitleMenu.subMenu is not null)
+                return;
+
+            this.StartHostFarmCreation();
+            this.startupStage = 1;
+            return;
+        }
+
+        if (this.startupStage == 1 && TitleMenu.subMenu is CharacterCustomization menu)
+        {
+            this.CompleteHostFarmCreation(menu);
+            this.startupStage = 2;
+        }
+    }
+
+    private void StartHostFarmCreation()
+    {
+        Game1.resetPlayer();
+        this.ApplyHostFarmIdentity();
+        Game1.startingCabins = 0;
+        Game1.cabinsSeparate = false;
+        Game1.whichFarm = 0;
+        Game1.options.enableServer = false;
+        Game1.player.team.useSeparateWallets.Value = false;
+        TitleMenu.subMenu = new CharacterCustomization(CharacterCustomization.Source.HostNewFarm, multiplayerServer: false);
+        this.WritePayload("full-matrix-farm-create-started.json", new
+        {
+            version = this.versionLabel,
+            farmName = this.farmName
+        });
+        this.monitor.Log($"SVSAPME_FULL_E2E farm-create-started farm=\"{this.farmName}\"", LogLevel.Info);
+    }
+
+    private void CompleteHostFarmCreation(CharacterCustomization menu)
+    {
+        this.ApplyHostFarmIdentity();
+        Game1.startingCabins = 0;
+        Game1.cabinsSeparate = false;
+        Game1.whichFarm = 0;
+        Game1.options.enableServer = false;
+        Game1.player.team.useSeparateWallets.Value = false;
+
+        this.helper.Reflection.GetField<TextBox>(menu, "nameBox").GetValue().Text = "SVSAPMEHost";
+        this.helper.Reflection.GetField<TextBox>(menu, "farmnameBox").GetValue().Text = this.farmName;
+        this.helper.Reflection.GetField<TextBox>(menu, "favThingBox").GetValue().Text = "SVSAPME";
+        this.helper.Reflection.GetField<bool>(menu, "skipIntro").SetValue(true);
+
+        var ok = menu.okButton.bounds.Center;
+        menu.receiveLeftClick(ok.X, ok.Y);
+        this.WritePayload("full-matrix-farm-create-submitted.json", new
+        {
+            version = this.versionLabel,
+            farmName = this.farmName
+        });
+        this.monitor.Log($"SVSAPME_FULL_E2E farm-create-submitted farm=\"{this.farmName}\"", LogLevel.Info);
+    }
+
+    private void ApplyHostFarmIdentity()
+    {
+        Game1.player.Name = "SVSAPMEHost";
+        Game1.player.displayName = Game1.player.Name;
+        Game1.player.farmName.Value = this.farmName;
+        Game1.player.favoriteThing.Value = "SVSAPME";
+        Game1.player.isCustomized.Value = true;
     }
 
     private void RunAll()
@@ -169,11 +265,15 @@ internal sealed class SvsapmeFullMatrixE2EService
         this.Check("69", this.TestClaimGate);
         this.Check("70", this.TestDemolishHeldExclusion);
         this.Check("71", this.TestRepositoryRoundTrip);
+        this.Check("81", this.TestAllMachineTypesRepositoryRoundTrip);
+        this.Check("83", this.TestDebugRecipeModeBehavior);
+        this.Check("84", this.TestRecipeModeSwitching);
         this.Check("88", this.TestFullNetworkStress);
         this.Check("89", this.TestZeroEnergyDegrade);
         this.Check("90", this.TestEnergyBoundaries);
         this.Check("91", this.TestRapidPickupReplay);
         this.Check("92", this.TestInterruptedSettlementRoundTrip);
+        this.Check("93", this.TestSvsapRecipeParity);
     }
 
     private void Check(string id, Func<(bool Pass, string Evidence)> test)
@@ -704,6 +804,184 @@ internal sealed class SvsapmeFullMatrixE2EService
         return (exists && state!.StoredWh == 123_456 && state.CapacityWh == 640_000, $"exists={exists} stored={state?.StoredWh ?? -1} capacity={state?.CapacityWh ?? -1}");
     }
 
+    private (bool, string) TestAllMachineTypesRepositoryRoundTrip()
+    {
+        var fixture = this.CreateFixture(width: 8, height: 7);
+        var snapshots = new List<MachineRoundTripSnapshot>();
+        var placedTiles = new List<Vector2>();
+        try
+        {
+            var index = 0;
+            foreach (var definition in ModItemCatalog.BigCraftables)
+            {
+                var tile = fixture.Origin + new Vector2(index % 8, 2 + index / 8);
+                var qualifiedItemId = "(BC)" + definition.Id;
+                var machine = this.PlaceLinkedMachine(fixture.Location, tile, qualifiedItemId, fixture.NetworkId);
+                placedTiles.Add(tile);
+                var guid = this.RegisterMachine(machine, fixture.Location, tile, 0);
+                var state = this.GetState(guid);
+                var storedWh = state.CapacityWh > 0 ? Math.Min(state.CapacityWh, 123 + index) : 0;
+                state.StoredWh = storedWh;
+                state.ProgressWh = index * 17;
+                state.OutputBuffer.Add(new BufferedItemStack
+                {
+                    QualifiedItemId = "(O)390",
+                    Stack = index + 1,
+                    Quality = 0
+                });
+                state.ModData["e2e-roundtrip"] = definition.Id;
+                machine.modData[MachineRegistryService.StoredWhKey] = storedWh.ToString();
+
+                snapshots.Add(new MachineRoundTripSnapshot(
+                    guid,
+                    qualifiedItemId,
+                    fixture.Location.NameOrUniqueName,
+                    tile.X,
+                    tile.Y,
+                    state.MachineType,
+                    storedWh,
+                    state.CapacityWh,
+                    state.ProgressWh,
+                    state.OutputBuffer.Count,
+                    definition.Id));
+                index++;
+            }
+
+            this.repository.Save();
+            this.repository.Load();
+            this.registry.RebuildCache();
+
+            var failures = new List<string>();
+            foreach (var snapshot in snapshots)
+            {
+                if (!this.repository.Data.Machines.TryGetValue(snapshot.Guid, out var state))
+                {
+                    failures.Add(snapshot.MachineType + ":missing");
+                    continue;
+                }
+
+                var sameState = state.QualifiedItemId == snapshot.QualifiedItemId
+                    && state.LocationName == snapshot.LocationName
+                    && Math.Abs(state.TileX - snapshot.TileX) < 0.001f
+                    && Math.Abs(state.TileY - snapshot.TileY) < 0.001f
+                    && state.MachineType == snapshot.MachineType
+                    && state.StoredWh == snapshot.StoredWh
+                    && state.CapacityWh == snapshot.CapacityWh
+                    && state.ProgressWh == snapshot.ProgressWh
+                    && state.OutputBuffer.Count == snapshot.OutputBufferCount
+                    && state.ModData.GetValueOrDefault("e2e-roundtrip") == snapshot.ModDataMarker;
+                if (!sameState)
+                    failures.Add(snapshot.MachineType + ":state");
+
+                var tile = new Vector2(snapshot.TileX, snapshot.TileY);
+                var linked = fixture.Location.Objects.TryGetValue(tile, out var obj)
+                    && obj.modData.GetValueOrDefault(SvsapNetworkIdKey) == fixture.NetworkId.ToString("N")
+                    && Guid.TryParse(obj.modData.GetValueOrDefault(SvsapEndpointIdKey), out _);
+                if (!linked)
+                    failures.Add(snapshot.MachineType + ":network");
+            }
+
+            return (
+                failures.Count == 0 && snapshots.Count == ModItemCatalog.BigCraftables.Count,
+                failures.Count == 0
+                    ? $"types={snapshots.Count} repositoryRoundTrip=true networkModData=true orientation=big-craftable-n/a"
+                    : string.Join("; ", failures));
+        }
+        finally
+        {
+            foreach (var tile in placedTiles)
+                fixture.Location.Objects.Remove(tile);
+            foreach (var snapshot in snapshots)
+                this.repository.Data.Machines.Remove(snapshot.Guid);
+            this.repository.Save();
+        }
+    }
+
+    private (bool, string) TestDebugRecipeModeBehavior()
+    {
+        var config = this.getConfig();
+        var previousMode = config.RecipeCostMode;
+        var previousRecipes = CapturePlayerRecipeState(ModItemCatalog.CraftingRecipes.Keys);
+        try
+        {
+            config.RecipeCostMode = RecipeCostModes.Debug;
+            this.helper.GameContent.InvalidateCache("Data/CraftingRecipes");
+            var recipes = Game1.content.Load<Dictionary<string, string>>("Data/CraftingRecipes");
+            var nonFree = ModItemCatalog.CraftingRecipes.Keys
+                .Where(name => !recipes.TryGetValue(name, out var raw) || GetRecipeIngredients(raw) != "(O)388 0")
+                .ToList();
+
+            foreach (var recipeName in ModItemCatalog.CraftingRecipes.Keys)
+                Game1.player.craftingRecipes.Remove(recipeName);
+            ModEntry.SyncSvsapmeCraftingRecipeUnlocks(Game1.player, config);
+            var unlocked = ModItemCatalog.CraftingRecipes.Keys.All(name => Game1.player.craftingRecipes.ContainsKey(name));
+            var untouchedNonSvsap = recipes.Any(pair =>
+                !ModItemCatalog.CraftingRecipes.ContainsKey(pair.Key)
+                && !pair.Key.StartsWith(ModItemCatalog.UniqueId, StringComparison.Ordinal)
+                && GetRecipeIngredients(pair.Value) != "(O)388 0");
+
+            return (
+                nonFree.Count == 0 && unlocked && untouchedNonSvsap,
+                $"freeRecipes={ModItemCatalog.CraftingRecipes.Count - nonFree.Count}/{ModItemCatalog.CraftingRecipes.Count} debugUnlocks={unlocked} nonSvsapUntouched={untouchedNonSvsap}");
+        }
+        finally
+        {
+            RestorePlayerRecipeState(previousRecipes);
+            config.RecipeCostMode = previousMode;
+            this.helper.GameContent.InvalidateCache("Data/CraftingRecipes");
+        }
+    }
+
+    private (bool, string) TestRecipeModeSwitching()
+    {
+        const string recipeName = ModItemCatalog.CarbonGenerator;
+        var config = this.getConfig();
+        var previousMode = config.RecipeCostMode;
+        try
+        {
+            config.RecipeCostMode = RecipeCostModes.Normal;
+            this.helper.GameContent.InvalidateCache("Data/CraftingRecipes");
+            var normal = Game1.content.Load<Dictionary<string, string>>("Data/CraftingRecipes")[recipeName];
+
+            config.RecipeCostMode = RecipeCostModes.Casual;
+            this.helper.GameContent.InvalidateCache("Data/CraftingRecipes");
+            var casual = Game1.content.Load<Dictionary<string, string>>("Data/CraftingRecipes")[recipeName];
+
+            config.RecipeCostMode = RecipeCostModes.Normal;
+            this.helper.GameContent.InvalidateCache("Data/CraftingRecipes");
+            var normalAgain = Game1.content.Load<Dictionary<string, string>>("Data/CraftingRecipes")[recipeName];
+
+            var normalIngredients = GetRecipeIngredients(normal);
+            var casualIngredients = GetRecipeIngredients(casual);
+            var expectedNormal = GetRecipeIngredients(ModItemCatalog.CraftingRecipes[recipeName]);
+            var expectedCasual = ReduceIngredientList(expectedNormal);
+            var normalStable = normalIngredients == expectedNormal && GetRecipeIngredients(normalAgain) == expectedNormal;
+            var casualCorrect = casualIngredients == expectedCasual;
+            var noResidualCache = normalAgain == normal;
+
+            return (
+                normalStable && casualCorrect && noResidualCache,
+                $"normal=\"{normalIngredients}\" casual=\"{casualIngredients}\" expectedCasual=\"{expectedCasual}\" normalStable={normalStable} noResidualCache={noResidualCache}");
+        }
+        finally
+        {
+            config.RecipeCostMode = previousMode;
+            this.helper.GameContent.InvalidateCache("Data/CraftingRecipes");
+        }
+    }
+
+    private (bool, string) TestSvsapRecipeParity()
+    {
+        var recipes = Game1.content.Load<Dictionary<string, string>>("Data/CraftingRecipes");
+        var failures = SvsapmeBalanceTable.ValidateSvsapCraftingRecipeParity(recipes);
+        var values = SvsapmeBalanceTable.GetBaseSvsapValues();
+        return (
+            failures.Count == 0,
+            failures.Count == 0
+                ? $"BasicCircuit={values["BasicCircuit"]} AdvancedCircuit={values["AdvancedCircuit"]} EliteCircuit={values["EliteCircuit"]} NetworkCable={values["NetworkCable"]}"
+                : string.Join("; ", failures));
+    }
+
     private (bool, string) TestFullNetworkStress()
     {
         var fixture = this.CreateFixture(width: 12, height: 6);
@@ -1063,6 +1341,56 @@ internal sealed class SvsapmeFullMatrixE2EService
         return chest.Items.Sum(item => item is not null && item.QualifiedItemId == qualifiedItemId ? item.Stack : 0);
     }
 
+    private static string GetRecipeIngredients(string raw)
+    {
+        return raw.Split('/')[0];
+    }
+
+    private static string ReduceIngredientList(string rawIngredients)
+    {
+        var tokens = rawIngredients.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length < 2)
+            return rawIngredients;
+
+        var reduced = new List<string>();
+        for (var i = 0; i + 1 < tokens.Length; i += 2)
+        {
+            reduced.Add(tokens[i]);
+            reduced.Add(int.TryParse(tokens[i + 1], out var count) && count > 1
+                ? Math.Max(1, (count + 1) / 2).ToString()
+                : tokens[i + 1]);
+        }
+
+        if (tokens.Length % 2 != 0)
+            reduced.Add(tokens[^1]);
+
+        return string.Join(" ", reduced);
+    }
+
+    private static Dictionary<string, int?> CapturePlayerRecipeState(IEnumerable<string> recipeNames)
+    {
+        var snapshot = new Dictionary<string, int?>(StringComparer.Ordinal);
+        foreach (var recipeName in recipeNames)
+        {
+            snapshot[recipeName] = Game1.player.craftingRecipes.TryGetValue(recipeName, out var count)
+                ? count
+                : null;
+        }
+
+        return snapshot;
+    }
+
+    private static void RestorePlayerRecipeState(Dictionary<string, int?> snapshot)
+    {
+        foreach (var pair in snapshot)
+        {
+            if (pair.Value.HasValue)
+                Game1.player.craftingRecipes[pair.Key] = pair.Value.Value;
+            else
+                Game1.player.craftingRecipes.Remove(pair.Key);
+        }
+    }
+
     private static Vector2 FindClearBlock(GameLocation location, int width, int height)
     {
         for (var y = 8; y < 80; y++)
@@ -1120,6 +1448,23 @@ internal sealed class SvsapmeFullMatrixE2EService
         });
     }
 
+    private void WriteNotReadyResults()
+    {
+        this.monitor.Log($"SVSAPME_FULL_E2E_NOT_READY worldReady={Context.IsWorldReady} mainPlayer={Context.IsMainPlayer} ticks={this.startupTicks}", LogLevel.Warn);
+        this.WritePayload("full-matrix-not-ready.json", new
+        {
+            version = this.versionLabel,
+            pass = false,
+            e2eReady = false,
+            reason = "Full-matrix E2E requires a loaded single-player host save. The game stayed outside WorldReady/MainPlayer before the timeout.",
+            worldReady = Context.IsWorldReady,
+            mainPlayer = Context.IsMainPlayer,
+            ticks = this.startupTicks,
+            total = 0,
+            results = Array.Empty<E2EResult>()
+        });
+    }
+
     private void WritePayload(string fileName, object payload)
     {
         if (string.IsNullOrWhiteSpace(this.outputDir))
@@ -1134,6 +1479,19 @@ internal sealed class SvsapmeFullMatrixE2EService
     }
 
     private sealed record E2EResult(string Id, bool Pass, string Evidence);
+
+    private sealed record MachineRoundTripSnapshot(
+        Guid Guid,
+        string QualifiedItemId,
+        string LocationName,
+        float TileX,
+        float TileY,
+        string MachineType,
+        long StoredWh,
+        long CapacityWh,
+        long ProgressWh,
+        int OutputBufferCount,
+        string ModDataMarker);
 
     private sealed record Fixture(
         GameLocation Location,

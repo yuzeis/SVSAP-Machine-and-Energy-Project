@@ -96,8 +96,12 @@ internal sealed class MachineRegistryService
                     this.monitor.Log($"Discarded {consumption.DiscardedStoredWh:N0} Wh of residual energy from consumed SVSAPME machine item {state.MachineGuid:N}; charged machines used as crafting material lose their stored energy.", LogLevel.Warn);
                     if (Context.IsWorldReady)
                     {
+                        var discardedWh = consumption.DiscardedStoredWh.ToString("N0");
                         Game1.addHUDMessage(new HUDMessage(
-                            $"A charged SVSAPME machine was used as crafting material; {consumption.DiscardedStoredWh:N0} Wh of stored energy was lost.",
+                            ModText.Get(
+                                "hud.machineConsumedEnergyLost",
+                                "A charged SVSAPME machine was used as crafting material; {{wh}} Wh of stored energy was lost.",
+                                new { wh = discardedWh }),
                             HUDMessage.error_type));
                     }
                 }
@@ -319,6 +323,14 @@ internal sealed class MachineRegistryService
         if (location is null)
         {
             message = "No current location is available for reclaim crate placement.";
+            return false;
+        }
+
+        if (!PersistentLocationEnumerationRules.ShouldRegisterLocation(location))
+        {
+            message = ModText.Get(
+                "hud.reclaimClaimPersistentLocation",
+                "SVSAPME reclaim crates can only be claimed in persistent locations; move to the farm, farmhouse, town, or another saved location first.");
             return false;
         }
 
@@ -703,11 +715,11 @@ internal sealed class MachineRegistryService
         foreach (var farmer in Game1.getAllFarmers())
         {
             foreach (var item in farmer.Items)
-                items.Add(item);
+                AddPersistentInventoryItem(items, item);
         }
 
         foreach (var item in EnumerateTeamGlobalInventoryItems())
-            items.Add(item);
+            AddPersistentInventoryItem(items, item);
 
         Utility.ForEachLocation(location =>
         {
@@ -720,19 +732,29 @@ internal sealed class MachineRegistryService
                     continue;
 
                 foreach (var item in chest.Items)
-                    items.Add(item);
+                    AddPersistentInventoryItem(items, item);
             }
 
             foreach (var fridge in EnumerateFridges(location))
             {
                 foreach (var item in fridge.Items)
-                    items.Add(item);
+                    AddPersistentInventoryItem(items, item);
             }
 
             return true;
         });
 
         return items;
+    }
+
+    private static void AddPersistentInventoryItem(ICollection<Item?> items, Item? item, int depth = 0)
+    {
+        items.Add(item);
+        if (item is not Chest chest || depth >= 8)
+            return;
+
+        foreach (var nested in chest.Items)
+            AddPersistentInventoryItem(items, nested, depth + 1);
     }
 
     private static IEnumerable<Item?> EnumerateTeamGlobalInventoryItems()

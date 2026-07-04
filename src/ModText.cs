@@ -24,6 +24,17 @@ internal static class ModText
         var translation = translations?.Get(key, tokens);
         return translation is not null && translation.HasValue()
             ? translation.ToString()
-            : fallback;
+            : FormatFallback(fallback, tokens);
+    }
+
+    private static string FormatFallback(string text, object tokens)
+    {
+        foreach (var property in tokens.GetType().GetProperties())
+        {
+            var value = property.GetValue(tokens)?.ToString() ?? string.Empty;
+            text = text.Replace("{{" + property.Name + "}}", value, StringComparison.Ordinal);
+        }
+
+        return text;
     }
 }

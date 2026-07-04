@@ -11,6 +11,8 @@ namespace SVSAPME.Services;
 
 internal sealed class SvsapmeMultiplayerService
 {
+    private const int ReconciledTransactionLimit = 256;
+
     private readonly IModHelper helper;
     private readonly IManifest manifest;
     private readonly MachineStateRepository repository;
@@ -22,8 +24,11 @@ internal sealed class SvsapmeMultiplayerService
     private readonly IMonitor monitor;
     private readonly HashSet<long> warnedMissingPeers = new();
     private readonly HashSet<Guid> reconciledTransactions = new();
+    private readonly Queue<Guid> reconciledTransactionOrder = new();
     private readonly MultiplayerTransactionCache<SvsapmeMachineActionResponse> actionResponses = new();
     private readonly MultiplayerEscrowStore<Item> pendingActionEscrows = new();
+    private readonly Dictionary<long, string> blockedPeerActionMessages = new();
+    private string clientGameplayDisabledMessage = string.Empty;
 
     public SvsapmeMultiplayerService(
         IModHelper helper,
@@ -91,7 +96,10 @@ internal sealed class SvsapmeMultiplayerService
 
         if (!this.ClientGameplayEnabled)
         {
-            Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.multiplayer.hostMissingSvsapme", "SVSAPME gameplay is disabled because the host is missing SVSAPME."), HUDMessage.error_type));
+            var message = string.IsNullOrWhiteSpace(this.clientGameplayDisabledMessage)
+                ? ModText.Get("hud.multiplayer.hostMissingSvsapme", "SVSAPME gameplay is disabled because the host is missing SVSAPME.")
+                : this.clientGameplayDisabledMessage;
+            Game1.addHUDMessage(new HUDMessage(message, HUDMessage.error_type));
             return false;
         }
 
@@ -130,36 +138,73 @@ internal sealed class SvsapmeMultiplayerService
     public void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
     {
         this.reconciledTransactions.Clear();
+        this.reconciledTransactionOrder.Clear();
         this.actionResponses.Clear();
         this.pendingActionEscrows.ClearWithoutRestore();
+        this.blockedPeerActionMessages.Clear();
         this.ClientGameplayEnabled = true;
+        this.clientGameplayDisabledMessage = string.Empty;
     }
 
     public void OnPeerContextReceived(object? sender, PeerContextReceivedEventArgs e)
     {
         if (Context.IsMainPlayer)
         {
-            if (!e.Peer.IsHost && !PeerHasThisMod(e.Peer))
+            this.blockedPeerActionMessages.Remove(e.Peer.PlayerID);
+            if (e.Peer.IsHost)
+                return;
+
+            var peerMod = e.Peer.HasSmapi ? e.Peer.GetMod(this.manifest.UniqueID) : null;
+            if (peerMod is null)
+            {
                 this.WarnMissingRequiredMod(e.Peer, "SVSAPME requires every player to install this mod. A connected player is missing it, so SVSAPME custom machines are disabled for that peer.");
+                return;
+            }
+
+            var localVersion = this.manifest.Version.ToString();
+            var peerVersion = peerMod.Version.ToString();
+            if (!string.Equals(localVersion, peerVersion, StringComparison.OrdinalIgnoreCase))
+            {
+                var message = this.CreateVersionMismatchMessage(hostVersion: localVersion, peerVersion: peerVersion);
+                this.blockedPeerActionMessages[e.Peer.PlayerID] = message;
+                this.WarnPeerVersionMismatch(e.Peer, message, localVersion, peerVersion);
+            }
 
             return;
         }
 
-        if (e.Peer.IsHost && !PeerHasThisMod(e.Peer))
+        if (!e.Peer.IsHost)
+            return;
+
+        var hostMod = e.Peer.HasSmapi ? e.Peer.GetMod(this.manifest.UniqueID) : null;
+        if (hostMod is null)
         {
-            this.ClientGameplayEnabled = false;
-            this.WarnMissingRequiredMod(e.Peer, "SVSAPME is installed locally, but the host is missing it. SVSAPME gameplay is disabled for this multiplayer save.");
+            this.DisableClientGameplay(ModText.Get("hud.multiplayer.hostMissingSvsapme", "SVSAPME gameplay is disabled because the host is missing SVSAPME."));
+            this.WarnMissingRequiredMod(e.Peer, this.clientGameplayDisabledMessage);
+            return;
+        }
+
+        var hostVersion = hostMod.Version.ToString();
+        var thisVersion = this.manifest.Version.ToString();
+        if (!string.Equals(hostVersion, thisVersion, StringComparison.OrdinalIgnoreCase))
+        {
+            var message = this.CreateVersionMismatchMessage(hostVersion, thisVersion);
+            this.DisableClientGameplay(message);
+            this.WarnPeerVersionMismatch(e.Peer, message, hostVersion, thisVersion);
         }
     }
 
     public void OnPeerDisconnected(object? sender, PeerDisconnectedEventArgs e)
     {
         this.warnedMissingPeers.Remove(e.Peer.PlayerID);
+        this.blockedPeerActionMessages.Remove(e.Peer.PlayerID);
         if (!Context.IsMainPlayer && e.Peer.IsHost)
         {
             this.ClientGameplayEnabled = false;
+            this.clientGameplayDisabledMessage = ModText.Get("hud.multiplayer.hostMissingSvsapme", "SVSAPME gameplay is disabled because the host is missing SVSAPME.");
             this.RestorePendingActionEscrows();
             this.reconciledTransactions.Clear();
+            this.reconciledTransactionOrder.Clear();
             this.actionResponses.Clear();
             return;
         }
@@ -238,6 +283,14 @@ internal sealed class SvsapmeMultiplayerService
     private void HandleMachineActionRequest(ModMessageReceivedEventArgs e)
     {
         var request = e.ReadAs<SvsapmeMachineActionRequest>();
+        if (this.blockedPeerActionMessages.TryGetValue(e.FromPlayerID, out var blockMessage))
+        {
+            var blocked = CreateFailureActionResponse(request, blockMessage);
+            this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, blocked);
+            this.SendMachineActionResponse(blocked, e.FromPlayerID);
+            return;
+        }
+
         if (this.actionResponses.TryGet(e.FromPlayerID, request.TransactionId, out var cached))
         {
             this.SendMachineActionResponse(cached, e.FromPlayerID);
@@ -260,7 +313,7 @@ internal sealed class SvsapmeMultiplayerService
 
     private void HandleMachineActionResponse(SvsapmeMachineActionResponse response)
     {
-        if (!this.reconciledTransactions.Add(response.TransactionId))
+        if (!this.MarkTransactionReconciled(response.TransactionId))
             return;
 
         this.pendingActionEscrows.Resolve(
@@ -405,6 +458,21 @@ internal sealed class SvsapmeMultiplayerService
         return false;
     }
 
+    private bool MarkTransactionReconciled(Guid transactionId)
+    {
+        if (transactionId == Guid.Empty)
+            return true;
+
+        if (!this.reconciledTransactions.Add(transactionId))
+            return false;
+
+        this.reconciledTransactionOrder.Enqueue(transactionId);
+        while (this.reconciledTransactionOrder.Count > ReconciledTransactionLimit)
+            this.reconciledTransactions.Remove(this.reconciledTransactionOrder.Dequeue());
+
+        return true;
+    }
+
     private void HandleEnergyDebugRequest(ModMessageReceivedEventArgs e)
     {
         var request = e.ReadAs<SvsapmeEnergyDebugRequest>();
@@ -490,9 +558,33 @@ internal sealed class SvsapmeMultiplayerService
             Game1.createItemDebris(item, Game1.player.getStandingPosition(), -1, Game1.currentLocation);
     }
 
-    private static bool PeerHasThisMod(IMultiplayerPeer peer)
+    private bool PeerHasThisMod(IMultiplayerPeer peer)
     {
-        return peer.HasSmapi && peer.GetMod("Koizumi.SVSAPME") is not null;
+        return peer.HasSmapi && peer.GetMod(this.manifest.UniqueID) is not null;
+    }
+
+    private void DisableClientGameplay(string message)
+    {
+        this.ClientGameplayEnabled = false;
+        this.clientGameplayDisabledMessage = message;
+    }
+
+    private string CreateVersionMismatchMessage(string hostVersion, string peerVersion)
+    {
+        return ModText.Get(
+            "hud.multiplayer.versionMismatch",
+            "SVSAPME multiplayer version mismatch: host {{host}}, this player {{peer}}. Update every player to the same version before using SVSAPME machine actions.",
+            new { host = hostVersion, peer = peerVersion });
+    }
+
+    private void WarnPeerVersionMismatch(IMultiplayerPeer peer, string message, string hostVersion, string peerVersion)
+    {
+        if (!this.warnedMissingPeers.Add(peer.PlayerID))
+            return;
+
+        this.monitor.Log($"{message} (peer {peer.PlayerID}; host={hostVersion}; peer={peerVersion})", LogLevel.Warn);
+        if (Context.IsWorldReady)
+            Game1.addHUDMessage(new HUDMessage(message, HUDMessage.error_type));
     }
 
     private void WarnMissingRequiredMod(IMultiplayerPeer peer, string message)

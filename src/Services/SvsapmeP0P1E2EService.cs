@@ -1,9 +1,12 @@
 using System.Text.Json;
 using Koizumi.SVSAP.Api;
+using Koizumi.SVSAPME.Api;
 using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
+using StardewValley.Menus;
+using StardewValley.Network;
 using StardewValley.Objects;
 using SVSAPME.Content;
 using SVSAPME.Models;
@@ -16,7 +19,10 @@ internal sealed class SvsapmeP0P1E2EService
     private const string RoleEnv = "STARDEW_SVSAPME_P0P1_E2E_ROLE";
     private const string OutputDirEnv = "STARDEW_SVSAPME_P0P1_E2E_OUTPUT";
     private const string VersionEnv = "STARDEW_SVSAPME_P0P1_E2E_VERSION";
-    private const string DefaultVersionLabel = "ver1.2-alpha.2";
+    private const string FarmNameEnv = "STARDEW_SVSAPME_P0P1_E2E_FARM";
+    private const string JoinAddressEnv = "STARDEW_SVSAPME_P0P1_E2E_JOIN";
+    private const string DefaultVersionLabel = "ver1.3.0-alpha.1";
+    private const int StartupTimeoutTicks = 12000;
     private const string SvsapNetworkIdKey = ModItemCatalog.SvsapUniqueId + "/NetworkId";
     private const string SvsapEndpointIdKey = ModItemCatalog.SvsapUniqueId + "/EndpointId";
     private const string PoweredTransferHalfWhCreditKey = ModItemCatalog.UniqueId + "/PoweredTransferHalfWhCredit";
@@ -29,15 +35,21 @@ internal sealed class SvsapmeP0P1E2EService
     private readonly MachineRegistryService registry;
     private readonly EnergyNetworkManager energy;
     private readonly MachineRuntimeService runtime;
+    private readonly SvsapmeMultiplayerService multiplayer;
     private readonly Func<ISvsapApi?> getSvsapApi;
     private readonly Func<ModConfig> getConfig;
     private readonly string role;
     private readonly string outputDir;
     private readonly string versionLabel;
+    private readonly string farmName;
+    private readonly string joinAddress;
     private readonly List<E2EResult> results = new();
+    private object? svsapNetworkRepository;
 
     private bool started;
     private bool stopped;
+    private int startupStage;
+    private int startupTicks;
     private int stage;
     private int stageTicks;
     private SingleFixture? single;
@@ -48,6 +60,8 @@ internal sealed class SvsapmeP0P1E2EService
     private int r6TargetCapacityBeforeRoute;
     private PoweredTransferRunMode r6PlannedModeBeforeRoute;
     private int r6PlannedItemsBeforeRoute;
+    private SvsapmeEnergyDebugResponse? energyDebugResponse;
+    private bool hostOfflineRecorded;
 
     public SvsapmeP0P1E2EService(
         IModHelper helper,
@@ -56,6 +70,7 @@ internal sealed class SvsapmeP0P1E2EService
         MachineRegistryService registry,
         EnergyNetworkManager energy,
         MachineRuntimeService runtime,
+        SvsapmeMultiplayerService multiplayer,
         Func<ISvsapApi?> getSvsapApi,
         Func<ModConfig> getConfig)
     {
@@ -65,6 +80,7 @@ internal sealed class SvsapmeP0P1E2EService
         this.registry = registry;
         this.energy = energy;
         this.runtime = runtime;
+        this.multiplayer = multiplayer;
         this.getSvsapApi = getSvsapApi;
         this.getConfig = getConfig;
         this.role = (Environment.GetEnvironmentVariable(RoleEnv) ?? string.Empty).Trim().ToLowerInvariant();
@@ -72,6 +88,12 @@ internal sealed class SvsapmeP0P1E2EService
         this.versionLabel = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(VersionEnv))
             ? DefaultVersionLabel
             : Environment.GetEnvironmentVariable(VersionEnv)!;
+        this.farmName = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(FarmNameEnv))
+            ? "SVSAPMEP0P1"
+            : Environment.GetEnvironmentVariable(FarmNameEnv)!;
+        this.joinAddress = string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(JoinAddressEnv))
+            ? "127.0.0.1"
+            : Environment.GetEnvironmentVariable(JoinAddressEnv)!;
     }
 
     private bool IsEnabled => this.role is "single" or "host" or "client";
@@ -87,6 +109,8 @@ internal sealed class SvsapmeP0P1E2EService
             Directory.CreateDirectory(this.outputDir);
 
         this.helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
+        this.helper.Events.Multiplayer.ModMessageReceived += this.OnP0P1ModMessageReceived;
+        this.helper.Events.Multiplayer.PeerDisconnected += this.OnP0P1PeerDisconnected;
         this.monitor.Log($"SVSAPME_P0P1_E2E started role={this.role} version={this.versionLabel} output=\"{this.outputDir}\"", LogLevel.Info);
     }
 
@@ -97,15 +121,23 @@ internal sealed class SvsapmeP0P1E2EService
 
         this.stopped = true;
         this.helper.Events.GameLoop.UpdateTicked -= this.OnUpdateTicked;
+        this.helper.Events.Multiplayer.ModMessageReceived -= this.OnP0P1ModMessageReceived;
+        this.helper.Events.Multiplayer.PeerDisconnected -= this.OnP0P1PeerDisconnected;
     }
 
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
     {
-        if (this.stopped || !Context.IsWorldReady)
+        if (this.stopped)
             return;
 
         try
         {
+            if (!Context.IsWorldReady)
+            {
+                this.TickStartup();
+                return;
+            }
+
             switch (this.role)
             {
                 case "single" when Context.IsMainPlayer:
@@ -126,6 +158,211 @@ internal sealed class SvsapmeP0P1E2EService
             this.monitor.Log($"SVSAPME_P0P1_E2E_FAIL role={this.role} stage={this.stage} {ex}", LogLevel.Error);
             this.Stop();
         }
+    }
+
+    private void OnP0P1ModMessageReceived(object? sender, ModMessageReceivedEventArgs e)
+    {
+        if (Context.IsMainPlayer || e.FromModID != ModItemCatalog.UniqueId)
+            return;
+
+        if (e.Type == SvsapmeMultiplayerMessageTypes.EnergyDebugResponse)
+            this.energyDebugResponse = e.ReadAs<SvsapmeEnergyDebugResponse>();
+    }
+
+    private void OnP0P1PeerDisconnected(object? sender, PeerDisconnectedEventArgs e)
+    {
+        if (this.role != "client" || !e.Peer.IsHost || this.hostOfflineRecorded)
+            return;
+
+        this.hostOfflineRecorded = true;
+        var observedGuid = this.multi?.CellGuid ?? Guid.Empty;
+        var reportSent = this.multiplayer.TrySendMachineItemMovementReport(new SvsapmeMachineItemMovementReport
+        {
+            ObservedMachineGuids = { observedGuid }
+        });
+        this.WritePayload("client-host-offline.json", new
+        {
+            hostConnected = false,
+            clientGameplayEnabled = this.multiplayer.ClientGameplayEnabled,
+            reportSent,
+            observedGuid = observedGuid.ToString("N"),
+            hostCompleteSeen = this.Exists("host-complete.json")
+        });
+
+        if (this.Exists("host-complete.json"))
+        {
+            this.WritePayload("client-complete.json", new { ok = true, version = this.versionLabel });
+            this.Stop();
+        }
+    }
+
+    private void TickStartup()
+    {
+        this.startupTicks++;
+        if (this.role == "client"
+            && !this.hostOfflineRecorded
+            && this.Exists("host-complete.json")
+            && this.Exists("client-energy-debug.json"))
+        {
+            this.hostOfflineRecorded = true;
+            var observedGuid = this.multi?.CellGuid ?? Guid.Empty;
+            var reportSent = this.multiplayer.TrySendMachineItemMovementReport(new SvsapmeMachineItemMovementReport
+            {
+                ObservedMachineGuids = { observedGuid }
+            });
+            this.WritePayload("client-host-offline.json", new
+            {
+                hostConnected = false,
+                clientGameplayEnabled = this.multiplayer.ClientGameplayEnabled,
+                reportSent,
+                observedGuid = observedGuid.ToString("N"),
+                hostCompleteSeen = true,
+                worldReady = Context.IsWorldReady,
+                mainPlayer = Context.IsMainPlayer
+            });
+            this.WritePayload("client-complete.json", new { ok = true, version = this.versionLabel });
+            this.Stop();
+            return;
+        }
+
+        if (this.startupTicks > StartupTimeoutTicks)
+        {
+            this.WriteNotReadyResults();
+            this.Stop();
+            return;
+        }
+
+        if (this.role is "single" or "host")
+        {
+            this.TickHostFarmStartup(multiplayerServer: this.role == "host");
+            return;
+        }
+
+        if (this.role == "client")
+            this.TickClientJoinStartup();
+    }
+
+    private void TickHostFarmStartup(bool multiplayerServer)
+    {
+        if (this.startupStage == 0)
+        {
+            if (Game1.activeClickableMenu is not TitleMenu || TitleMenu.subMenu is not null)
+                return;
+
+            this.StartHostFarmCreation(multiplayerServer);
+            this.startupStage = 1;
+            return;
+        }
+
+        if (this.startupStage == 1 && TitleMenu.subMenu is CharacterCustomization menu)
+        {
+            this.CompleteHostFarmCreation(menu, multiplayerServer);
+            this.startupStage = 2;
+        }
+    }
+
+    private void TickClientJoinStartup()
+    {
+        var hostReady = string.IsNullOrWhiteSpace(this.outputDir) || File.Exists(Path.Combine(this.outputDir, "host-ready.json"));
+        if (!hostReady)
+            return;
+
+        if (this.startupStage == 0)
+        {
+            if (Game1.activeClickableMenu is not TitleMenu)
+                return;
+
+            var multiplayerCore = this.helper.Reflection.GetField<Multiplayer>(typeof(Game1), "multiplayer").GetValue();
+            var client = multiplayerCore.InitClient(new LidgrenClient(this.joinAddress));
+            TitleMenu.subMenu = new FarmhandMenu(client);
+            this.WritePayload("client-join-menu.json", new { ok = true, joinAddress = this.joinAddress, version = this.versionLabel });
+            this.monitor.Log($"SVSAPME_P0P1_E2E client-join-menu address=\"{this.joinAddress}\"", LogLevel.Info);
+            this.startupStage = 1;
+            return;
+        }
+
+        if (this.startupStage == 1)
+        {
+            var menu = this.GetFarmhandMenu();
+            var slot = menu?.MenuSlots.OfType<FarmhandMenu.FarmhandSlot>().FirstOrDefault(slot => !slot.BelongsToAnotherPlayer());
+            if (slot is null)
+                return;
+
+            slot.Activate();
+            this.WritePayload("client-slot-activated.json", new { ok = true, version = this.versionLabel });
+            this.monitor.Log("SVSAPME_P0P1_E2E client-slot-activated", LogLevel.Info);
+            this.startupStage = 2;
+        }
+    }
+
+    private FarmhandMenu? GetFarmhandMenu()
+    {
+        if (Game1.activeClickableMenu is FarmhandMenu active)
+            return active;
+
+        if (Game1.activeClickableMenu is TitleMenu && TitleMenu.subMenu is FarmhandMenu sub)
+            return sub;
+
+        return null;
+    }
+
+    private void StartHostFarmCreation(bool multiplayerServer)
+    {
+        Game1.resetPlayer();
+        this.ApplyHostFarmIdentity();
+        Game1.startingCabins = multiplayerServer ? 1 : 0;
+        Game1.cabinsSeparate = false;
+        Game1.whichFarm = 0;
+        Game1.options.enableServer = multiplayerServer;
+        Game1.player.team.useSeparateWallets.Value = false;
+        TitleMenu.subMenu = new CharacterCustomization(CharacterCustomization.Source.HostNewFarm, multiplayerServer: multiplayerServer);
+        this.WritePayload($"{this.role}-farm-create-started.json", new { ok = true, farmName = this.farmName, multiplayerServer, version = this.versionLabel });
+        this.monitor.Log($"SVSAPME_P0P1_E2E farm-create-started role={this.role} farm=\"{this.farmName}\" multiplayer={multiplayerServer}", LogLevel.Info);
+    }
+
+    private void CompleteHostFarmCreation(CharacterCustomization menu, bool multiplayerServer)
+    {
+        this.ApplyHostFarmIdentity();
+        Game1.startingCabins = multiplayerServer ? 1 : 0;
+        Game1.cabinsSeparate = false;
+        Game1.whichFarm = 0;
+        Game1.options.enableServer = multiplayerServer;
+        Game1.player.team.useSeparateWallets.Value = false;
+
+        this.helper.Reflection.GetField<TextBox>(menu, "nameBox").GetValue().Text = multiplayerServer ? "SVSAPMEHost" : "SVSAPMESolo";
+        this.helper.Reflection.GetField<TextBox>(menu, "farmnameBox").GetValue().Text = this.farmName;
+        this.helper.Reflection.GetField<TextBox>(menu, "favThingBox").GetValue().Text = "SVSAPME";
+        this.helper.Reflection.GetField<bool>(menu, "skipIntro").SetValue(true);
+
+        var ok = menu.okButton.bounds.Center;
+        menu.receiveLeftClick(ok.X, ok.Y);
+        this.WritePayload($"{this.role}-farm-create-submitted.json", new { ok = true, farmName = this.farmName, multiplayerServer, version = this.versionLabel });
+        this.monitor.Log($"SVSAPME_P0P1_E2E farm-create-submitted role={this.role} farm=\"{this.farmName}\"", LogLevel.Info);
+    }
+
+    private void ApplyHostFarmIdentity()
+    {
+        Game1.player.Name = this.role == "host" ? "SVSAPMEHost" : "SVSAPMESolo";
+        Game1.player.displayName = Game1.player.Name;
+        Game1.player.farmName.Value = this.farmName;
+        Game1.player.favoriteThing.Value = "SVSAPME";
+        Game1.player.isCustomized.Value = true;
+    }
+
+    private void WriteNotReadyResults()
+    {
+        this.WritePayload($"{this.role}-not-ready.json", new
+        {
+            version = this.versionLabel,
+            role = this.role,
+            pass = false,
+            e2eReady = false,
+            worldReady = Context.IsWorldReady,
+            mainPlayer = Context.IsMainPlayer,
+            startupStage = this.startupStage,
+            startupTicks = this.startupTicks
+        });
+        this.monitor.Log($"SVSAPME_P0P1_E2E_NOT_READY role={this.role} worldReady={Context.IsWorldReady} mainPlayer={Context.IsMainPlayer} stage={this.startupStage} ticks={this.startupTicks}", LogLevel.Warn);
     }
 
     private void TickSingle()
@@ -199,10 +436,11 @@ internal sealed class SvsapmeP0P1E2EService
                 && placed.QualifiedItemId == "(BC)" + ModItemCatalog.CopperEnergyCell
                 && TryReadMachineGuid(placed, out var placedGuid)
                 && placedGuid == this.multi.CellGuid;
+            var noPending = !this.repository.Data.PendingReclaims.SelectMany(reclaim => reclaim.MachineGuids).Contains(this.multi.CellGuid);
             this.Record(
                 "M1",
-                cellPlaced && cellState.StoredWh == this.multi.CellStoredWh,
-                $"farmhand replay cellPlaced={cellPlaced} storedWh={cellState.StoredWh} expected={this.multi.CellStoredWh}");
+                cellPlaced && cellState.StoredWh == this.multi.CellStoredWh && noPending,
+                $"farmhand replay cellPlaced={cellPlaced} storedWh={cellState.StoredWh} expected={this.multi.CellStoredWh} noPending={noPending}");
             this.WritePayload("host-m1-verified.json", new { ok = this.results.Last().Pass });
             this.stage = 20;
             this.stageTicks = 0;
@@ -232,6 +470,60 @@ internal sealed class SvsapmeP0P1E2EService
                 "M2",
                 noNaturalPending && !forceClaimed && machines == 0 && !pendingAfterForce,
                 $"farmhand-held noNaturalPending={noNaturalPending} forceClaimed={forceClaimed} machines={machines} pendingAfterForce={pendingAfterForce} message=\"{message}\"");
+            this.WritePayload("host-m2-verified.json", new { ok = this.results.Last().Pass });
+            this.stage = 30;
+            this.stageTicks = 0;
+            return;
+        }
+
+        if (this.stage == 30)
+        {
+            if (!this.Exists("client-consumed.json") || this.stageTicks < 30)
+                return;
+
+            this.registry.ReconcileMissingMachinesOnDayStarted();
+            this.registry.ReconcileMissingMachinesOnDayStarted();
+            var retired = !this.repository.Data.Machines.ContainsKey(this.multi!.FarmGuid);
+            var noNaturalPending = !this.repository.Data.PendingReclaims.SelectMany(reclaim => reclaim.MachineGuids).Contains(this.multi.FarmGuid);
+            this.repository.Data.PendingReclaims.Add(new PendingReclaimCrate
+            {
+                ReclaimId = Guid.NewGuid(),
+                Reason = "e2e-consumed-force",
+                OriginalLocationName = "Farm",
+                TileX = (int)this.multi.FarmTile.X,
+                TileY = (int)this.multi.FarmTile.Y,
+                MachineGuids = { this.multi.FarmGuid }
+            });
+            var forceClaimed = this.registry.TryClaimPendingReclaims(Game1.player, includeUnconfirmed: true, out var machines, out _, out var message);
+            this.Record(
+                "M3",
+                retired && noNaturalPending && !forceClaimed && machines == 0,
+                $"farmhand-consumed retired={retired} noNaturalPending={noNaturalPending} forceClaimed={forceClaimed} machines={machines} message=\"{message}\"");
+            var depositOk = this.energy.TryDepositWh(this.multi.NetworkId, 1_000, ModItemCatalog.UniqueId, "e2e-host-authority", out var accepted, out var code, out var energyMessage);
+            var readOk = this.energy.TryGetNetworkEnergy(this.multi.NetworkId, out var storedWh, out var capacityWh, out var readCode);
+            this.WritePayload("host-energy-ready.json", new HostEnergyReadyPayload(this.multi.NetworkId, depositOk, accepted, readOk, storedWh, capacityWh, code.ToString(), readCode.ToString(), energyMessage));
+            this.stage = 40;
+            this.stageTicks = 0;
+            return;
+        }
+
+        if (this.stage == 40)
+        {
+            if (!this.Exists("client-energy-denied.json") || !this.Exists("client-energy-debug.json") || this.stageTicks < 10)
+                return;
+
+            var ready = this.ReadPayload<HostEnergyReadyPayload>("host-energy-ready.json");
+            var denied = this.ReadPayload<ClientEnergyDeniedPayload>("client-energy-denied.json");
+            var debug = this.ReadPayload<ClientEnergyDebugPayload>("client-energy-debug.json");
+            var readOk = this.energy.TryGetNetworkEnergy(this.multi!.NetworkId, out var storedWh, out var capacityWh, out var code);
+            this.Record(
+                "M4",
+                ready.DepositOk && ready.AcceptedWh == 1_000 && !denied.DepositOk && denied.AcceptedWh == 0 && denied.Code == SvsapmeEnergyErrorCode.NotHost.ToString() && denied.RequestSent,
+                $"hostDeposit={ready.DepositOk}/{ready.AcceptedWh} clientDeposit={denied.DepositOk}/{denied.AcceptedWh} clientCode={denied.Code} requestSent={denied.RequestSent}");
+            this.Record(
+                "M5",
+                readOk && debug.Success && debug.NetworkId == this.multi.NetworkId && debug.StoredWh == storedWh && debug.CapacityWh == capacityWh,
+                $"hostRead={readOk}/{storedWh}/{capacityWh}/{code} clientDebug={debug.Success}/{debug.StoredWh}/{debug.CapacityWh}/{debug.Code}");
             this.WriteResults("host-complete.json");
             this.Stop();
         }
@@ -286,9 +578,90 @@ internal sealed class SvsapmeP0P1E2EService
 
         if (this.stage == 30)
         {
+            if (!this.Exists("host-m2-verified.json"))
+                return;
+
+            var hadBefore = this.PlayerHasMachineGuid(this.multi!.FarmGuid);
+            this.RemoveFromPlayerInventory(this.multi.FarmGuid);
+            var hasAfter = this.PlayerHasMachineGuid(this.multi.FarmGuid);
+            var reportSent = this.multiplayer.TrySendMachineItemMovementReport(new SvsapmeMachineItemMovementReport
+            {
+                RemovedMachineGuids = { this.multi.FarmGuid }
+            });
+            this.WritePayload("client-consumed.json", new
+            {
+                machineGuid = this.multi.FarmGuid.ToString("N"),
+                inventoryHadBefore = hadBefore,
+                inventoryHasAfter = hasAfter,
+                reportSent
+            });
+            this.stage = 40;
+            this.stageTicks = 0;
+            return;
+        }
+
+        if (this.stage == 40)
+        {
+            if (!this.Exists("host-energy-ready.json"))
+                return;
+
+            var ready = this.ReadPayload<HostEnergyReadyPayload>("host-energy-ready.json");
+            var depositOk = this.energy.TryDepositWh(ready.NetworkId, 250, ModItemCatalog.UniqueId, "e2e-client-denied", out var accepted, out var code, out var message);
+            var host = this.helper.Multiplayer.GetConnectedPlayers().FirstOrDefault(peer => peer.IsHost);
+            var requestSent = false;
+            if (host is not null)
+            {
+                this.helper.Multiplayer.SendMessage(
+                    new SvsapmeEnergyDebugRequest { NetworkId = ready.NetworkId },
+                    SvsapmeMultiplayerMessageTypes.EnergyDebugRequest,
+                    modIDs: new[] { ModItemCatalog.UniqueId },
+                    playerIDs: new[] { host.PlayerID });
+                requestSent = true;
+            }
+
+            this.WritePayload("client-energy-denied.json", new ClientEnergyDeniedPayload(depositOk, accepted, code.ToString(), message, requestSent));
+            this.stage = 50;
+            this.stageTicks = 0;
+            return;
+        }
+
+        if (this.stage == 50)
+        {
+            if (this.energyDebugResponse is null)
+                return;
+
+            this.WritePayload("client-energy-debug.json", new ClientEnergyDebugPayload(
+                this.energyDebugResponse.NetworkId,
+                this.energyDebugResponse.Success,
+                this.energyDebugResponse.Code,
+                this.energyDebugResponse.Message,
+                this.energyDebugResponse.StoredWh,
+                this.energyDebugResponse.CapacityWh));
+            this.stage = 60;
+            this.stageTicks = 0;
+            return;
+        }
+
+        if (this.stage == 60)
+        {
             if (!this.Exists("host-complete.json"))
                 return;
 
+            var hostConnected = this.helper.Multiplayer.GetConnectedPlayers().Any(peer => peer.IsHost);
+            if (hostConnected)
+                return;
+
+            var offlineReportSent = this.multiplayer.TrySendMachineItemMovementReport(new SvsapmeMachineItemMovementReport
+            {
+                ObservedMachineGuids = { this.multi!.CellGuid }
+            });
+            this.WritePayload("client-host-offline.json", new
+            {
+                hostConnected,
+                clientGameplayEnabled = this.multiplayer.ClientGameplayEnabled,
+                reportSent = offlineReportSent,
+                observedGuid = this.multi.CellGuid.ToString("N")
+            });
             this.WritePayload("client-complete.json", new { ok = true, version = this.versionLabel });
             this.Stop();
         }
@@ -533,14 +906,17 @@ internal sealed class SvsapmeP0P1E2EService
         var location = this.GetFarm();
         var origin = FindClearBlock(location, 4, 3);
         ClearBlock(location, origin, 4, 3);
-        var cellTile = origin;
-        var farmTile = origin + new Vector2(1, 0);
-        var cell = this.PlaceMachine(location, cellTile, "(BC)" + ModItemCatalog.CopperEnergyCell);
-        var farm = this.PlaceMachine(location, farmTile, "(BC)" + ModItemCatalog.CopperFarm);
+        var networkId = Guid.NewGuid();
+        var coreTile = origin;
+        var cellTile = origin + new Vector2(1, 0);
+        var farmTile = origin + new Vector2(2, 0);
+        this.PlaceLinkedMachine(location, coreTile, "(BC)" + ModItemCatalog.SvsapUniqueId + ".NetworkCore", networkId);
+        var cell = this.PlaceLinkedMachine(location, cellTile, "(BC)" + ModItemCatalog.CopperEnergyCell, networkId);
+        var farm = this.PlaceLinkedMachine(location, farmTile, "(BC)" + ModItemCatalog.CopperFarm, networkId);
         var cellGuid = this.RegisterMachine(cell, location, cellTile, storedWh: 3_210);
         var farmGuid = this.RegisterMachine(farm, location, farmTile, storedWh: 0);
         cell.modData[MachineRegistryService.StoredWhKey] = "3210";
-        return new MultiFixture(cellTile, farmTile, cellGuid, farmGuid, 3_210);
+        return new MultiFixture(networkId, cellTile, farmTile, cellGuid, farmGuid, 3_210);
     }
 
     private SObject PlaceLinkedMachine(GameLocation location, Vector2 tile, string qualifiedItemId, Guid networkId)
@@ -548,7 +924,7 @@ internal sealed class SvsapmeP0P1E2EService
         if (ItemRegistry.Create(qualifiedItemId, 1) is not SObject obj)
             throw new InvalidOperationException($"Could not create placeable object {qualifiedItemId}.");
 
-        StampEndpoint(obj, networkId);
+        this.RegisterSvsapEndpoint(obj, location, tile, networkId, GetSvsapEndpointType(obj));
         location.Objects[tile] = obj;
         return obj;
     }
@@ -565,7 +941,7 @@ internal sealed class SvsapmeP0P1E2EService
     private Chest PlaceLinkedChest(GameLocation location, Vector2 tile, Guid networkId)
     {
         var chest = new Chest(CreateEmptyChestSlots(), tile, false, 0, false);
-        StampEndpoint(chest, networkId);
+        this.RegisterSvsapEndpoint(chest, location, tile, networkId, "Chest");
         location.Objects[tile] = chest;
         return chest;
     }
@@ -679,6 +1055,13 @@ internal sealed class SvsapmeP0P1E2EService
         }
     }
 
+    private bool PlayerHasMachineGuid(Guid guid)
+    {
+        return Game1.player.Items.Any(item =>
+            item is not null
+            && item.modData.GetValueOrDefault(MachineRegistryService.MachineGuidKey) == guid.ToString("N"));
+    }
+
     private MachineState GetState(Guid guid)
     {
         if (!this.repository.Data.Machines.TryGetValue(guid, out var state))
@@ -711,10 +1094,64 @@ internal sealed class SvsapmeP0P1E2EService
         return Game1.getLocationFromName("Farm") ?? Game1.currentLocation ?? throw new InvalidOperationException("Farm location is not available.");
     }
 
-    private static void StampEndpoint(Item item, Guid networkId)
+    private void RegisterSvsapEndpoint(Item item, GameLocation location, Vector2 tile, Guid networkId, string endpointTypeName)
     {
+        var endpointId = Guid.NewGuid();
         item.modData[SvsapNetworkIdKey] = networkId.ToString("N");
-        item.modData[SvsapEndpointIdKey] = Guid.NewGuid().ToString("N");
+        item.modData[SvsapEndpointIdKey] = endpointId.ToString("N");
+
+        var repository = this.GetSvsapNetworkRepository();
+        var repositoryType = repository.GetType();
+        var network = repositoryType.GetMethod("GetOrCreateNetwork")?.Invoke(repository, new object?[] { networkId })
+            ?? throw new InvalidOperationException("Could not create SVSAP P0/P1 test network.");
+        var assembly = network.GetType().Assembly;
+        var endpointType = assembly.GetType("SVSAP.Models.NetworkEndpoint")
+            ?? throw new InvalidOperationException("SVSAP.Models.NetworkEndpoint type was not found.");
+        var endpointKindType = assembly.GetType("SVSAP.Models.EndpointType")
+            ?? throw new InvalidOperationException("SVSAP.Models.EndpointType type was not found.");
+        var endpoint = Activator.CreateInstance(endpointType)
+            ?? throw new InvalidOperationException("Could not instantiate SVSAP network endpoint.");
+
+        SetProperty(endpoint, "EndpointId", endpointId);
+        SetProperty(endpoint, "LocationName", location.NameOrUniqueName);
+        SetProperty(endpoint, "TileX", tile.X);
+        SetProperty(endpoint, "TileY", tile.Y);
+        SetProperty(endpoint, "Type", Enum.Parse(endpointKindType, endpointTypeName));
+        SetProperty(endpoint, "Active", true);
+        SetProperty(endpoint, "Priority", 0);
+
+        repositoryType.GetMethod("UpsertEndpoint")?.Invoke(repository, new[] { networkId, endpoint });
+    }
+
+    private object GetSvsapNetworkRepository()
+    {
+        if (this.svsapNetworkRepository is not null)
+            return this.svsapNetworkRepository;
+
+        var modInfo = this.helper.ModRegistry.Get(ModItemCatalog.SvsapUniqueId)
+            ?? throw new InvalidOperationException("Koizumi.SVSAP mod metadata was not found.");
+        var mod = modInfo.GetType().GetProperty("Mod")?.GetValue(modInfo)
+            ?? throw new InvalidOperationException("Koizumi.SVSAP mod instance was not available.");
+        var field = mod.GetType().GetField("networkRepository", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Koizumi.SVSAP networkRepository field was not found.");
+        this.svsapNetworkRepository = field.GetValue(mod)
+            ?? throw new InvalidOperationException("Koizumi.SVSAP networkRepository was null.");
+        return this.svsapNetworkRepository;
+    }
+
+    private static string GetSvsapEndpointType(Item item)
+    {
+        if (item.QualifiedItemId == "(BC)" + ModItemCatalog.SvsapUniqueId + ".NetworkCore")
+            return "NetworkCore";
+
+        return "Machine";
+    }
+
+    private static void SetProperty(object target, string name, object value)
+    {
+        var property = target.GetType().GetProperty(name)
+            ?? throw new InvalidOperationException($"Property {name} was not found on {target.GetType().FullName}.");
+        property.SetValue(target, value);
     }
 
     private static bool TryReadMachineGuid(Item item, out Guid guid)
@@ -834,6 +1271,7 @@ internal sealed class SvsapmeP0P1E2EService
         Guid ImporterGuid);
 
     private sealed record MultiFixture(
+        Guid NetworkId,
         Vector2 CellTile,
         Vector2 FarmTile,
         Guid CellGuid,
@@ -841,6 +1279,7 @@ internal sealed class SvsapmeP0P1E2EService
         long CellStoredWh);
 
     private sealed record MultiFixturePayload(
+        Guid NetworkId,
         string CellTile,
         string FarmTile,
         Guid CellGuid,
@@ -850,6 +1289,7 @@ internal sealed class SvsapmeP0P1E2EService
         public static MultiFixturePayload FromFixture(MultiFixture fixture)
         {
             return new MultiFixturePayload(
+                fixture.NetworkId,
                 FormatTile(fixture.CellTile),
                 FormatTile(fixture.FarmTile),
                 fixture.CellGuid,
@@ -860,6 +1300,7 @@ internal sealed class SvsapmeP0P1E2EService
         public MultiFixture ToFixture()
         {
             return new MultiFixture(
+                this.NetworkId,
                 ParseTile(this.CellTile),
                 ParseTile(this.FarmTile),
                 this.CellGuid,
@@ -867,4 +1308,30 @@ internal sealed class SvsapmeP0P1E2EService
                 this.CellStoredWh);
         }
     }
+
+    private sealed record HostEnergyReadyPayload(
+        Guid NetworkId,
+        bool DepositOk,
+        long AcceptedWh,
+        bool ReadOk,
+        long StoredWh,
+        long CapacityWh,
+        string DepositCode,
+        string ReadCode,
+        string Message);
+
+    private sealed record ClientEnergyDeniedPayload(
+        bool DepositOk,
+        long AcceptedWh,
+        string Code,
+        string Message,
+        bool RequestSent);
+
+    private sealed record ClientEnergyDebugPayload(
+        Guid NetworkId,
+        bool Success,
+        string Code,
+        string Message,
+        long StoredWh,
+        long CapacityWh);
 }
