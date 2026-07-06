@@ -68,6 +68,7 @@ internal sealed class MachineRegistryService
 
             if (this.TryFindHeldMachineItem(state.MachineGuid, out var heldItem))
             {
+                changed |= MachineLifecycleRules.ClearDisassembledMachineEnergy(state);
                 changed |= SyncMachineItemState(heldItem, state);
                 changed |= state.ModData.Remove(ConsumedCandidateKey);
                 if (state.MissingDays != 0)
@@ -83,32 +84,20 @@ internal sealed class MachineRegistryService
             if (state.ModData.Remove(ConsumedCandidateKey))
             {
                 changed = true;
-                var consumption = RetireConfirmedConsumedMachine(this.repository.Data, state.MachineGuid);
-
-                // Upgrade recipes consume the prior-tier machine item as literal material
-                // (SVSAPMEFinalDesign.md: "配方以原机器为原料（升级路径，字面替代）"). A consumed
-                // machine is gone; it is never reissued as an item, or the upgrade cost accounted for
-                // in the B10 table would be refundable and the whole upgrade economy would collapse.
-                // Any residual stored energy is annihilated with the machine, but never silently:
-                // we surface a host-side HUD warning plus a log line so the loss is observable.
-                if (consumption.DiscardedStoredWh > 0)
+                if (!CanRetireConfirmedConsumedMachine(state))
                 {
-                    this.monitor.Log($"Discarded {consumption.DiscardedStoredWh:N0} Wh of residual energy from consumed SVSAPME machine item {state.MachineGuid:N}; charged machines used as crafting material lose their stored energy.", LogLevel.Warn);
-                    if (Context.IsWorldReady)
-                    {
-                        var discardedWh = consumption.DiscardedStoredWh.ToString("N0");
-                        Game1.addHUDMessage(new HUDMessage(
-                            ModText.Get(
-                                "hud.machineConsumedEnergyLost",
-                                "A charged SVSAPME machine was used as crafting material; {{wh}} Wh of stored energy was lost.",
-                                new { wh = discardedWh }),
-                            HUDMessage.error_type));
-                    }
+                    this.monitor.Log($"Preserved SVSAPME machine state {state.MachineGuid:N} because the consumed-candidate state still has recoverable internal payload.", LogLevel.Trace);
                 }
+                else
+                {
+                    var consumption = RetireConfirmedConsumedMachine(this.repository.Data, state.MachineGuid);
+                    if (consumption.DiscardedStoredWh > 0)
+                        this.monitor.Log($"Discarded {consumption.DiscardedStoredWh:N0} Wh of residual energy from consumed SVSAPME machine item {state.MachineGuid:N}.", LogLevel.Trace);
 
-                this.machinesByGuid.Remove(state.MachineGuid);
-                this.monitor.Log($"Retired SVSAPME machine state {state.MachineGuid:N} after its item form was consumed and no live holder remained.", LogLevel.Trace);
-                continue;
+                    this.machinesByGuid.Remove(state.MachineGuid);
+                    this.monitor.Log($"Retired SVSAPME machine state {state.MachineGuid:N} after its item form was consumed and no live holder remained.", LogLevel.Trace);
+                    continue;
+                }
             }
 
             state.MissingDays++;
@@ -197,6 +186,10 @@ internal sealed class MachineRegistryService
             return false;
 
         var machineGuid = EnsureMachineGuid(placedObject);
+        var continuingPlacedState = this.repository.TryGet(machineGuid, out var existingState)
+            && string.Equals(existingState.LocationName, location.NameOrUniqueName, StringComparison.Ordinal)
+            && Math.Abs(existingState.TileX - tile.X) < 0.001f
+            && Math.Abs(existingState.TileY - tile.Y) < 0.001f;
         var state = this.repository.GetOrCreate(machineGuid);
         state.QualifiedItemId = placedObject.QualifiedItemId;
         state.LocationName = location.NameOrUniqueName;
@@ -207,8 +200,17 @@ internal sealed class MachineRegistryService
         state.ModData.Remove(ReclaimInTransitKey);
         state.ModData.Remove(ConsumedCandidateKey);
 
-        if (long.TryParse(placedObject.modData.GetValueOrDefault(StoredWhKey), out var storedWh))
+        if (EnergyCellRules.IsEnergyCell(placedObject.QualifiedItemId)
+            && long.TryParse(placedObject.modData.GetValueOrDefault(StoredWhKey), out var storedWh))
+        {
             state.StoredWh = Math.Max(0, storedWh);
+        }
+        else
+        {
+            placedObject.modData.Remove(StoredWhKey);
+            if (!continuingPlacedState)
+                MachineLifecycleRules.ClearDisassembledMachineEnergy(state);
+        }
 
         state.CapacityWh = GetMachineCapacityWh(placedObject.QualifiedItemId);
         this.machinesByGuid[machineGuid] = new MachineLocation(machineGuid, location.NameOrUniqueName, tile, placedObject.QualifiedItemId);
@@ -272,6 +274,7 @@ internal sealed class MachineRegistryService
         }
 
         var changed = state.ModData.Remove(ConsumedCandidateKey);
+        changed |= MachineLifecycleRules.ClearDisassembledMachineEnergy(state);
         if (state.MissingDays != 0)
         {
             state.MissingDays = 0;
@@ -386,19 +389,28 @@ internal sealed class MachineRegistryService
         if (!TryReadMachineGuid(placedObject, out var machineGuid))
             return false;
 
-        if (MachineLifecycleRules.IsSameTickReplayRemoval(machineGuid, addedMachineGuids))
+        var sameTickReplay = MachineLifecycleRules.IsSameTickReplayRemoval(machineGuid, addedMachineGuids);
+        if (this.repository.TryGet(machineGuid, out var state))
+        {
+            if (!sameTickReplay)
+            {
+                state.LocationName = location.NameOrUniqueName;
+                state.TileX = tile.X;
+                state.TileY = tile.Y;
+            }
+
+            state.MissingDays = 0;
+            MachineLifecycleRules.ClearDisassembledMachineEnergy(state);
+            if (sameTickReplay)
+                this.SyncPlacedMachineState(machineGuid);
+            else
+                SyncMachineItemState(placedObject, state);
+        }
+
+        if (sameTickReplay)
             return true;
 
         this.machinesByGuid.Remove(machineGuid);
-        if (this.repository.TryGet(machineGuid, out var state))
-        {
-            state.LocationName = location.NameOrUniqueName;
-            state.TileX = tile.X;
-            state.TileY = tile.Y;
-            state.MissingDays = 0;
-            placedObject.modData[StoredWhKey] = state.StoredWh.ToString();
-        }
-
         return true;
     }
 
@@ -541,6 +553,7 @@ internal sealed class MachineRegistryService
 
     private static Item CreateMachineItem(MachineState state)
     {
+        MachineLifecycleRules.ClearDisassembledMachineEnergy(state);
         var item = ItemRegistry.Create(state.QualifiedItemId, 1);
         SyncMachineItemState(item, state);
         return item;
@@ -600,6 +613,20 @@ internal sealed class MachineRegistryService
     internal static bool ShouldRecoverMachineForReclaim(bool verifyNotLive, bool isMachineGuidLive)
     {
         return !verifyNotLive || !isMachineGuidLive;
+    }
+
+    internal static bool CanRetireConfirmedConsumedMachine(MachineState state)
+    {
+        return !HasRecoverableInternalPayload(state);
+    }
+
+    private static bool HasRecoverableInternalPayload(MachineState state)
+    {
+        return state.OutputBuffer.Any(stack => stack.Stack > 0)
+            || (state.Farm.InternalSeedCount > 0 && !string.IsNullOrWhiteSpace(state.Farm.BoundSeedQualifiedItemId))
+            || (state.Farm.InternalFertilizerCount > 0 && !string.IsNullOrWhiteSpace(state.Farm.BoundFertilizerQualifiedItemId))
+            || state.Farm.Plots.Count > 0
+            || FarmModuleRules.GetInstalledModuleItems(state.Farm).Any();
     }
 
     internal static ConfirmedMachineConsumptionResult RetireConfirmedConsumedMachine(MachineSaveData data, Guid machineGuid)
@@ -784,7 +811,7 @@ internal sealed class MachineRegistryService
     {
         var changed = false;
         changed |= SetModData(item, MachineGuidKey, state.MachineGuid.ToString("N"));
-        if (state.StoredWh > 0)
+        if (EnergyCellRules.IsEnergyCell(state.QualifiedItemId) && state.StoredWh > 0)
             changed |= SetModData(item, StoredWhKey, state.StoredWh.ToString());
         else
             changed |= item.modData.Remove(StoredWhKey);

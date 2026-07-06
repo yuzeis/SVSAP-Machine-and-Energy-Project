@@ -184,6 +184,7 @@ internal sealed class MachineRuntimeService
             Game1.addHUDMessage(new HUDMessage(this.getConfig().EnableExtendedGeneratorFuels
                 ? ModText.Get("hud.carbonGenerator.holdExtendedFuel", "Hold Coal, Wood, Hardwood, Fiber, or Sap to fuel the Carbon Generator.")
                 : ModText.Get("hud.carbonGenerator.holdCoal", "Hold Coal to fuel the Carbon Generator."), HUDMessage.error_type));
+            this.HelperSuppress(e);
             return;
         }
 

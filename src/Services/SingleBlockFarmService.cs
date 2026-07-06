@@ -68,6 +68,7 @@ internal sealed class SingleBlockFarmService
         if (!TryClassifyFarmAction(held.QualifiedItemId, out var actionKind, out var error))
         {
             Game1.addHUDMessage(new HUDMessage(error, HUDMessage.error_type));
+            this.Suppress(e);
             return;
         }
 
@@ -83,7 +84,7 @@ internal sealed class SingleBlockFarmService
             SvsapmeMachineActionKind.LoadFarmSeed => this.TryLoadSeed(placedObject, location, tile, held.QualifiedItemId, Game1.player.FarmingLevel),
             SvsapmeMachineActionKind.LoadFarmFertilizer => this.TryLoadFertilizer(placedObject, location, tile, held.QualifiedItemId),
             SvsapmeMachineActionKind.InstallFarmModule => this.TryInstallModule(placedObject, location, tile, held.QualifiedItemId),
-            _ => new SvsapmeMachineActionApplyResult(false, false, "Unsupported farm action.")
+            _ => new SvsapmeMachineActionApplyResult(false, false, ModText.Get("hud.farm.unsupportedAction", "Unsupported farm action."))
         };
         if (result.Success && result.ConsumeEscrowedItem)
             Game1.player.reduceActiveItemByOne();

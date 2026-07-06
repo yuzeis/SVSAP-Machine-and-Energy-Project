@@ -20,7 +20,7 @@ internal sealed class SvsapmeFullMatrixE2EService
     private const string OutputDirEnv = "STARDEW_SVSAPME_FULL_E2E_OUTPUT";
     private const string VersionEnv = "STARDEW_SVSAPME_FULL_E2E_VERSION";
     private const string FarmNameEnv = "STARDEW_SVSAPME_FULL_E2E_FARM";
-    private const string DefaultVersionLabel = "ver1.3.0-alpha.1";
+    private const string DefaultVersionLabel = "ver1.3.0-Muehenlohn";
     private const int StartupTimeoutTicks = 12000;
     private const string SvsapNetworkIdKey = ModItemCatalog.SvsapUniqueId + "/NetworkId";
     private const string SvsapEndpointIdKey = ModItemCatalog.SvsapUniqueId + "/EndpointId";
@@ -711,19 +711,19 @@ internal sealed class SvsapmeFullMatrixE2EService
         this.registry.ReconcileMissingMachinesOnDayStarted();
         var retired = !this.repository.Data.Machines.ContainsKey(guid);
         var pending = this.repository.Data.PendingReclaims.SelectMany(reclaim => reclaim.MachineGuids).Contains(guid);
-        var hud = Game1.hudMessages.Count > beforeHud;
-        return (retired && !pending && hud, $"retired={retired} pending={pending} hudAdded={hud}");
+        var hudUnchanged = Game1.hudMessages.Count == beforeHud;
+        return (retired && !pending && hudUnchanged, $"retired={retired} pending={pending} hudUnchanged={hudUnchanged}");
     }
 
     private (bool, string) TestDigitizeGuard()
     {
         var fixture = this.CreateFixture(width: 4, height: 3);
         var item = this.CreateStatefulMachineItem("(BC)" + ModItemCatalog.CopperFarm, out var guid);
-        var inserted = this.getSvsapApi()!.TryInsertItem(fixture.NetworkId, item, out var remainder, out _, out _);
+        var inserted = this.getSvsapApi()!.TryInsertItem(fixture.NetworkId, item, out var remainder, out var code, out _);
         var inChest = fixture.TargetChest.Items.Any(entry => entry is not null
             && entry.modData.GetValueOrDefault(MachineRegistryService.MachineGuidKey) == guid.ToString("N"));
         this.repository.Data.Machines.Remove(guid);
-        return (inserted && remainder is null && inChest, $"inserted={inserted} remainder={(remainder?.Stack ?? 0)} inNetworkChest={inChest}");
+        return (!inserted && remainder is not null && !inChest, $"inserted={inserted} code={code} remainder={(remainder?.Stack ?? 0)} inNetworkChest={inChest}");
     }
 
     private (bool, string) TestStackGuard()

@@ -60,6 +60,7 @@ internal sealed class SvsapmeSelfTestService
             "orphan-reclaim" => TestOrphanReclaim(),
             "claim-force-gate" => TestClaimForceGate(),
             "consumed-charged-retire" => TestConsumedChargedRetire(),
+            "disassembly-energy-policy" => TestDisassemblyEnergyPolicy(),
             "missing-machine-reclaim" => TestMissingMachineReclaim(),
             "multiplayer-protocol" => TestMultiplayerProtocol(),
             "action-idempotent" => TestActionIdempotent(),
@@ -315,6 +316,9 @@ internal sealed class SvsapmeSelfTestService
         if (!restored.TakeLast(2).SequenceEqual(new[] { "blueberry", "coffee" }, StringComparer.Ordinal))
             failures.Add("host disconnect restore must preserve all pending escrow payloads");
 
+        if (typeof(SvsapmeMachineActionResponse).GetProperty(nameof(SvsapmeMachineActionResponse.ConsumeEscrowedItem))?.PropertyType != typeof(bool))
+            failures.Add("machine action responses must carry the authoritative consume/restore escrow decision");
+
         return failures;
     }
 
@@ -350,6 +354,18 @@ internal sealed class SvsapmeSelfTestService
 
         if (typeof(SvsapmeMultiplayerService).GetMethod("TrySendMachineActionRequest", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic) is null)
             failures.Add("SvsapmeMultiplayerService must expose a client action sender for farmhand clicks");
+
+        if (typeof(SvsapmeMultiplayerService).GetField("pendingClientActionsByMachine", nonPublicInstance) is null
+            || typeof(SvsapmeMultiplayerService).GetProperty("PendingClientMachineActionCount")?.PropertyType != typeof(int))
+        {
+            failures.Add("farmhand machine actions must keep an in-flight guard so repeated clicks cannot send duplicate consumptions");
+        }
+
+        if (typeof(SvsapmeMultiplayerService).GetMethod("TryReservePendingClientAction", nonPublicInstance) is null
+            || typeof(SvsapmeMultiplayerService).GetMethod("TryTakePlayerActionItem", nonPublicInstance) is not null)
+        {
+            failures.Add("SVSAPME multiplayer escrow must be client-side and must not mutate farmhand inventory from the host copy");
+        }
 
         if (typeof(SvsapmeMultiplayerService).GetMethod("TrySendMachineItemMovementReport", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic) is null)
             failures.Add("SvsapmeMultiplayerService must expose a client item-movement reporter for farmhand machine items");
@@ -936,6 +952,32 @@ internal sealed class SvsapmeSelfTestService
             MachineGuids = { machineGuid }
         });
 
+        if (!MachineRegistryService.CanRetireConfirmedConsumedMachine(data.Machines[machineGuid]))
+            failures.Add("energy-only consumed machines may retire; stored Wh is discarded by policy");
+
+        var loadedState = new MachineState
+        {
+            MachineGuid = Guid.Parse("edededed-eded-eded-eded-edededededed"),
+            QualifiedItemId = "(BC)" + ModItemCatalog.BatterySynthesizer,
+            OutputBuffer = { new BufferedItemStack { QualifiedItemId = "(O)787", Stack = 1 } }
+        };
+        if (MachineRegistryService.CanRetireConfirmedConsumedMachine(loadedState))
+            failures.Add("consumed-candidate machines with output buffers must not be retired as confirmed consumed");
+
+        var farmPayloadState = new MachineState
+        {
+            MachineGuid = Guid.Parse("efefefef-efef-efef-efef-efefefefefef"),
+            QualifiedItemId = "(BC)" + ModItemCatalog.CopperFarm,
+            Farm =
+            {
+                BoundSeedQualifiedItemId = "(O)472",
+                InternalSeedCount = 1,
+                InstalledModuleQualifiedItemIds = { "(O)" + ModItemCatalog.BasicGrowthLightModule }
+            }
+        };
+        if (MachineRegistryService.CanRetireConfirmedConsumedMachine(farmPayloadState))
+            failures.Add("consumed-candidate farms with internal seeds or modules must stay recoverable instead of retiring");
+
         var result = MachineRegistryService.RetireConfirmedConsumedMachine(data, machineGuid);
         if (!result.Retired)
             failures.Add("confirmed consumed machine must report retirement");
@@ -948,6 +990,39 @@ internal sealed class SvsapmeSelfTestService
 
         if (data.PendingReclaims.Any(reclaim => reclaim.MachineGuids.Contains(machineGuid)))
             failures.Add("confirmed consumed machine must not remain in pending reclaim records");
+
+        return failures;
+    }
+
+    private static IReadOnlyList<string> TestDisassemblyEnergyPolicy()
+    {
+        var failures = new List<string>();
+        var nonCell = new MachineState
+        {
+            MachineGuid = Guid.Parse("11111111-1111-1111-1111-111111111111"),
+            QualifiedItemId = "(BC)" + ModItemCatalog.BatterySynthesizer,
+            StoredWh = 4000,
+            ProgressWh = 2500
+        };
+        if (!MachineLifecycleRules.ClearDisassembledMachineEnergy(nonCell))
+            failures.Add("non-cell machine disassembly must report an energy-state change");
+
+        if (nonCell.StoredWh != 0 || nonCell.ProgressWh != 0)
+            failures.Add("non-cell machine disassembly must zero StoredWh and ProgressWh");
+
+        var cell = new MachineState
+        {
+            MachineGuid = Guid.Parse("22222222-2222-2222-2222-222222222222"),
+            QualifiedItemId = "(BC)" + ModItemCatalog.CopperEnergyCell,
+            StoredWh = 4000,
+            ProgressWh = 2500
+        };
+        MachineLifecycleRules.ClearDisassembledMachineEnergy(cell);
+        if (cell.StoredWh != 4000)
+            failures.Add("energy cell disassembly must preserve StoredWh");
+
+        if (cell.ProgressWh != 0)
+            failures.Add("energy cell disassembly must still clear non-cell progress fields");
 
         return failures;
     }
@@ -1364,6 +1439,7 @@ internal sealed class SvsapmeSelfTestService
         "orphan-reclaim",
         "claim-force-gate",
         "consumed-charged-retire",
+        "disassembly-energy-policy",
         "missing-machine-reclaim",
         "multiplayer-protocol",
         "action-idempotent",

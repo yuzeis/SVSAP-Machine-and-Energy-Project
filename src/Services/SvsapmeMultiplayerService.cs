@@ -27,6 +27,7 @@ internal sealed class SvsapmeMultiplayerService
     private readonly Queue<Guid> reconciledTransactionOrder = new();
     private readonly MultiplayerTransactionCache<SvsapmeMachineActionResponse> actionResponses = new();
     private readonly MultiplayerEscrowStore<Item> pendingActionEscrows = new();
+    private readonly Dictionary<Guid, PendingClientAction> pendingClientActionsByMachine = new();
     private readonly Dictionary<long, string> blockedPeerActionMessages = new();
     private string clientGameplayDisabledMessage = string.Empty;
 
@@ -57,6 +58,8 @@ internal sealed class SvsapmeMultiplayerService
     public int CachedActionResponseCount => this.actionResponses.Count;
 
     public int PendingActionEscrowCount => this.pendingActionEscrows.Count;
+
+    public int PendingClientMachineActionCount => this.pendingClientActionsByMachine.Count;
 
     public bool TrySendMachineItemMovementReport(SvsapmeMachineItemMovementReport report)
     {
@@ -110,8 +113,15 @@ internal sealed class SvsapmeMultiplayerService
             return false;
         }
 
+        if (!this.TryReservePendingClientAction(request, out var pendingMessage))
+        {
+            Game1.addHUDMessage(new HUDMessage(pendingMessage, HUDMessage.error_type));
+            return false;
+        }
+
         if (!this.TryCaptureEscrowedHeldItem(request, out var captureMessage))
         {
+            this.ClearPendingClientAction(request);
             Game1.addHUDMessage(new HUDMessage(captureMessage, HUDMessage.error_type));
             return false;
         }
@@ -126,9 +136,10 @@ internal sealed class SvsapmeMultiplayerService
         }
         catch (Exception ex)
         {
+            this.ClearPendingClientAction(request);
             this.pendingActionEscrows.Resolve(request.TransactionId, restore: true, RestoreEscrowedItem);
             this.monitor.Log($"Failed to send SVSAPME machine action request to host: {ex.Message}", LogLevel.Warn);
-            Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.multiplayer.actionSendFailed", "SVSAPME action could not be sent; escrowed item was restored."), HUDMessage.error_type));
+            Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.multiplayer.actionSendFailed", "SVSAPME action could not be sent; please retry."), HUDMessage.error_type));
             return false;
         }
 
@@ -141,6 +152,7 @@ internal sealed class SvsapmeMultiplayerService
         this.reconciledTransactionOrder.Clear();
         this.actionResponses.Clear();
         this.pendingActionEscrows.ClearWithoutRestore();
+        this.pendingClientActionsByMachine.Clear();
         this.blockedPeerActionMessages.Clear();
         this.ClientGameplayEnabled = true;
         this.clientGameplayDisabledMessage = string.Empty;
@@ -203,6 +215,7 @@ internal sealed class SvsapmeMultiplayerService
             this.ClientGameplayEnabled = false;
             this.clientGameplayDisabledMessage = ModText.Get("hud.multiplayer.hostMissingSvsapme", "SVSAPME gameplay is disabled because the host is missing SVSAPME.");
             this.RestorePendingActionEscrows();
+            this.pendingClientActionsByMachine.Clear();
             this.reconciledTransactions.Clear();
             this.reconciledTransactionOrder.Clear();
             this.actionResponses.Clear();
@@ -297,7 +310,7 @@ internal sealed class SvsapmeMultiplayerService
             return;
         }
 
-        var response = this.ExecuteMachineActionRequest(request);
+        var response = this.ExecuteMachineActionRequest(request, e.FromPlayerID);
         this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, response);
         this.SendMachineActionResponse(response, e.FromPlayerID);
     }
@@ -320,8 +333,11 @@ internal sealed class SvsapmeMultiplayerService
             response.TransactionId,
             SvsapmeActionEscrowRules.ShouldRestoreOnResponse(response.Success, response.ConsumeEscrowedItem),
             RestoreEscrowedItem);
+        this.ClearPendingClientAction(response);
 
-        Game1.addHUDMessage(new HUDMessage(response.Message, response.Success ? HUDMessage.newQuest_type : HUDMessage.error_type));
+        Game1.addHUDMessage(new HUDMessage(
+            LocalizeMachineActionResponse(response.Success),
+            response.Success ? HUDMessage.newQuest_type : HUDMessage.error_type));
     }
 
     internal bool TryCaptureEscrowedHeldItem(SvsapmeMachineActionRequest request, out string message)
@@ -337,28 +353,42 @@ internal sealed class SvsapmeMultiplayerService
         var player = Game1.player;
         var held = player?.CurrentItem;
         if (player is null || held is null)
-            return true;
-
-        if (player.Items.IndexOf(held) < 0 || held.Stack <= 0)
         {
-            message = "Held item changed; please retry.";
+            message = ModText.Get("hud.multiplayer.heldChanged", "Held item changed; please retry.");
             return false;
         }
 
-        var escrowed = held.getOne();
-        escrowed.Stack = 1;
+        if (player.Items.IndexOf(held) < 0
+            || held.Stack <= 0
+            || !string.Equals(held.QualifiedItemId, request.QualifiedItemId, StringComparison.Ordinal))
+        {
+            message = ModText.Get("hud.multiplayer.heldChanged", "Held item changed; please retry.");
+            return false;
+        }
+
+        var escrowedItem = held.getOne();
+        escrowedItem.Stack = 1;
+        var slot = player.Items.IndexOf(held);
         held.Stack -= 1;
         if (held.Stack <= 0)
-            player.removeItemFromInventory(held);
+            player.Items[slot] = null;
 
-        this.pendingActionEscrows.Track(request.TransactionId, escrowed);
-        return true;
+        if (this.pendingActionEscrows.Track(request.TransactionId, escrowedItem))
+            return true;
+
+        RestoreEscrowedItem(escrowedItem);
+        message = ModText.Get("hud.multiplayer.actionSendFailed", "SVSAPME action could not be sent; please retry.");
+        return false;
     }
 
-    private SvsapmeMachineActionResponse ExecuteMachineActionRequest(SvsapmeMachineActionRequest request)
+    private SvsapmeMachineActionResponse ExecuteMachineActionRequest(SvsapmeMachineActionRequest request, long fromPlayerId)
     {
         if (!this.TryResolveHostActionContext(request, out var state, out var location, out var tile, out var placedObject, out var failure))
             return CreateFailureActionResponse(request, failure);
+
+        var player = Game1.GetPlayer(fromPlayerId, onlyOnline: true);
+        if (player is null)
+            return CreateFailureActionResponse(request, ModText.Get("hud.multiplayer.requestPlayerOffline", "The requesting player is no longer online."));
 
         var result = request.ActionKind switch
         {
@@ -389,7 +419,7 @@ internal sealed class SvsapmeMultiplayerService
                 location,
                 tile,
                 request.QualifiedItemId),
-            _ => new SvsapmeMachineActionApplyResult(false, false, "Unsupported SVSAPME machine action.")
+            _ => new SvsapmeMachineActionApplyResult(false, false, ModText.Get("hud.multiplayer.unsupportedAction", "Unsupported SVSAPME machine action."))
         };
 
         return new SvsapmeMachineActionResponse
@@ -397,9 +427,60 @@ internal sealed class SvsapmeMultiplayerService
             TransactionId = request.TransactionId,
             MachineGuid = request.MachineGuid,
             Success = result.Success,
-            ConsumeEscrowedItem = result.ConsumeEscrowedItem,
+            ConsumeEscrowedItem = result.Success && result.ConsumeEscrowedItem,
             Message = result.Message
         };
+    }
+
+    private bool TryReservePendingClientAction(SvsapmeMachineActionRequest request, out string message)
+    {
+        message = string.Empty;
+        if (request.MachineGuid == Guid.Empty || request.TransactionId == Guid.Empty)
+            return true;
+
+        if (this.pendingClientActionsByMachine.TryGetValue(request.MachineGuid, out var pending)
+            && pending.TransactionId != request.TransactionId)
+        {
+            message = ModText.Get("hud.multiplayer.actionPending", "SVSAPME is still waiting for the previous action on this machine.");
+            return false;
+        }
+
+        this.pendingClientActionsByMachine[request.MachineGuid] = new PendingClientAction(request.TransactionId);
+        return true;
+    }
+
+    private void ClearPendingClientAction(SvsapmeMachineActionRequest request)
+    {
+        if (request.MachineGuid == Guid.Empty)
+            return;
+
+        if (this.pendingClientActionsByMachine.TryGetValue(request.MachineGuid, out var pending)
+            && pending.TransactionId == request.TransactionId)
+        {
+            this.pendingClientActionsByMachine.Remove(request.MachineGuid);
+        }
+    }
+
+    private void ClearPendingClientAction(SvsapmeMachineActionResponse response)
+    {
+        if (response.MachineGuid == Guid.Empty)
+            return;
+
+        if (this.pendingClientActionsByMachine.TryGetValue(response.MachineGuid, out var pending)
+            && pending.TransactionId == response.TransactionId)
+        {
+            this.pendingClientActionsByMachine.Remove(response.MachineGuid);
+        }
+    }
+
+    private static void RestoreEscrowedItemToPlayer(Farmer player, Item item)
+    {
+        if (player.addItemToInventoryBool(item))
+            return;
+
+        var location = player.currentLocation ?? Game1.currentLocation;
+        if (Context.IsWorldReady && location is not null)
+            Game1.createItemDebris(item, player.getStandingPosition(), -1, location);
     }
 
     private bool TryResolveHostActionContext(
@@ -416,37 +497,37 @@ internal sealed class SvsapmeMultiplayerService
         placedObject = null!;
 
         if (request.TransactionId == Guid.Empty)
-            return Fail("SVSAPME action request is missing a TransactionId.", out message);
+            return Fail(ModText.Get("hud.multiplayer.missingTransactionId", "SVSAPME action request is missing a TransactionId."), out message);
 
         if (!this.repository.TryGet(request.MachineGuid, out state!))
-            return Fail("MachineGuid is unknown on the host.", out message);
+            return Fail(ModText.Get("hud.multiplayer.unknownMachineGuid", "MachineGuid is unknown on the host."), out message);
 
         location = Game1.getLocationFromName(state.LocationName);
         if (location is null)
-            return Fail("Machine location is not loaded on the host.", out message);
+            return Fail(ModText.Get("hud.multiplayer.machineLocationMissing", "Machine location is not loaded on the host."), out message);
 
         tile = new Vector2(state.TileX, state.TileY);
         if (!location.Objects.TryGetValue(tile, out placedObject!))
-            return Fail("Machine is missing from its recorded tile.", out message);
+            return Fail(ModText.Get("hud.multiplayer.machineTileMissing", "Machine is missing from its recorded tile."), out message);
 
         if (placedObject.QualifiedItemId != state.QualifiedItemId)
-            return Fail("Machine tile now contains a different object.", out message);
+            return Fail(ModText.Get("hud.multiplayer.machineTileChanged", "Machine tile now contains a different object."), out message);
 
         if (!Guid.TryParse(placedObject.modData.GetValueOrDefault(MachineRegistryService.MachineGuidKey), out var placedGuid)
             || placedGuid != request.MachineGuid)
         {
-            return Fail("MachineGuid does not match the object at its recorded tile.", out message);
+            return Fail(ModText.Get("hud.multiplayer.machineGuidMismatch", "MachineGuid does not match the object at its recorded tile."), out message);
         }
 
         var api = this.getSvsapApi();
         if (api is null)
-            return Fail("SVSAP API is unavailable on the host.", out message);
+            return Fail(ModText.Get("hud.multiplayer.svsapApiUnavailable", "SVSAP API is unavailable on the host."), out message);
 
         if (!api.TryGetLinkedEndpoint(location, tile, out var endpoint, out var code, out var apiMessage))
-            return Fail($"SVSAP endpoint validation failed: {code} {apiMessage}", out message);
+            return Fail(ModText.Get("hud.multiplayer.endpointValidationFailed", "SVSAP endpoint validation failed: {{code}} {{message}}", new { code, message = apiMessage }), out message);
 
         if (endpoint is null || !endpoint.Active)
-            return Fail("Machine is not on an active SVSAP network.", out message);
+            return Fail(ModText.Get("hud.multiplayer.endpointInactive", "Machine is not on an active SVSAP network."), out message);
 
         message = string.Empty;
         return true;
@@ -510,7 +591,7 @@ internal sealed class SvsapmeMultiplayerService
             {
                 MachineGuid = machineGuid,
                 Success = false,
-                Message = "MachineGuid is unknown on the host."
+                Message = ModText.Get("hud.multiplayer.unknownMachineGuid", "MachineGuid is unknown on the host.")
             };
         }
 
@@ -518,7 +599,7 @@ internal sealed class SvsapmeMultiplayerService
         {
             MachineGuid = machineGuid,
             Success = true,
-            Message = "Machine snapshot resolved.",
+            Message = ModText.Get("hud.multiplayer.machineSnapshotResolved", "Machine snapshot resolved."),
             QualifiedItemId = state.QualifiedItemId,
             LocationName = state.LocationName,
             TileX = state.TileX,
@@ -545,17 +626,27 @@ internal sealed class SvsapmeMultiplayerService
     private void RestorePendingActionEscrows()
     {
         var restored = this.pendingActionEscrows.RestoreAll(RestoreEscrowedItem);
+        this.pendingClientActionsByMachine.Clear();
         if (restored > 0)
             this.monitor.Log($"Restored {restored:N0} pending SVSAPME action escrow item(s).", LogLevel.Warn);
     }
 
+    private static string LocalizeMachineActionResponse(bool success)
+    {
+        return success
+            ? ModText.Get("hud.multiplayer.actionSucceeded", "SVSAPME action completed.")
+            : ModText.Get("hud.multiplayer.actionFailed", "SVSAPME action failed; please retry.");
+    }
+
     private static void RestoreEscrowedItem(Item item)
     {
-        if (Game1.player is not null && Game1.player.addItemToInventoryBool(item))
+        var player = Game1.player;
+        if (player is not null && player.addItemToInventoryBool(item))
             return;
 
-        if (Context.IsWorldReady && Game1.player is not null)
-            Game1.createItemDebris(item, Game1.player.getStandingPosition(), -1, Game1.currentLocation);
+        var location = player?.currentLocation ?? Game1.currentLocation;
+        if (Context.IsWorldReady && player is not null && location is not null)
+            Game1.createItemDebris(item, player.getStandingPosition(), -1, location);
     }
 
     private bool PeerHasThisMod(IMultiplayerPeer peer)
@@ -599,4 +690,6 @@ internal sealed class SvsapmeMultiplayerService
         if (Context.IsWorldReady)
             Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.multiplayer.allPlayersNeedMod", "SVSAPME: all players must install this mod for multiplayer SVSAPME gameplay."), HUDMessage.error_type));
     }
+
+    private sealed record PendingClientAction(Guid TransactionId);
 }

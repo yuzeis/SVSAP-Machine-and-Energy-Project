@@ -21,7 +21,7 @@ internal sealed class SvsapmeP0P1E2EService
     private const string VersionEnv = "STARDEW_SVSAPME_P0P1_E2E_VERSION";
     private const string FarmNameEnv = "STARDEW_SVSAPME_P0P1_E2E_FARM";
     private const string JoinAddressEnv = "STARDEW_SVSAPME_P0P1_E2E_JOIN";
-    private const string DefaultVersionLabel = "ver1.3.0-alpha.1";
+    private const string DefaultVersionLabel = "ver1.3.0-Muehenlohn";
     private const int StartupTimeoutTicks = 12000;
     private const string SvsapNetworkIdKey = ModItemCatalog.SvsapUniqueId + "/NetworkId";
     private const string SvsapEndpointIdKey = ModItemCatalog.SvsapUniqueId + "/EndpointId";
@@ -781,7 +781,7 @@ internal sealed class SvsapmeP0P1E2EService
 
         this.Record(
             "R4",
-            playerStackRejected && inserted && remainder is null && inNetworkChest,
+            playerStackRejected && !inserted && remainder is not null && !inNetworkChest,
             $"stackRejected={playerStackRejected} inserted={inserted} remainder={(remainder?.Stack ?? 0)} networkChestHasGuid={inNetworkChest}");
     }
 

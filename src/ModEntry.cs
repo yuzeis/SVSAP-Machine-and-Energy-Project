@@ -134,7 +134,7 @@ public sealed class ModEntry : Mod
 #if DEBUG
         helper.ConsoleCommands.Add(
             "svsapme_selftest",
-            "Run implemented SVSAPME foundation selftests. Optional args include wh-roundtrip tier-table content-table api-shape config-surface cell-stack-guard machine-guid-reconcile orphan-reclaim claim-force-gate consumed-charged-retire missing-machine-reclaim multiplayer-protocol action-idempotent escrow-restore host-action-dispatch energy-production-rules synth-atomic farm-crop-set farm-power-freeze farm-daily-progress farm-single-crop-budget farm-module-economy farm-fertilizer-quality farm-locked-output daily-order-storage-gate location-cache-full-enum building-demolish-reclaim powered-prescan-refund powered-degrade-parity powered-interface-range battery-discharge-gate electric-machine-rules b10-parity no-arbitrage-audit.",
+            "Run implemented SVSAPME foundation selftests. Optional args include wh-roundtrip tier-table content-table api-shape config-surface cell-stack-guard machine-guid-reconcile orphan-reclaim claim-force-gate consumed-charged-retire disassembly-energy-policy missing-machine-reclaim multiplayer-protocol action-idempotent escrow-restore host-action-dispatch energy-production-rules synth-atomic farm-crop-set farm-power-freeze farm-daily-progress farm-single-crop-budget farm-module-economy farm-fertilizer-quality farm-locked-output daily-order-storage-gate location-cache-full-enum building-demolish-reclaim powered-prescan-refund powered-degrade-parity powered-interface-range battery-discharge-gate electric-machine-rules b10-parity no-arbitrage-audit.",
             this.selfTestService.RunCommand);
 #endif
         helper.ConsoleCommands.Add(
