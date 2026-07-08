@@ -32,6 +32,8 @@ internal sealed class ModConfig
     public bool EnablePoweredTransfer { get; set; } = true;
     public bool EnableElectricMachines { get; set; } = true;
     public bool EnableAutomaticFarmOutputToNetwork { get; set; } = true;
+    public bool EnableAutomaticProcessorInputFromNetwork { get; set; } = true;
+    public bool EnableAutomaticProcessorOutputToNetwork { get; set; } = true;
     public bool AllowBatteryDischarge { get; set; }
     public double BatteryDischargeEfficiency { get; set; } = 0.8;
     public double GeneratorMultiplier { get; set; } = 1.0;

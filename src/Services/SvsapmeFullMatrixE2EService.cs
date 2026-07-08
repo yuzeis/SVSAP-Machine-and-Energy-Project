@@ -20,7 +20,7 @@ internal sealed class SvsapmeFullMatrixE2EService
     private const string OutputDirEnv = "STARDEW_SVSAPME_FULL_E2E_OUTPUT";
     private const string VersionEnv = "STARDEW_SVSAPME_FULL_E2E_VERSION";
     private const string FarmNameEnv = "STARDEW_SVSAPME_FULL_E2E_FARM";
-    private const string DefaultVersionLabel = "ver1.3.0-Muehenlohn";
+    private const string DefaultVersionLabel = "ver1.4.0-alpha.1";
     private const int StartupTimeoutTicks = 12000;
     private const string SvsapNetworkIdKey = ModItemCatalog.SvsapUniqueId + "/NetworkId";
     private const string SvsapEndpointIdKey = ModItemCatalog.SvsapUniqueId + "/EndpointId";
@@ -1065,7 +1065,8 @@ internal sealed class SvsapmeFullMatrixE2EService
         var targetChest = this.PlaceChest(fixture.Location, exporterTile + new Vector2(1, 0));
         var exporter = this.PlaceLinkedMachine(fixture.Location, exporterTile, exporterQualifiedItemId, fixture.NetworkId);
         this.RegisterMachine(exporter, fixture.Location, exporterTile, 0);
-        this.runtime.TryConfigurePoweredFilter(exporter, fixture.Location, exporterTile, "(O)390", 1);
+        if (!this.runtime.TrySetPoweredFilterSlot(exporter, fixture.Location, exporterTile, 0, "(O)390", out _))
+            return 0;
         this.SetNetworkEnergy(fixture, 100_000);
         this.InsertNetwork(fixture.NetworkId, "(O)390", Math.Max(expected + 10, 1500));
         this.runtime.RunRouteTickForE2E();

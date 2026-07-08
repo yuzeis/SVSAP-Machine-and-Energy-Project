@@ -586,6 +586,15 @@ internal sealed class MachineRegistryService
                 reclaimedItems++;
             }
 
+            foreach (var buffered in state.Farm.InputBuffer)
+            {
+                if (buffered.Stack <= 0)
+                    continue;
+
+                items.Add(BufferedItemCodec.CreateItem(buffered));
+                reclaimedItems++;
+            }
+
             if (state.Farm.InternalSeedCount > 0
                 && !string.IsNullOrWhiteSpace(state.Farm.BoundSeedQualifiedItemId))
             {
@@ -603,6 +612,12 @@ internal sealed class MachineRegistryService
             foreach (var moduleQualifiedItemId in FarmModuleRules.GetInstalledModuleItems(state.Farm))
             {
                 items.Add(ItemRegistry.Create(moduleQualifiedItemId, 1));
+                reclaimedItems++;
+            }
+
+            foreach (var processorItem in GetProcessorRecoverableItems(state.Processor))
+            {
+                items.Add(processorItem);
                 reclaimedItems++;
             }
         }
@@ -623,10 +638,14 @@ internal sealed class MachineRegistryService
     private static bool HasRecoverableInternalPayload(MachineState state)
     {
         return state.OutputBuffer.Any(stack => stack.Stack > 0)
+            || state.Farm.InputBuffer.Any(stack => stack.Stack > 0)
             || (state.Farm.InternalSeedCount > 0 && !string.IsNullOrWhiteSpace(state.Farm.BoundSeedQualifiedItemId))
             || (state.Farm.InternalFertilizerCount > 0 && !string.IsNullOrWhiteSpace(state.Farm.BoundFertilizerQualifiedItemId))
             || state.Farm.Plots.Count > 0
-            || FarmModuleRules.GetInstalledModuleItems(state.Farm).Any();
+            || FarmModuleRules.GetInstalledModuleItems(state.Farm).Any()
+            || state.Processor.InputBuffer.Any(stack => stack.Stack > 0)
+            || state.Processor.OutputBuffer.Any(stack => stack.Stack > 0)
+            || state.Processor.Slots.Any(SingleBlockProcessorRules.IsWorking);
     }
 
     internal static ConfirmedMachineConsumptionResult RetireConfirmedConsumedMachine(MachineSaveData data, Guid machineGuid)
@@ -660,11 +679,37 @@ internal sealed class MachineRegistryService
                 continue;
 
             state.OutputBuffer.Clear();
+            state.Farm.InputBuffer.Clear();
             state.Farm.InternalSeedCount = 0;
             state.Farm.InternalFertilizerCount = 0;
             FarmModuleRules.ClearInstalledModules(state.Farm);
+            state.Processor.InputBuffer.Clear();
+            state.Processor.OutputBuffer.Clear();
+            state.Processor.Slots.Clear();
             state.ModData[ReclaimInTransitKey] = "1";
             state.MissingDays = 0;
+        }
+    }
+
+    private static IEnumerable<Item> GetProcessorRecoverableItems(SingleBlockProcessorMachineState processor)
+    {
+        foreach (var stack in processor.InputBuffer)
+        {
+            if (stack.Stack > 0)
+                yield return BufferedItemCodec.CreateItem(stack);
+        }
+
+        foreach (var stack in processor.OutputBuffer)
+        {
+            if (stack.Stack > 0)
+                yield return BufferedItemCodec.CreateItem(stack);
+        }
+
+        foreach (var slot in processor.Slots)
+        {
+            var recoverable = SingleBlockProcessorRules.GetRecoverableStack(slot);
+            if (recoverable is not null)
+                yield return BufferedItemCodec.CreateItem(recoverable);
         }
     }
 

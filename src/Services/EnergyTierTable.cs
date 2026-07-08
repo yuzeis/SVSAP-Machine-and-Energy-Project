@@ -20,6 +20,15 @@ internal static class EnergyTierTable
         new(EnergyTier.Iridium, 256, 5, 30, 10)
     };
 
+    public static readonly IReadOnlyList<ProcessorTierInfo> Processors =
+    new List<ProcessorTierInfo>
+    {
+        new(EnergyTier.Copper, 16, 18, 40),
+        new(EnergyTier.Steel, 64, 18, 40),
+        new(EnergyTier.Gold, 144, 18, 40),
+        new(EnergyTier.Iridium, 256, 18, 40)
+    };
+
     public static IReadOnlyList<string> Validate()
     {
         var failures = new List<string>();
@@ -33,6 +42,11 @@ internal static class EnergyTierTable
         ExpectFarm(EnergyTier.Steel, 64, 3, 30, 5);
         ExpectFarm(EnergyTier.Gold, 144, 4, 30, 8);
         ExpectFarm(EnergyTier.Iridium, 256, 5, 30, 10);
+
+        ExpectProcessor(EnergyTier.Copper, 16, 18, 40);
+        ExpectProcessor(EnergyTier.Steel, 64, 18, 40);
+        ExpectProcessor(EnergyTier.Gold, 144, 18, 40);
+        ExpectProcessor(EnergyTier.Iridium, 256, 18, 40);
 
         return failures;
 
@@ -60,6 +74,18 @@ internal static class EnergyTierTable
                 failures.Add($"farm:{tier}");
             }
         }
+
+        void ExpectProcessor(EnergyTier tier, int slots, long kegWhPerHour, long caskWhPerDay)
+        {
+            var row = Processors.FirstOrDefault(entry => entry.Tier == tier);
+            if (row is null
+                || row.Slots != slots
+                || row.KegWhPerSlotPerHour != kegWhPerHour
+                || row.CaskWhPerSlotPerDay != caskWhPerDay)
+            {
+                failures.Add($"processor:{tier}");
+            }
+        }
     }
 }
 
@@ -75,3 +101,9 @@ internal sealed record FarmTierInfo(
     int ModuleSlots,
     long BaseWhPerPlotPerDay,
     int RequiredFarmingLevel);
+
+internal sealed record ProcessorTierInfo(
+    EnergyTier Tier,
+    int Slots,
+    long KegWhPerSlotPerHour,
+    long CaskWhPerSlotPerDay);

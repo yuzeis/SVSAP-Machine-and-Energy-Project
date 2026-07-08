@@ -10,7 +10,18 @@ internal static class SvsapmeActionEscrowRules
             or SvsapmeMachineActionKind.LoadFarmSeed
             or SvsapmeMachineActionKind.LoadFarmFertilizer
             or SvsapmeMachineActionKind.InstallFarmModule
-            or SvsapmeMachineActionKind.FuelCarbonGenerator;
+            or SvsapmeMachineActionKind.FuelCarbonGenerator
+            or SvsapmeMachineActionKind.StartElectricFurnace
+            or SvsapmeMachineActionKind.StartElectricGeodeCrusher
+            or SvsapmeMachineActionKind.LoadProcessorInput;
+    }
+
+    public static int GetPrimaryEscrowCount(SvsapmeMachineActionKind kind, int requestedCount)
+    {
+        return kind is SvsapmeMachineActionKind.StartElectricFurnace
+            or SvsapmeMachineActionKind.LoadProcessorInput
+            ? Math.Clamp(requestedCount, 1, 999)
+            : 1;
     }
 
     public static bool ShouldRestoreOnResponse(bool success, bool consumeEscrowedItem)

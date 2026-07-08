@@ -21,7 +21,7 @@ internal sealed class SvsapmeP0P1E2EService
     private const string VersionEnv = "STARDEW_SVSAPME_P0P1_E2E_VERSION";
     private const string FarmNameEnv = "STARDEW_SVSAPME_P0P1_E2E_FARM";
     private const string JoinAddressEnv = "STARDEW_SVSAPME_P0P1_E2E_JOIN";
-    private const string DefaultVersionLabel = "ver1.3.0-Muehenlohn";
+    private const string DefaultVersionLabel = "ver1.4.0-alpha.1";
     private const int StartupTimeoutTicks = 12000;
     private const string SvsapNetworkIdKey = ModItemCatalog.SvsapUniqueId + "/NetworkId";
     private const string SvsapEndpointIdKey = ModItemCatalog.SvsapUniqueId + "/EndpointId";

@@ -62,6 +62,9 @@ internal static class SingleBlockFarmRules
         {
             farm.Plots.Add(new FarmPlotState
             {
+                SeedQualifiedItemId = crop.SeedQualifiedItemId,
+                HarvestQualifiedItemId = crop.HarvestQualifiedItemId,
+                PlacedByFarmingLevel = farm.PlacedByFarmingLevel,
                 FertilizerQualifiedItemId = i < fertilizerCoverage ? farm.BoundFertilizerQualifiedItemId : string.Empty
             });
         }
@@ -149,14 +152,17 @@ internal static class SingleBlockFarmRules
         return season.Trim().ToLowerInvariant();
     }
 
-    private static int AddHarvestOutput(IList<BufferedItemStack> outputBuffer, FarmMachineState farm, FarmCropSpec crop, FarmPlotState plot)
+    public static int AddHarvestOutput(IList<BufferedItemStack> outputBuffer, FarmMachineState farm, FarmCropSpec crop, FarmPlotState plot)
     {
         var total = GetHarvestStack(crop, plot);
         outputBuffer.Add(new BufferedItemStack
         {
             QualifiedItemId = crop.HarvestQualifiedItemId,
             Stack = total,
-            Quality = FarmModuleRules.GetHarvestQuality(farm.PlacedByFarmingLevel, plot.FertilizerQualifiedItemId, plot)
+            Quality = FarmModuleRules.GetHarvestQuality(
+                plot.PlacedByFarmingLevel > 0 ? plot.PlacedByFarmingLevel : farm.PlacedByFarmingLevel,
+                plot.FertilizerQualifiedItemId,
+                plot)
         });
         return 1;
     }

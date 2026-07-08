@@ -23,6 +23,7 @@ public sealed class ModEntry : Mod
     private EnergyProductionService energyProductionService = null!;
     private MachineRuntimeService machineRuntimeService = null!;
     private SingleBlockFarmService singleBlockFarmService = null!;
+    private SingleBlockProcessorService singleBlockProcessorService = null!;
     private CellStackGuardService cellStackGuardService = null!;
     private SvsapmeMultiplayerService multiplayerService = null!;
 #if DEBUG
@@ -68,6 +69,14 @@ public sealed class ModEntry : Mod
             () => this.config,
             helper.Input,
             this.Monitor);
+        this.singleBlockProcessorService = new SingleBlockProcessorService(
+            this.machineStateRepository,
+            this.machineRegistryService,
+            this.energyNetworkManager,
+            () => this.svsapApi,
+            () => this.config,
+            helper.Input,
+            this.Monitor);
         this.cellStackGuardService = new CellStackGuardService(this.Monitor, this.machineRegistryService);
         EnergyCellStackingPatch.Apply(this.ModManifest.UniqueID, this.Monitor);
         this.multiplayerService = new SvsapmeMultiplayerService(
@@ -78,6 +87,7 @@ public sealed class ModEntry : Mod
             this.energyNetworkManager,
             this.machineRuntimeService,
             this.singleBlockFarmService,
+            this.singleBlockProcessorService,
             () => this.svsapApi,
             this.Monitor);
 #if DEBUG
@@ -104,6 +114,10 @@ public sealed class ModEntry : Mod
 #endif
         this.machineRuntimeService.SetClientActionSender(this.multiplayerService.TrySendMachineActionRequest);
         this.singleBlockFarmService.SetClientActionSender(this.multiplayerService.TrySendMachineActionRequest);
+        this.singleBlockProcessorService.SetClientActionSender(this.multiplayerService.TrySendMachineActionRequest);
+        this.machineRuntimeService.SetSnapshotRequestSender(this.multiplayerService.TrySendMachineSnapshotRequest);
+        this.singleBlockFarmService.SetSnapshotRequestSender(this.multiplayerService.TrySendMachineSnapshotRequest);
+        this.singleBlockProcessorService.SetSnapshotRequestSender(this.multiplayerService.TrySendMachineSnapshotRequest);
         this.cellStackGuardService.SetClientMovementReporter(this.multiplayerService.TrySendMachineItemMovementReport);
         var contentInjector = new ContentInjector(() => this.config);
 
@@ -111,10 +125,13 @@ public sealed class ModEntry : Mod
         helper.Events.GameLoop.GameLaunched += this.OnGameLaunched;
         helper.Events.GameLoop.SaveLoaded += this.OnSaveLoaded;
         helper.Events.GameLoop.DayStarted += this.OnDayStarted;
+        helper.Events.GameLoop.DayStarted += this.multiplayerService.OnDayStarted;
         helper.Events.GameLoop.UpdateTicked += this.machineRuntimeService.OnUpdateTicked;
+        helper.Events.GameLoop.TimeChanged += this.singleBlockProcessorService.OnTimeChanged;
         helper.Events.GameLoop.Saving += this.OnSaving;
         helper.Events.Input.ButtonPressed += this.machineRuntimeService.OnButtonPressed;
         helper.Events.Input.ButtonPressed += this.singleBlockFarmService.OnButtonPressed;
+        helper.Events.Input.ButtonPressed += this.singleBlockProcessorService.OnButtonPressed;
         helper.Events.Multiplayer.PeerContextReceived += this.multiplayerService.OnPeerContextReceived;
         helper.Events.Multiplayer.PeerDisconnected += this.multiplayerService.OnPeerDisconnected;
         helper.Events.Multiplayer.ModMessageReceived += this.multiplayerService.OnModMessageReceived;
@@ -134,7 +151,7 @@ public sealed class ModEntry : Mod
 #if DEBUG
         helper.ConsoleCommands.Add(
             "svsapme_selftest",
-            "Run implemented SVSAPME foundation selftests. Optional args include wh-roundtrip tier-table content-table api-shape config-surface cell-stack-guard machine-guid-reconcile orphan-reclaim claim-force-gate consumed-charged-retire disassembly-energy-policy missing-machine-reclaim multiplayer-protocol action-idempotent escrow-restore host-action-dispatch energy-production-rules synth-atomic farm-crop-set farm-power-freeze farm-daily-progress farm-single-crop-budget farm-module-economy farm-fertilizer-quality farm-locked-output daily-order-storage-gate location-cache-full-enum building-demolish-reclaim powered-prescan-refund powered-degrade-parity powered-interface-range battery-discharge-gate electric-machine-rules b10-parity no-arbitrage-audit.",
+            "Run implemented SVSAPME foundation selftests. Optional args include wh-roundtrip tier-table content-table api-shape config-surface cell-stack-guard machine-guid-reconcile orphan-reclaim claim-force-gate consumed-charged-retire disassembly-energy-policy missing-machine-reclaim multiplayer-protocol action-idempotent escrow-restore host-action-dispatch energy-production-rules synth-atomic farm-crop-set farm-power-freeze farm-daily-progress farm-single-crop-budget farm-module-economy farm-fertilizer-quality farm-locked-output single-block-processor-rules daily-order-storage-gate location-cache-full-enum building-demolish-reclaim powered-prescan-refund powered-degrade-parity powered-interface-range battery-discharge-gate electric-machine-rules gui-layout-bounds b10-parity no-arbitrage-audit.",
             this.selfTestService.RunCommand);
 #endif
         helper.ConsoleCommands.Add(
@@ -168,7 +185,7 @@ public sealed class ModEntry : Mod
         this.svsapApi = this.Helper.ModRegistry.GetApi<ISvsapApi>("Koizumi.SVSAP");
         if (this.svsapApi is null)
         {
-            this.Monitor.Log("Koizumi.SVSAP API was not found. SVSAPME gameplay systems will stay disabled until SVSAP 1.2.0+ is loaded.", LogLevel.Error);
+            this.Monitor.Log("Koizumi.SVSAP API was not found. SVSAPME gameplay systems will stay disabled until SVSAP 1.4.0-alpha.1+ is loaded.", LogLevel.Error);
             return;
         }
 
@@ -217,6 +234,8 @@ public sealed class ModEntry : Mod
         gmcm.AddBoolOption(this.ModManifest, () => this.config.EnablePoweredTransfer, value => this.config.EnablePoweredTransfer = value, () => ModText.Get("gmcm.enablePoweredTransfer.name", "Enable Powered Transfer"));
         gmcm.AddBoolOption(this.ModManifest, () => this.config.EnableElectricMachines, value => this.config.EnableElectricMachines = value, () => ModText.Get("gmcm.enableElectricMachines.name", "Enable Electric Machines"));
         gmcm.AddBoolOption(this.ModManifest, () => this.config.EnableAutomaticFarmOutputToNetwork, value => this.config.EnableAutomaticFarmOutputToNetwork = value, () => ModText.Get("gmcm.enableAutomaticFarmOutputToNetwork.name", "Enable Farm Output To Network"));
+        gmcm.AddBoolOption(this.ModManifest, () => this.config.EnableAutomaticProcessorInputFromNetwork, value => this.config.EnableAutomaticProcessorInputFromNetwork = value, () => ModText.Get("gmcm.enableAutomaticProcessorInputFromNetwork.name", "Enable Processor Input From Network"));
+        gmcm.AddBoolOption(this.ModManifest, () => this.config.EnableAutomaticProcessorOutputToNetwork, value => this.config.EnableAutomaticProcessorOutputToNetwork = value, () => ModText.Get("gmcm.enableAutomaticProcessorOutputToNetwork.name", "Enable Processor Output To Network"));
         gmcm.AddBoolOption(this.ModManifest, () => this.config.AllowBatteryDischarge, value => this.config.AllowBatteryDischarge = value, () => ModText.Get("gmcm.allowBatteryDischarge.name", "Allow Battery Discharge"));
         gmcm.AddNumberOption(this.ModManifest, () => (float)this.config.BatteryDischargeEfficiency, value => this.config.BatteryDischargeEfficiency = Math.Clamp(value, 0f, 1f), () => ModText.Get("gmcm.batteryDischargeEfficiency.name", "Battery Discharge Efficiency"), min: 0f, max: 1f, interval: 0.05f, formatValue: value => value.ToString("0.00"));
         gmcm.AddNumberOption(this.ModManifest, () => (float)this.config.GeneratorMultiplier, value => this.config.GeneratorMultiplier = Math.Clamp(value, 0f, 10f), () => ModText.Get("gmcm.generatorMultiplier.name", "Generator Multiplier"), min: 0f, max: 10f, interval: 0.1f, formatValue: value => value.ToString("0.0"));
@@ -271,6 +290,7 @@ public sealed class ModEntry : Mod
             {
                 case DailySettlementStep.FarmConsumptionAndGrowth:
                     this.singleBlockFarmService.OnDayStarted(sender, e);
+                    this.singleBlockProcessorService.OnDayStarted(sender, e);
                     break;
 
                 case DailySettlementStep.EnergyProduction:
@@ -311,6 +331,14 @@ public sealed class ModEntry : Mod
         {
             this.Monitor.Log(
                 $"  {tier.Tier}: plots={tier.Plots}, moduleSlots={tier.ModuleSlots}, base={tier.BaseWhPerPlotPerDay} Wh/plot/day, farming={tier.RequiredFarmingLevel}",
+                LogLevel.Info);
+        }
+
+        this.Monitor.Log("Single-block processor tiers:", LogLevel.Info);
+        foreach (var tier in EnergyTierTable.Processors)
+        {
+            this.Monitor.Log(
+                $"  {tier.Tier}: slots={tier.Slots}, keg={tier.KegWhPerSlotPerHour} Wh/slot/hour, cask={tier.CaskWhPerSlotPerDay} Wh/slot/day",
                 LogLevel.Info);
         }
     }

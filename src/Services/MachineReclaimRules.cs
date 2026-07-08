@@ -104,7 +104,11 @@ internal static class MachineReclaimRules
                     continue;
 
                 machineCount++;
-                bufferedItemStacks += state.OutputBuffer.Count;
+                bufferedItemStacks += state.OutputBuffer.Count(stack => stack.Stack > 0);
+                bufferedItemStacks += state.Farm.InputBuffer.Count(stack => stack.Stack > 0);
+                bufferedItemStacks += state.Processor.InputBuffer.Count(stack => stack.Stack > 0);
+                bufferedItemStacks += state.Processor.OutputBuffer.Count(stack => stack.Stack > 0);
+                bufferedItemStacks += state.Processor.Slots.Count(slot => SingleBlockProcessorRules.GetRecoverableStack(slot) is not null);
                 if (state.Farm.InternalSeedCount > 0
                     && !string.IsNullOrWhiteSpace(state.Farm.BoundSeedQualifiedItemId))
                 {

@@ -19,6 +19,7 @@ internal static class ModItemCatalog
     public const string SvsapSpeedCard = SvsapPrefix + "SpeedCard";
     public const string SvsapCapacityCard = SvsapPrefix + "CapacityCard";
     public const string SvsapQualityCard = SvsapPrefix + "QualityCard";
+    public const string SvsapOreDictionaryCard = SvsapPrefix + "OreDictionaryCard";
 
     public const string CarbonRod = Prefix + "CarbonRod";
     public const string CopperCoil = Prefix + "CopperCoil";
@@ -45,6 +46,14 @@ internal static class ModItemCatalog
     public const string SteelFarm = Prefix + "SteelFarm";
     public const string GoldFarm = Prefix + "GoldFarm";
     public const string IridiumFarm = Prefix + "IridiumFarm";
+    public const string CopperKeg = Prefix + "CopperKeg";
+    public const string SteelKeg = Prefix + "SteelKeg";
+    public const string GoldKeg = Prefix + "GoldKeg";
+    public const string IridiumKeg = Prefix + "IridiumKeg";
+    public const string CopperCask = Prefix + "CopperCask";
+    public const string SteelCask = Prefix + "SteelCask";
+    public const string GoldCask = Prefix + "GoldCask";
+    public const string IridiumCask = Prefix + "IridiumCask";
 
     public const string PoweredImporterCopper = Prefix + "PoweredImporterCopper";
     public const string PoweredImporterSteel = Prefix + "PoweredImporterSteel";
@@ -97,6 +106,14 @@ internal static class ModItemCatalog
         new(SteelFarm, "Steel Single-Block Farm", "Runs 64 internal crop plots.", 10560, 129),
         new(GoldFarm, "Gold Single-Block Farm", "Runs 144 internal crop plots.", 24960, 129),
         new(IridiumFarm, "Iridium Single-Block Farm", "Runs 256 internal crop plots.", 68760, 129),
+        new(CopperKeg, "Copper Single-Block Keg", "Runs 16 internal keg slots.", 5600, 12),
+        new(SteelKeg, "Steel Single-Block Keg", "Runs 64 internal keg slots.", 16800, 12),
+        new(GoldKeg, "Gold Single-Block Keg", "Runs 144 internal keg slots.", 38600, 12),
+        new(IridiumKeg, "Iridium Single-Block Keg", "Runs 256 internal keg slots.", 96800, 12),
+        new(CopperCask, "Copper Single-Block Cask", "Runs 16 internal aging slots.", 6200, 163),
+        new(SteelCask, "Steel Single-Block Cask", "Runs 64 internal aging slots.", 18600, 163),
+        new(GoldCask, "Gold Single-Block Cask", "Runs 144 internal aging slots.", 42600, 163),
+        new(IridiumCask, "Iridium Single-Block Cask", "Runs 256 internal aging slots.", 106800, 163),
         new(PoweredImporterCopper, "Copper Powered Importer", "Powered upgrade for the SVSAP Importer.", 810, 105),
         new(PoweredImporterSteel, "Steel Powered Importer", "Powered upgrade for the SVSAP Importer.", 3270, 105),
         new(PoweredImporterGold, "Gold Powered Importer", "Powered upgrade for the SVSAP Importer.", 4420, 105),
@@ -144,6 +161,14 @@ internal static class ModItemCatalog
         [SteelFarm] = "(O)" + FarmChamber + " 2 (O)335 10 (BC)" + CopperFarm + " 1 (O)" + SvsapAdvancedCircuit + " 1 (O)787 1/Home/(BC)" + SteelFarm + " 1/true/null",
         [GoldFarm] = "(O)" + FarmChamber + " 4 (O)336 10 (BC)" + SteelFarm + " 1 (O)" + SvsapAdvancedCircuit + " 2 (O)787 2/Home/(BC)" + GoldFarm + " 1/true/null",
         [IridiumFarm] = "(O)" + FarmChamber + " 8 (O)337 10 (BC)" + GoldFarm + " 1 (O)" + SvsapEliteCircuit + " 2 (O)787 4/Home/(BC)" + IridiumFarm + " 1/true/null",
+        [CopperKeg] = "(BC)12 16 (O)334 10 (O)" + SvsapBasicCircuit + " 2 (O)" + EnergyMatrix + " 1/Home/(BC)" + CopperKeg + " 1/true/null",
+        [SteelKeg] = "(BC)" + CopperKeg + " 1 (BC)12 48 (O)335 10 (O)" + SvsapAdvancedCircuit + " 1 (O)" + EnergyMatrix + " 1/Home/(BC)" + SteelKeg + " 1/true/null",
+        [GoldKeg] = "(BC)" + SteelKeg + " 1 (BC)12 80 (O)336 10 (O)" + SvsapAdvancedCircuit + " 2 (O)" + EnergyMatrix + " 2/Home/(BC)" + GoldKeg + " 1/true/null",
+        [IridiumKeg] = "(BC)" + GoldKeg + " 1 (BC)12 112 (O)337 10 (O)" + SvsapEliteCircuit + " 2 (O)" + EnergyMatrix + " 4/Home/(BC)" + IridiumKeg + " 1/true/null",
+        [CopperCask] = "(BC)163 16 (O)334 10 (O)" + SvsapBasicCircuit + " 2 (O)" + EnergyMatrix + " 1/Home/(BC)" + CopperCask + " 1/true/null",
+        [SteelCask] = "(BC)" + CopperCask + " 1 (BC)163 48 (O)335 10 (O)" + SvsapAdvancedCircuit + " 1 (O)" + EnergyMatrix + " 1/Home/(BC)" + SteelCask + " 1/true/null",
+        [GoldCask] = "(BC)" + SteelCask + " 1 (BC)163 80 (O)336 10 (O)" + SvsapAdvancedCircuit + " 2 (O)" + EnergyMatrix + " 2/Home/(BC)" + GoldCask + " 1/true/null",
+        [IridiumCask] = "(BC)" + GoldCask + " 1 (BC)163 112 (O)337 10 (O)" + SvsapEliteCircuit + " 2 (O)" + EnergyMatrix + " 4/Home/(BC)" + IridiumCask + " 1/true/null",
 
         [PoweredImporterCopper] = "(BC)" + SvsapImporter + " 1 (O)334 3 (O)" + CopperCoil + " 1 (O)" + SvsapBasicCircuit + " 1/Home/(BC)" + PoweredImporterCopper + " 1/true/null",
         [PoweredImporterSteel] = "(BC)" + PoweredImporterCopper + " 1 (O)335 5 (O)" + SvsapAdvancedCircuit + " 1/Home/(BC)" + PoweredImporterSteel + " 1/true/null",
@@ -189,6 +214,14 @@ internal static class ModItemCatalog
         [SteelFarm] = "Farming 5",
         [GoldFarm] = "Farming 8",
         [IridiumFarm] = "Farming 10",
+        [CopperKeg] = "Farming 8",
+        [SteelKeg] = "Farming 9",
+        [GoldKeg] = "Farming 10",
+        [IridiumKeg] = "Farming 10",
+        [CopperCask] = "Farming 10",
+        [SteelCask] = "Farming 10",
+        [GoldCask] = "Farming 10",
+        [IridiumCask] = "Farming 10",
         [PoweredImporterCopper] = "Mining 3",
         [PoweredImporterSteel] = "Mining 4",
         [PoweredImporterGold] = "Mining 6",

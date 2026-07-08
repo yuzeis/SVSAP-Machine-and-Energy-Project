@@ -5,6 +5,7 @@ using StardewValley;
 using Koizumi.SVSAPME.Api;
 using SVSAPME.Content;
 using SVSAPME.Models;
+using SVSAPME.UI;
 
 namespace SVSAPME.Services;
 
@@ -75,6 +76,7 @@ internal sealed class SvsapmeSelfTestService
             "farm-module-economy" => TestFarmModuleEconomy(),
             "farm-fertilizer-quality" => TestFarmFertilizerQuality(),
             "farm-locked-output" => TestFarmLockedOutput(),
+            "single-block-processor-rules" => TestSingleBlockProcessorRules(),
             "daily-order-storage-gate" => TestDailyOrderStorageGate(),
             "location-cache-full-enum" => TestLocationCacheFullEnum(),
             "building-demolish-reclaim" => TestBuildingDemolishReclaim(),
@@ -83,10 +85,41 @@ internal sealed class SvsapmeSelfTestService
             "powered-interface-range" => TestPoweredInterfaceRange(),
             "battery-discharge-gate" => TestBatteryDischargeGate(),
             "electric-machine-rules" => TestElectricMachineRules(),
+            "gui-layout-bounds" => TestGuiLayoutBounds(),
             "b10-parity" => SvsapmeBalanceTable.ValidateParity(),
             "no-arbitrage-audit" => SvsapmeBalanceTable.ValidateNoArbitrage(),
             _ => new[] { $"case is not implemented in the SVSAPME selftest harness: {testCase}" }
         };
+    }
+
+    private static IReadOnlyList<string> TestGuiLayoutBounds()
+    {
+        var failures = new List<string>();
+
+        if (!SingleBlockProcessorMenu.LayoutFits(menuWidth: 980, menuHeight: 700)
+            || !SingleBlockProcessorMenu.LayoutFits(menuWidth: 752, menuHeight: 672))
+        {
+            failures.Add("single-block processor menu must keep input panel, work grid, output panel, and page buttons inside 1280x720 and 800x720 UI bounds");
+        }
+
+        var processorCompact = SingleBlockProcessorMenu.CalculateLayoutShape(menuWidth: 752, menuHeight: 672);
+        if (processorCompact.Columns < 4 || processorCompact.Rows < 6 || processorCompact.PageSize != processorCompact.Columns * processorCompact.Rows)
+            failures.Add("single-block processor compact layout must preserve a useful paged work-grid shape");
+
+        if (!SingleBlockFarmMenu.LayoutFits(menuWidth: 930, menuHeight: 660)
+            || !SingleBlockFarmMenu.LayoutFits(menuWidth: 752, menuHeight: 660))
+        {
+            failures.Add("single-block farm menu must keep input panel, plot grid, output panel, and page buttons inside 1280x720 and 800x720 UI bounds");
+        }
+
+        var farmCompact = SingleBlockFarmMenu.CalculateLayoutShape(menuWidth: 752, menuHeight: 660);
+        if (farmCompact.Columns < 5 || farmCompact.Rows < 7 || farmCompact.PageSize != farmCompact.Columns * farmCompact.Rows)
+            failures.Add("single-block farm compact layout must preserve a useful paged plot-grid shape");
+
+        if (!PoweredTransferMenu.LayoutFits(menuWidth: 1040) || !PoweredTransferMenu.LayoutFits(menuWidth: 720))
+            failures.Add("powered importer/exporter menu controls must wrap instead of overflowing compact UI widths");
+
+        return failures;
     }
 
     private static IReadOnlyList<string> TestWhRoundtrip()
@@ -160,6 +193,8 @@ internal sealed class SvsapmeSelfTestService
             nameof(ModConfig.DebugEnergyRouting),
             nameof(ModConfig.DetailedEnergyLogs),
             nameof(ModConfig.EnableAutomaticFarmOutputToNetwork),
+            nameof(ModConfig.EnableAutomaticProcessorInputFromNetwork),
+            nameof(ModConfig.EnableAutomaticProcessorOutputToNetwork),
             nameof(ModConfig.EnableBatterySynthesizer),
             nameof(ModConfig.EnableCarbonGenerator),
             nameof(ModConfig.EnableElectricMachines),
@@ -193,16 +228,57 @@ internal sealed class SvsapmeSelfTestService
             SvsapmeMultiplayerMessageTypes.MachineSnapshotResponse,
             SvsapmeMultiplayerMessageTypes.MachineActionRequest,
             SvsapmeMultiplayerMessageTypes.MachineActionResponse,
+            SvsapmeMultiplayerMessageTypes.MachineDeliveryAck,
             SvsapmeMultiplayerMessageTypes.MachineItemMovementReport,
             SvsapmeMultiplayerMessageTypes.EnergyDebugRequest,
             SvsapmeMultiplayerMessageTypes.EnergyDebugResponse
         };
 
-        if (messageTypes.Any(string.IsNullOrWhiteSpace) || messageTypes.Distinct(StringComparer.Ordinal).Count() != 7)
-            failures.Add("SVSAPME multiplayer message set must contain seven distinct message names");
+        if (messageTypes.Any(string.IsNullOrWhiteSpace) || messageTypes.Distinct(StringComparer.Ordinal).Count() != 8)
+            failures.Add("SVSAPME multiplayer message set must contain eight distinct message names");
 
         if (messageTypes.Any(type => !type.StartsWith("Svsapme", StringComparison.Ordinal)))
             failures.Add("SVSAPME multiplayer messages must use SVSAPME names and never forge Koizumi.SVSAP messages");
+
+        if (typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.DisplayName))?.PropertyType != typeof(string)
+            || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.Lines))?.PropertyType != typeof(List<string>))
+        {
+            failures.Add("machine snapshot responses must carry host-authored display text for farmhand status menus");
+        }
+
+        if (typeof(SvsapmeMachineActionResponse).GetProperty(nameof(SvsapmeMachineActionResponse.ReturnedItems))?.PropertyType != typeof(List<BufferedItemStack>))
+            failures.Add("machine action responses must carry returned item payloads for farmhand processor collection");
+
+        if (typeof(SvsapmeMachineDeliveryAck).GetProperty(nameof(SvsapmeMachineDeliveryAck.TransactionId))?.PropertyType != typeof(Guid)
+            || typeof(MachineSaveData).GetProperty(nameof(MachineSaveData.PendingRemoteDeliveries))?.PropertyType != typeof(List<PendingRemoteDelivery>))
+        {
+            failures.Add("farmhand returned-item deliveries must be backed by a persistent host ack protocol");
+        }
+
+        var nonPublicInstance = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var nonPublicStatic = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic;
+        if (typeof(SvsapmeMultiplayerService).GetMethod("PruneConfirmedExpiredPendingDeliveries", nonPublicInstance)?.ReturnType != typeof(int)
+            || typeof(SvsapmeMultiplayerService).GetMethod(nameof(SvsapmeMultiplayerService.OnDayStarted)) is null)
+        {
+            failures.Add("host pending remote deliveries must have a day-start expiry path that prunes confirmed stale payloads without automatic duplication");
+        }
+
+        if (typeof(SvsapmeMultiplayerService).GetField("PendingDeliveryRetentionDays", nonPublicStatic)?.GetRawConstantValue() is not int retentionDays
+            || retentionDays <= 0)
+        {
+            failures.Add("pending remote delivery expiry must use a positive retention window");
+        }
+
+        if (typeof(SvsapmeMultiplayerService).GetField("PersistentActionEscrowModDataKey", nonPublicStatic)?.GetRawConstantValue() is not string escrowKey
+            || string.IsNullOrWhiteSpace(escrowKey)
+            || typeof(SvsapmeMultiplayerService).GetMethod("RestoreDurableActionEscrows", nonPublicInstance)?.ReturnType != typeof(int)
+            || typeof(SvsapmeMultiplayerService).GetMethod("TrackDurableActionEscrow", nonPublicInstance)?.ReturnType != typeof(bool))
+        {
+            failures.Add("farmhand item escrow must have a durable restore path across save/load or crash windows");
+        }
+
+        if (typeof(MachineSaveData).GetProperty(nameof(MachineSaveData.SchemaVersion))?.PropertyType != typeof(int))
+            failures.Add("SVSAPME machine save data must carry a schema version");
 
         var cache = new MultiplayerTransactionCache<SvsapmeMachineActionResponse>(limit: 2);
         var tx1 = Guid.Parse("11111111-1111-1111-1111-111111111111");
@@ -267,9 +343,18 @@ internal sealed class SvsapmeSelfTestService
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadFarmSeed)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadFarmFertilizer)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.InstallFarmModule)
-            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.FuelCarbonGenerator))
+            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.FuelCarbonGenerator)
+            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.StartElectricFurnace)
+            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.StartElectricGeodeCrusher)
+            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadProcessorInput))
         {
             failures.Add("item-bearing SVSAPME machine actions must be escrow candidates");
+        }
+
+        if (SvsapmeActionEscrowRules.GetPrimaryEscrowCount(SvsapmeMachineActionKind.StartElectricFurnace, 5) != 5
+            || SvsapmeActionEscrowRules.GetPrimaryEscrowCount(SvsapmeMachineActionKind.StartElectricGeodeCrusher, 1) != 1)
+        {
+            failures.Add("electric machine farmhand actions must escrow the authoritative input count");
         }
 
         if (SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.None))
@@ -328,6 +413,8 @@ internal sealed class SvsapmeSelfTestService
         var nonPublicInstance = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
         var configure = typeof(MachineRuntimeService).GetMethod("TryConfigurePoweredFilter", nonPublicInstance);
         var fuel = typeof(MachineRuntimeService).GetMethod("TryFuelCarbonGenerator", nonPublicInstance);
+        var startFurnace = typeof(MachineRuntimeService).GetMethod("TryStartElectricFurnaceManualUse", nonPublicInstance);
+        var startGeodeCrusher = typeof(MachineRuntimeService).GetMethod("TryStartElectricGeodeCrusherManualUse", nonPublicInstance);
         var loadSeed = typeof(SingleBlockFarmService).GetMethod("TryLoadSeed", nonPublicInstance);
         var loadFertilizer = typeof(SingleBlockFarmService).GetMethod("TryLoadFertilizer", nonPublicInstance);
         var installModule = typeof(SingleBlockFarmService).GetMethod("TryInstallModule", nonPublicInstance);
@@ -336,6 +423,12 @@ internal sealed class SvsapmeSelfTestService
 
         if (fuel?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
             failures.Add("MachineRuntimeService must expose host-dispatchable Carbon Generator fueling");
+
+        if (startFurnace?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
+            failures.Add("MachineRuntimeService must expose host-dispatchable Electric Furnace starts");
+
+        if (startGeodeCrusher?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
+            failures.Add("MachineRuntimeService must expose host-dispatchable Electric Geode Crusher starts");
 
         if (loadSeed?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
             failures.Add("SingleBlockFarmService must expose host-dispatchable seed loading");
@@ -348,6 +441,19 @@ internal sealed class SvsapmeSelfTestService
 
         if (typeof(SvsapmeMultiplayerService).GetMethod("TryResolveHostActionContext", nonPublicInstance) is null)
             failures.Add("SvsapmeMultiplayerService must validate MachineGuid, tile, and active SVSAP endpoint before host actions");
+
+        var endpointPolicy = typeof(SvsapmeMultiplayerService).GetMethod("RequiresActiveEndpoint", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        if (endpointPolicy?.ReturnType != typeof(bool))
+        {
+            failures.Add("SvsapmeMultiplayerService must expose an endpoint policy for farmhand host actions");
+        }
+        else
+        {
+            var collectRequiresEndpoint = (bool)(endpointPolicy.Invoke(null, new object[] { SvsapmeMachineActionKind.CollectProcessorOutput }) ?? true);
+            var furnaceRequiresEndpoint = (bool)(endpointPolicy.Invoke(null, new object[] { SvsapmeMachineActionKind.StartElectricFurnace }) ?? false);
+            if (collectRequiresEndpoint || !furnaceRequiresEndpoint)
+                failures.Add("farmhand processor collection must not require an active endpoint, while energy-consuming host actions still must");
+        }
 
         if (typeof(SvsapmeMultiplayerService).GetMethod("ExecuteMachineActionRequest", nonPublicInstance)?.ReturnType != typeof(SvsapmeMachineActionResponse))
             failures.Add("SvsapmeMultiplayerService must dispatch host machine actions into response messages");
@@ -370,10 +476,22 @@ internal sealed class SvsapmeSelfTestService
         if (typeof(SvsapmeMultiplayerService).GetMethod("TrySendMachineItemMovementReport", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic) is null)
             failures.Add("SvsapmeMultiplayerService must expose a client item-movement reporter for farmhand machine items");
 
+        if (typeof(SvsapmeMultiplayerService).GetMethod("TrySendMachineSnapshotRequest", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic) is null
+            || typeof(SvsapmeMultiplayerService).GetMethod("CreateMachineSnapshotResponse", nonPublicInstance)?.ReturnType != typeof(SvsapmeMachineSnapshotResponse))
+        {
+            failures.Add("SvsapmeMultiplayerService must expose host-authored machine snapshots for farmhand status menus");
+        }
+
         if (typeof(MachineRuntimeService).GetMethod("SetClientActionSender") is null
             || typeof(SingleBlockFarmService).GetMethod("SetClientActionSender") is null)
         {
             failures.Add("interactive SVSAPME services must bind farmhand clicks to multiplayer action requests");
+        }
+
+        if (typeof(MachineRuntimeService).GetMethod("SetSnapshotRequestSender") is null
+            || typeof(SingleBlockFarmService).GetMethod("SetSnapshotRequestSender") is null)
+        {
+            failures.Add("interactive SVSAPME services must bind farmhand empty-hand status clicks to host snapshots");
         }
 
         if (typeof(SvsapmeMachineActionRequest).GetProperty(nameof(SvsapmeMachineActionRequest.FarmingLevel))?.PropertyType != typeof(int))
@@ -714,6 +832,100 @@ internal sealed class SvsapmeSelfTestService
         return failures;
     }
 
+    private static IReadOnlyList<string> TestSingleBlockProcessorRules()
+    {
+        var failures = new List<string>();
+
+        var copperKegId = "(BC)" + ModItemCatalog.CopperKeg;
+        var iridiumKegId = "(BC)" + ModItemCatalog.IridiumKeg;
+        if (SingleBlockProcessorRules.GetProcessorKind(copperKegId) != SingleBlockProcessorKind.Keg)
+            failures.Add("copper single-block keg must be identified as a processor keg");
+
+        if (SingleBlockProcessorRules.GetTier(copperKegId).Slots != 16
+            || SingleBlockProcessorRules.GetTier(iridiumKegId).Slots != 256)
+        {
+            failures.Add("single-block processor tiers must expose 16/64/144/256 internal slots");
+        }
+
+        var processor = new SingleBlockProcessorMachineState();
+        if (processor.AutoPullFromNetwork)
+            failures.Add("single-block processors must default network auto-input to off until the player opts in");
+
+        SingleBlockProcessorRules.NormalizeSlots(processor, SingleBlockProcessorRules.GetTier(iridiumKegId));
+        if (processor.Slots.Count != 256)
+            failures.Add("iridium processor state must normalize to 256 slots");
+
+        var apple = ItemRegistry.Create("(O)613", 1);
+        if (!SingleBlockProcessorRules.TryCreateJob(SingleBlockProcessorKind.Keg, apple, out var wineSlot, out _))
+        {
+            failures.Add("single-block keg must accept fruit as wine input");
+        }
+        else
+        {
+            if (wineSlot.Output?.QualifiedItemId != "(O)348" || wineSlot.Output.PreservedParentSheetIndex != "613")
+                failures.Add("single-block keg wine output must preserve the fruit parent sheet index");
+
+            if (wineSlot.Output?.PreserveType != (int)StardewValley.Object.PreserveType.Wine)
+                failures.Add("single-block keg wine output must preserve vanilla preserve type identity");
+
+            var vanillaWine = ItemRegistry.GetObjectTypeDefinition().CreateFlavoredWine((StardewValley.Object)apple.getOne());
+            var restoredWine = BufferedItemCodec.CreateItem(wineSlot.Output!);
+            if (restoredWine.DisplayName != vanillaWine.DisplayName || restoredWine.salePrice(false) != vanillaWine.salePrice(false))
+                failures.Add("single-block keg wine output must use vanilla flavored output naming and pricing");
+
+            if (wineSlot.RemainingMinutes != 10_000 || wineSlot.TotalMinutes != 10_000)
+                failures.Add("single-block keg fruit processing time must match vanilla wine time");
+
+            if (SingleBlockProcessorRules.GetRecoverableStack(wineSlot)?.QualifiedItemId != "(O)613")
+                failures.Add("unfinished single-block processor slots must recover the input, not the future output");
+
+            SingleBlockProcessorRules.AdvanceKegSlot(wineSlot, 10_000);
+            if (!SingleBlockProcessorRules.IsReady(wineSlot))
+                failures.Add("single-block keg slot must become ready after its full minute budget is paid");
+
+            if (SingleBlockProcessorRules.GetRecoverableStack(wineSlot)?.QualifiedItemId != "(O)348")
+                failures.Add("finished single-block processor slots must recover the completed output");
+
+            var overflowProcessor = new SingleBlockProcessorMachineState();
+            var overflowInput = ItemRegistry.Create("(O)613", 1);
+            if (SingleBlockProcessorRules.TryCreateJob(SingleBlockProcessorKind.Keg, overflowInput, out var overflowSlot, out _))
+            {
+                SingleBlockProcessorRules.MoveSlotPayloadToBuffer(overflowProcessor, overflowSlot);
+                if (overflowProcessor.OutputBuffer.Count != 1 || overflowProcessor.OutputBuffer[0].QualifiedItemId != "(O)613")
+                    failures.Add("processor overflow recovery must preserve unfinished input instead of creating output early");
+            }
+        }
+
+        var shortCoffee = ItemRegistry.Create("(O)433", 4);
+        if (SingleBlockProcessorRules.TryCreateJob(SingleBlockProcessorKind.Keg, shortCoffee, out _, out _))
+            failures.Add("coffee recipe must require five coffee beans");
+
+        var coffee = ItemRegistry.Create("(O)433", 5);
+        if (!SingleBlockProcessorRules.TryCreateJob(SingleBlockProcessorKind.Keg, coffee, out var coffeeSlot, out _)
+            || coffeeSlot.InputCount != 5
+            || coffeeSlot.Output?.QualifiedItemId != "(O)395"
+            || coffeeSlot.RemainingMinutes != 120)
+        {
+            failures.Add("coffee recipe must consume five beans and produce coffee after 120 minutes");
+        }
+
+        var wine = ItemRegistry.Create("(O)348", 1);
+        wine.Quality = 0;
+        if (!SingleBlockProcessorRules.TryCreateJob(SingleBlockProcessorKind.Cask, wine, out var caskSlot, out _)
+            || caskSlot.Output?.Quality != 4
+            || caskSlot.RemainingDays != 56)
+        {
+            failures.Add("single-block cask must age normal wine to iridium over 56 days");
+        }
+
+        var iridiumWine = ItemRegistry.Create("(O)348", 1);
+        iridiumWine.Quality = 4;
+        if (SingleBlockProcessorRules.TryCreateJob(SingleBlockProcessorKind.Cask, iridiumWine, out _, out _))
+            failures.Add("single-block cask must reject already-iridium input");
+
+        return failures;
+    }
+
     private static IReadOnlyList<string> TestDailyOrderStorageGate()
     {
         var failures = new List<string>();
@@ -978,6 +1190,30 @@ internal sealed class SvsapmeSelfTestService
         if (MachineRegistryService.CanRetireConfirmedConsumedMachine(farmPayloadState))
             failures.Add("consumed-candidate farms with internal seeds or modules must stay recoverable instead of retiring");
 
+        var farmInputBufferState = new MachineState
+        {
+            MachineGuid = Guid.Parse("fafafafa-fafa-fafa-fafa-fafafafafafa"),
+            QualifiedItemId = "(BC)" + ModItemCatalog.CopperFarm,
+            Farm =
+            {
+                InputBuffer = { new BufferedItemStack { QualifiedItemId = "(O)472", Stack = 4 } }
+            }
+        };
+        if (MachineRegistryService.CanRetireConfirmedConsumedMachine(farmInputBufferState))
+            failures.Add("consumed-candidate farms with buffered input stacks must stay recoverable instead of retiring");
+
+        var processorInputBufferState = new MachineState
+        {
+            MachineGuid = Guid.Parse("fbfbfbfb-fbfb-fbfb-fbfb-fbfbfbfbfbfb"),
+            QualifiedItemId = "(BC)" + ModItemCatalog.CopperKeg,
+            Processor =
+            {
+                InputBuffer = { new BufferedItemStack { QualifiedItemId = "(O)433", Stack = 5 } }
+            }
+        };
+        if (MachineRegistryService.CanRetireConfirmedConsumedMachine(processorInputBufferState))
+            failures.Add("consumed-candidate processors with buffered input stacks must stay recoverable instead of retiring");
+
         var result = MachineRegistryService.RetireConfirmedConsumedMachine(data, machineGuid);
         if (!result.Retired)
             failures.Add("confirmed consumed machine must report retirement");
@@ -1099,6 +1335,14 @@ internal sealed class SvsapmeSelfTestService
             ModItemCatalog.SteelFarm,
             ModItemCatalog.GoldFarm,
             ModItemCatalog.IridiumFarm,
+            ModItemCatalog.CopperKeg,
+            ModItemCatalog.SteelKeg,
+            ModItemCatalog.GoldKeg,
+            ModItemCatalog.IridiumKeg,
+            ModItemCatalog.CopperCask,
+            ModItemCatalog.SteelCask,
+            ModItemCatalog.GoldCask,
+            ModItemCatalog.IridiumCask,
             ModItemCatalog.PoweredImporterCopper,
             ModItemCatalog.PoweredImporterSteel,
             ModItemCatalog.PoweredImporterGold,
@@ -1454,6 +1698,7 @@ internal sealed class SvsapmeSelfTestService
         "farm-module-economy",
         "farm-fertilizer-quality",
         "farm-locked-output",
+        "single-block-processor-rules",
         "daily-order-storage-gate",
         "location-cache-full-enum",
         "building-demolish-reclaim",
@@ -1462,6 +1707,7 @@ internal sealed class SvsapmeSelfTestService
         "powered-interface-range",
         "battery-discharge-gate",
         "electric-machine-rules",
+        "gui-layout-bounds",
         "b10-parity",
         "no-arbitrage-audit"
     };
