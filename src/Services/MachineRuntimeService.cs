@@ -18,7 +18,9 @@ namespace SVSAPME.Services;
 internal sealed class MachineRuntimeService
 {
     private const int PrototypeTransferThroughput = 64;
+    internal const int PoweredTransferUpgradeSlotCount = 4;
     private const string PoweredTransferHalfWhCreditKey = ModItemCatalog.UniqueId + "/PoweredTransferHalfWhCredit";
+    private const string PoweredTransferUpgradeSlotsKey = ModItemCatalog.UniqueId + "/PoweredTransferUpgradeSlots";
     private const string BatteryDischargerEnabledKey = ModItemCatalog.UniqueId + "/BatteryDischargerEnabled";
     private const string SvsapTransferFilterKey = ModItemCatalog.SvsapUniqueId + "/TransferFilter";
     private const string SvsapTransferFilterListKey = ModItemCatalog.SvsapUniqueId + "/TransferFilters";
@@ -46,12 +48,14 @@ internal sealed class MachineRuntimeService
         SvsapTransferQualityStrategyKey,
         SvsapTransferMinSourceKeepKey,
         SvsapTransferTargetKeepKey,
-        SvsapTransferItemsPerOperationKey
+        SvsapTransferItemsPerOperationKey,
+        PoweredTransferUpgradeSlotsKey
     };
 
     private readonly MachineStateRepository repository;
     private readonly MachineRegistryService registry;
     private readonly EnergyNetworkManager energy;
+    private readonly EnergyTelemetryService telemetry;
     private readonly Func<ISvsapApi?> getSvsapApi;
     private readonly Func<ModConfig> getConfig;
     private readonly IInputHelper inputHelper;
@@ -64,6 +68,7 @@ internal sealed class MachineRuntimeService
         MachineStateRepository repository,
         MachineRegistryService registry,
         EnergyNetworkManager energy,
+        EnergyTelemetryService telemetry,
         Func<ISvsapApi?> getSvsapApi,
         Func<ModConfig> getConfig,
         IInputHelper inputHelper,
@@ -72,6 +77,7 @@ internal sealed class MachineRuntimeService
         this.repository = repository;
         this.registry = registry;
         this.energy = energy;
+        this.telemetry = telemetry;
         this.getSvsapApi = getSvsapApi;
         this.getConfig = getConfig;
         this.inputHelper = inputHelper;
@@ -379,6 +385,22 @@ internal sealed class MachineRuntimeService
                 lines.Add(ModText.Get("ui.machine.networkEnergy", "Network energy: {{stored}} / {{capacity}}", new { stored = FormatWh(networkStoredWh), capacity = FormatWh(networkCapacityWh) }));
             else if (endpoint.Active)
                 lines.Add(ModText.Get("ui.machine.networkEnergyUnavailable", "Network energy: unavailable ({{code}})", new { code = energyCode.ToString() }));
+            if (endpoint.Active)
+            {
+                var flow = this.telemetry.GetSnapshot(endpoint.NetworkId);
+                lines.Add(ModText.Get("ui.energyMeter.lastTick", "Last flow: +{{generated}} / -{{consumed}} / net {{net}}", new
+                {
+                    generated = FormatWh(flow.LastGeneratedWh),
+                    consumed = FormatWh(flow.LastConsumedWh),
+                    net = FormatSignedWh(flow.LastNetWh)
+                }));
+                lines.Add(ModText.Get("ui.energyMeter.today", "Today: +{{generated}} / -{{consumed}} / net {{net}}", new
+                {
+                    generated = FormatWh(flow.TodayGeneratedWh),
+                    consumed = FormatWh(flow.TodayConsumedWh),
+                    net = FormatSignedWh(flow.TodayNetWh)
+                }));
+            }
         }
         else
         {
@@ -394,6 +416,8 @@ internal sealed class MachineRuntimeService
 
         if (state.OutputBuffer.Count > 0)
             lines.Add(ModText.Get("ui.machine.outputBuffer", "Output buffer: {{items}}", new { items = FormatBufferedItems(state.OutputBuffer) }));
+
+        this.AddPortStatusLines(lines, placedObject.QualifiedItemId);
 
         switch (placedObject.QualifiedItemId)
         {
@@ -454,9 +478,28 @@ internal sealed class MachineRuntimeService
         return lines;
     }
 
+    private void AddPortStatusLines(List<string> lines, string qualifiedItemId)
+    {
+        foreach (var port in MachinePortCatalog.GetPorts(qualifiedItemId))
+        {
+            lines.Add(ModText.Get(
+                "ui.machine.port.line",
+                "Port {{role}}: {{side}} - {{description}}",
+                new
+                {
+                    role = ModText.Get(port.RoleKey, port.RoleKey),
+                    side = ModText.Get(port.SideKey, port.SideKey),
+                    description = ModText.Get(port.DescriptionKey, port.DescriptionKey)
+                }));
+        }
+    }
+
     private void AddPoweredStatusLines(List<string> lines, SObject placedObject)
     {
         var tier = GetPoweredTier(placedObject.QualifiedItemId);
+        var upgrades = GetPoweredUpgradeSlots(placedObject, null);
+        var capacityMultiplier = HasPoweredUpgrade(upgrades, ModItemCatalog.SvsapCapacityCard) ? 2 : 1;
+        var speedMultiplier = HasPoweredUpgrade(upgrades, ModItemCatalog.SvsapSpeedCard) ? 2 : 1;
         var blacklist = GetBoolModData(placedObject, null, SvsapTransferFilterBlacklistKey, false);
         var quality = Enum.TryParse(placedObject.modData.GetValueOrDefault(SvsapTransferQualityStrategyKey), out PoweredTransferQualityStrategy parsedQuality)
             ? parsedQuality.ToString()
@@ -467,9 +510,13 @@ internal sealed class MachineRuntimeService
             "Throughput: {{powered}}/route tick; prototype fallback {{prototype}}/route tick",
             new
             {
-                powered = PoweredTransferRules.GetEffectivePoweredThroughput(tier, PrototypeTransferThroughput).ToString("N0"),
+                powered = (PoweredTransferRules.GetEffectivePoweredThroughput(tier, PrototypeTransferThroughput) * capacityMultiplier).ToString("N0"),
                 prototype = PrototypeTransferThroughput.ToString("N0")
             }));
+        lines.Add(ModText.Get("ui.machine.powered.interval", "Effective interval: {{ticks}} ticks", new
+        {
+            ticks = Math.Max(1, (int)Math.Ceiling(this.getConfig().EnergyTickInterval / (double)speedMultiplier)).ToString("N0")
+        }));
         lines.Add(ModText.Get("ui.machine.powered.energyCost", "Energy cost: 0.5 Wh/item"));
         var filterSummary = FormatPoweredFilterSummary(placedObject, null);
         lines.Add(string.IsNullOrWhiteSpace(filterSummary)
@@ -522,6 +569,68 @@ internal sealed class MachineRuntimeService
     private static string FormatWh(long wh)
     {
         return $"{Math.Max(0, wh) / 1000m:0.00} kWh";
+    }
+
+    private static string FormatSignedWh(long wh)
+    {
+        var sign = wh >= 0 ? "+" : "-";
+        return sign + FormatWh(Math.Abs(wh));
+    }
+
+    private static string FormatEnergyCode(SvsapmeEnergyErrorCode code)
+    {
+        return code switch
+        {
+            SvsapmeEnergyErrorCode.NoEnergyCell => ModText.Get("ui.energy.reason.noEnergyCell", "no energy cell"),
+            SvsapmeEnergyErrorCode.StorageFull => ModText.Get("ui.energy.reason.storageFull", "storage full"),
+            SvsapmeEnergyErrorCode.InsufficientEnergy => ModText.Get("ui.energy.reason.insufficient", "insufficient energy"),
+            SvsapmeEnergyErrorCode.NotHost => ModText.Get("ui.energy.reason.notHost", "not host"),
+            SvsapmeEnergyErrorCode.NetworkUnknown => ModText.Get("ui.energy.reason.notLinked", "network unknown"),
+            SvsapmeEnergyErrorCode.SubsystemDisabled => ModText.Get("ui.energy.reason.configDisabled", "disabled"),
+            _ => code.ToString()
+        };
+    }
+
+    private static string FormatTelemetryTotals(IReadOnlyList<EnergyTelemetryReasonTotal> totals)
+    {
+        if (totals.Count == 0)
+            return ModText.Get("ui.common.none", "none");
+
+        return string.Join(", ", totals.Select(total => $"{total.Reason} {FormatWh(total.Wh)}"));
+    }
+
+    private static string FormatTelemetryDevice(EnergyTelemetryReasonTotal total)
+    {
+        if (string.IsNullOrWhiteSpace(total.DeviceId))
+            return total.Reason;
+        var separator = total.DeviceId.IndexOf(':');
+        var identity = separator >= 0 && separator + 1 < total.DeviceId.Length
+            ? total.DeviceId[(separator + 1)..]
+            : total.DeviceId;
+        var parts = identity.Split('|');
+        if (parts.Length >= 3 && string.Equals(parts[0], "machine", StringComparison.Ordinal))
+        {
+            var name = FormatItem(parts[1]);
+            var shortGuid = parts[2].Length >= 8 ? parts[2][..8] : parts[2];
+            return $"{name} [{shortGuid}]";
+        }
+
+        return identity;
+    }
+
+    private static string BuildMachineEnergyReason(MachineState state, string operation)
+    {
+        return $"machine|{state.QualifiedItemId}|{state.MachineGuid:N}|{operation}";
+    }
+
+    private static string BuildMachineEnergyReason(SObject? machine, string operation)
+    {
+        if (machine is null)
+            return operation;
+
+        var rawGuid = machine.modData.GetValueOrDefault(MachineRegistryService.MachineGuidKey);
+        var guid = Guid.TryParse(rawGuid, out var parsed) ? parsed : Guid.Empty;
+        return $"machine|{machine.QualifiedItemId}|{guid:N}|{operation}";
     }
 
     private static string FormatBool(bool value)
@@ -608,28 +717,8 @@ internal sealed class MachineRuntimeService
             return new(true, false, ModText.Get("hud.poweredFilter.cleared", "Powered transfer filter cleared."));
         }
 
-        if (filterQualifiedItemId == "(O)" + ModItemCatalog.SvsapOreDictionaryCard)
-        {
-            var next = !GetBoolModData(placedObject, null, SvsapTransferOreDictionaryKey, false);
-            placedObject.modData[SvsapTransferOreDictionaryKey] = next.ToString();
-            this.SyncPoweredTransferModData(placedObject, location, tile);
-            return new(true, false, next
-                ? ModText.Get("hud.poweredFilter.oreDictionaryOn", "Powered transfer ore dictionary matching enabled.")
-                : ModText.Get("hud.poweredFilter.oreDictionaryOff", "Powered transfer ore dictionary matching disabled."));
-        }
-
-        if (filterQualifiedItemId == "(O)" + ModItemCatalog.SvsapQualityCard)
-        {
-            var strategy = GetPoweredQualityStrategy(placedObject, null) == PoweredTransferQualityStrategy.LowQualityFirst
-                ? PoweredTransferQualityStrategy.HighQualityFirst
-                : PoweredTransferQualityStrategy.LowQualityFirst;
-            placedObject.modData[SvsapTransferQualityStrategyKey] = strategy.ToString();
-            this.SyncPoweredTransferModData(placedObject, location, tile);
-            return new(true, false, ModText.Get("hud.poweredFilter.quality", "Powered transfer quality: {{quality}}.", new { quality = FormatPoweredQualityStrategy(strategy) }));
-        }
-
-        if (filterQualifiedItemId is ("(O)" + ModItemCatalog.SvsapSpeedCard) or ("(O)" + ModItemCatalog.SvsapCapacityCard))
-            return new(false, false, ModText.Get("hud.poweredFilter.fixedByTier", "Powered transfer speed and capacity are fixed by machine tier."));
+        if (IsPoweredUpgradeCard(filterQualifiedItemId))
+            return new(false, false, ModText.Get("hud.poweredUpgrade.useMenu", "Open the powered transfer console and install this card in an upgrade slot."));
 
         Item probe;
         try
@@ -696,6 +785,71 @@ internal sealed class MachineRuntimeService
         }
 
         return result;
+    }
+
+    internal IReadOnlyList<string> GetPoweredUpgradeSlotIds(SObject placedObject)
+    {
+        return GetPoweredUpgradeSlots(placedObject, null);
+    }
+
+    internal bool HasPoweredUpgrade(SObject placedObject, string qualifiedItemId)
+    {
+        return GetPoweredUpgradeSlots(placedObject, null).Contains(qualifiedItemId, StringComparer.Ordinal);
+    }
+
+    internal SvsapmeMachineActionApplyResult TryInstallPoweredUpgrade(
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile,
+        int slotIndex,
+        string qualifiedItemId)
+    {
+        if (!IsPoweredConfigurableMachine(placedObject.QualifiedItemId))
+            return new(false, false, ModText.Get("hud.poweredFilter.notAccepted", "Target machine does not accept a powered filter."));
+
+        if (slotIndex is < 0 or >= PoweredTransferUpgradeSlotCount)
+            return new(false, false, ModText.Get("hud.poweredUpgrade.invalidSlot", "Powered upgrade slot is invalid."));
+
+        if (!IsPoweredUpgradeCard(qualifiedItemId))
+            return new(false, false, ModText.Get("hud.poweredUpgrade.invalidCard", "This item is not a supported powered transfer upgrade card."));
+
+        var slots = GetPoweredUpgradeSlots(placedObject, null);
+        if (!string.IsNullOrWhiteSpace(slots[slotIndex]))
+            return new(false, false, ModText.Get("hud.poweredUpgrade.slotOccupied", "Powered upgrade slot is occupied."));
+
+        if (slots.Contains(qualifiedItemId, StringComparer.Ordinal))
+            return new(false, false, ModText.Get("hud.poweredUpgrade.duplicate", "Only one card of each powered upgrade type can be installed."));
+
+        slots[slotIndex] = qualifiedItemId;
+        WritePoweredUpgradeSlots(placedObject, slots);
+        this.SyncPoweredTransferModData(placedObject, location, tile);
+        return new(true, true, ModText.Get("hud.poweredUpgrade.installed", "Powered upgrade installed: {{item}}.", new { item = FormatItem(qualifiedItemId) }));
+    }
+
+    internal SvsapmeMachineActionApplyResult TryRemovePoweredUpgrade(
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile,
+        int slotIndex)
+    {
+        var slots = GetPoweredUpgradeSlots(placedObject, null);
+        if (slotIndex is < 0 or >= PoweredTransferUpgradeSlotCount || string.IsNullOrWhiteSpace(slots[slotIndex]))
+            return new(false, false, ModText.Get("hud.poweredUpgrade.slotEmpty", "Powered upgrade slot is empty."));
+
+        var qualifiedItemId = slots[slotIndex];
+        slots[slotIndex] = string.Empty;
+        WritePoweredUpgradeSlots(placedObject, slots);
+        if (qualifiedItemId == "(O)" + ModItemCatalog.SvsapOreDictionaryCard)
+            placedObject.modData.Remove(SvsapTransferOreDictionaryKey);
+        if (qualifiedItemId == "(O)" + ModItemCatalog.SvsapQualityCard)
+            placedObject.modData.Remove(SvsapTransferQualityStrategyKey);
+
+        this.SyncPoweredTransferModData(placedObject, location, tile);
+        var returned = ItemRegistry.Create(qualifiedItemId, 1);
+        return new(true, false, ModText.Get("hud.poweredUpgrade.removed", "Powered upgrade removed: {{item}}.", new { item = returned.DisplayName }))
+        {
+            ReturnedItems = new List<BufferedItemStack> { BufferedItemCodec.FromItem(returned) }
+        };
     }
 
     internal bool TrySetPoweredFilterSlot(SObject placedObject, GameLocation location, Vector2 tile, int slotIndex, string qualifiedItemId, out string message)
@@ -778,6 +932,12 @@ internal sealed class MachineRuntimeService
 
     internal bool TryTogglePoweredOreDictionaryMode(SObject placedObject, GameLocation location, Vector2 tile, out string message)
     {
+        if (!this.HasPoweredUpgrade(placedObject, "(O)" + ModItemCatalog.SvsapOreDictionaryCard))
+        {
+            message = ModText.Get("hud.poweredUpgrade.oreRequired", "Install an ore dictionary card before enabling ore dictionary matching.");
+            return false;
+        }
+
         var next = !GetBoolModData(placedObject, null, SvsapTransferOreDictionaryKey, false);
         placedObject.modData[SvsapTransferOreDictionaryKey] = next.ToString();
         this.SyncPoweredTransferModData(placedObject, location, tile);
@@ -789,9 +949,18 @@ internal sealed class MachineRuntimeService
 
     internal bool TryTogglePoweredQualityStrategy(SObject placedObject, GameLocation location, Vector2 tile, out string message)
     {
-        var strategy = GetPoweredQualityStrategy(placedObject, null) == PoweredTransferQualityStrategy.LowQualityFirst
-            ? PoweredTransferQualityStrategy.HighQualityFirst
-            : PoweredTransferQualityStrategy.LowQualityFirst;
+        if (!this.HasPoweredUpgrade(placedObject, "(O)" + ModItemCatalog.SvsapQualityCard))
+        {
+            message = ModText.Get("hud.poweredUpgrade.qualityRequired", "Install a quality card before changing the quality strategy.");
+            return false;
+        }
+
+        var strategy = GetPoweredQualityStrategy(placedObject, null) switch
+        {
+            PoweredTransferQualityStrategy.LowQualityFirst => PoweredTransferQualityStrategy.HighQualityFirst,
+            PoweredTransferQualityStrategy.HighQualityFirst => PoweredTransferQualityStrategy.PreserveGoldIridium,
+            _ => PoweredTransferQualityStrategy.LowQualityFirst
+        };
         placedObject.modData[SvsapTransferQualityStrategyKey] = strategy.ToString();
         this.SyncPoweredTransferModData(placedObject, location, tile);
         message = ModText.Get("hud.poweredFilter.quality", "Powered transfer quality: {{quality}}.", new { quality = FormatPoweredQualityStrategy(strategy) });
@@ -816,6 +985,39 @@ internal sealed class MachineRuntimeService
     internal bool IsPoweredOreDictionaryModeEnabled(SObject placedObject)
     {
         return GetBoolModData(placedObject, null, SvsapTransferOreDictionaryKey, false);
+    }
+
+    internal PoweredTransferMenuView GetPoweredTransferMenuView(SObject placedObject)
+    {
+        var tier = GetPoweredTier(placedObject.QualifiedItemId);
+        var upgrades = GetPoweredUpgradeSlots(placedObject, null);
+        var capacityMultiplier = HasPoweredUpgrade(upgrades, ModItemCatalog.SvsapCapacityCard) ? 2 : 1;
+        var speedMultiplier = HasPoweredUpgrade(upgrades, ModItemCatalog.SvsapSpeedCard) ? 2 : 1;
+        return new PoweredTransferMenuView(
+            GetBoolModData(placedObject, null, SvsapTransferFilterBlacklistKey, false),
+            IsPoweredOreDictionaryModeEnabled(placedObject),
+            GetPoweredQualityStrategy(placedObject, null).ToString(),
+            GetPoweredFacingDirection(placedObject),
+            GetPoweredFilterSlotViews(placedObject),
+            PoweredTransferRules.GetEffectivePoweredThroughput(tier, PrototypeTransferThroughput) * capacityMultiplier,
+            Math.Max(1, (int)Math.Ceiling(this.getConfig().EnergyTickInterval / (double)speedMultiplier)),
+            0.5m,
+            upgrades);
+    }
+
+    internal PoweredNetworkStatusView GetPoweredNetworkStatus(GameLocation location, Vector2 tile)
+    {
+        var api = this.getSvsapApi();
+        if (api is null
+            || !api.TryGetLinkedEndpoint(location, tile, out var endpoint, out _, out _)
+            || endpoint is null
+            || !endpoint.Active
+            || !this.energy.TryGetNetworkEnergy(endpoint.NetworkId, out var storedWh, out var capacityWh, out _))
+        {
+            return new PoweredNetworkStatusView(false, 0, 0);
+        }
+
+        return new PoweredNetworkStatusView(true, storedWh, capacityWh);
     }
 
     internal IReadOnlyList<string> DescribePoweredConfigurationLines(SObject placedObject)
@@ -959,21 +1161,27 @@ internal sealed class MachineRuntimeService
                 case "(BC)" + ModItemCatalog.PoweredImporterSteel:
                 case "(BC)" + ModItemCatalog.PoweredImporterGold:
                 case "(BC)" + ModItemCatalog.PoweredImporterIridium:
-                    machineChanged |= this.RoutePoweredImporter(api, state, endpoint.NetworkId, location, machine);
+                    machineChanged |= RunPoweredOperations(
+                        () => this.RoutePoweredImporter(api, state, endpoint.NetworkId, location, machine),
+                        GetPoweredOperationCount(location, machine.Tile, state));
                     break;
 
                 case "(BC)" + ModItemCatalog.PoweredExporterCopper:
                 case "(BC)" + ModItemCatalog.PoweredExporterSteel:
                 case "(BC)" + ModItemCatalog.PoweredExporterGold:
                 case "(BC)" + ModItemCatalog.PoweredExporterIridium:
-                    machineChanged |= this.RoutePoweredExporter(api, state, endpoint.NetworkId, location, machine);
+                    machineChanged |= RunPoweredOperations(
+                        () => this.RoutePoweredExporter(api, state, endpoint.NetworkId, location, machine),
+                        GetPoweredOperationCount(location, machine.Tile, state));
                     break;
 
                 case "(BC)" + ModItemCatalog.PoweredMachineInterfaceCopper:
                 case "(BC)" + ModItemCatalog.PoweredMachineInterfaceSteel:
                 case "(BC)" + ModItemCatalog.PoweredMachineInterfaceGold:
                 case "(BC)" + ModItemCatalog.PoweredMachineInterfaceIridium:
-                    machineChanged |= this.RoutePoweredMachineInterface(api, state, endpoint.NetworkId, location, machine);
+                    machineChanged |= RunPoweredOperations(
+                        () => this.RoutePoweredMachineInterface(api, state, endpoint.NetworkId, location, machine),
+                        GetPoweredOperationCount(location, machine.Tile, state));
                     break;
 
                 case "(BC)" + ModItemCatalog.ElectricFurnace:
@@ -996,6 +1204,28 @@ internal sealed class MachineRuntimeService
             this.repository.Save();
     }
 
+    private static bool RunPoweredOperations(Func<bool> operation, int operationCount)
+    {
+        var changed = false;
+        for (var i = 0; i < Math.Clamp(operationCount, 1, 2); i++)
+        {
+            var operationChanged = operation();
+            changed |= operationChanged;
+            if (!operationChanged)
+                break;
+        }
+
+        return changed;
+    }
+
+    private static int GetPoweredOperationCount(GameLocation location, Vector2 tile, MachineState state)
+    {
+        if (!location.Objects.TryGetValue(tile, out var placedObject))
+            return 1;
+
+        return HasPoweredUpgrade(GetPoweredUpgradeSlots(placedObject, state), ModItemCatalog.SvsapSpeedCard) ? 2 : 1;
+    }
+
     private void ShowEnergyMonitor(GameLocation location, Vector2 tile)
     {
         if (!Context.IsMainPlayer)
@@ -1012,27 +1242,133 @@ internal sealed class MachineRuntimeService
         }
 
         var api = this.getSvsapApi();
-        if (api is null
-            || !api.TryGetLinkedEndpoint(location, tile, out var endpoint, out _, out _)
-            || endpoint is null
-            || !endpoint.Active)
+        if (api is null)
         {
-            Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.energyMonitor.notLinked", "Energy Monitor is not linked to an active SVSAP network."), HUDMessage.error_type));
+            Game1.activeClickableMenu = new SvsapmeStatusMenu(
+                ModText.Get("ui.energyMeter.title", "Energy Meter"),
+                () => new[] { ModText.Get("ui.machine.network.apiUnavailable", "Network: SVSAP API unavailable") });
             return;
         }
 
-        if (!this.energy.TryGetNetworkEnergy(endpoint.NetworkId, out var storedWh, out var capacityWh, out var code))
+        if (!api.TryGetLinkedEndpoint(location, tile, out var endpoint, out var endpointCode, out var endpointMessage)
+            || endpoint is null)
         {
-            Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.energyMonitor.failed", "Energy report failed: {{code}}.", new { code }), HUDMessage.error_type));
+            Game1.activeClickableMenu = new SvsapmeStatusMenu(
+                ModText.Get("ui.energyMeter.title", "Energy Meter"),
+                () => new[] { ModText.Get("ui.machine.network.notLinked", "Network: not linked ({{code}}: {{message}})", new { code = endpointCode.ToString(), message = endpointMessage }) });
             return;
         }
 
-        Game1.addHUDMessage(new HUDMessage(
-            ModText.Get(
-                "hud.energyMonitor.report",
-                "SVSAPME energy: {{storedKwh}}/{{capacityKwh}} kWh.",
-                new { storedKwh = $"{storedWh / 1000m:0.00}", capacityKwh = $"{capacityWh / 1000m:0.00}" }),
-            HUDMessage.newQuest_type));
+        if (!endpoint.Active)
+        {
+            Game1.activeClickableMenu = new SvsapmeStatusMenu(
+                ModText.Get("ui.energyMeter.title", "Energy Meter"),
+                () => new[] { ModText.Get("ui.machine.network.inactive", "Network: {{network}} inactive", new { network = FormatShortGuid(endpoint.NetworkId) }) });
+            return;
+        }
+
+        Game1.activeClickableMenu = new EnergyMonitorMenu(() => this.GetEnergyMonitorView(endpoint.NetworkId));
+    }
+
+    internal EnergyMonitorView GetEnergyMonitorView(Guid networkId)
+    {
+        var online = this.energy.TryGetNetworkEnergy(networkId, out var storedWh, out var capacityWh, out var code);
+        var telemetry = this.telemetry.GetSnapshot(networkId);
+        var status = online
+            ? string.IsNullOrWhiteSpace(telemetry.LastWarning)
+                ? ModText.Get("ui.machine.network.online", "Network online")
+                : ModText.Get("ui.energyMeter.warning", "Warning: {{message}}", new { message = telemetry.LastWarning })
+            : ModText.Get("hud.energyMonitor.failed", "Energy report failed: {{code}}.", new { code = FormatEnergyCode(code) });
+        return new EnergyMonitorView(
+            online,
+            status,
+            storedWh,
+            capacityWh,
+            telemetry.LastGeneratedWh,
+            telemetry.LastConsumedWh,
+            telemetry.TodayGeneratedWh,
+            telemetry.TodayConsumedWh,
+            telemetry.LastWarning,
+            telemetry.TopProducers.Select(total => new EnergyMonitorDeviceView(total.DeviceId, FormatTelemetryDevice(total), total.Wh, BuildTelemetryDeviceDetails(total))).ToList(),
+            telemetry.TopConsumers.Select(total => new EnergyMonitorDeviceView(total.DeviceId, FormatTelemetryDevice(total), total.Wh, BuildTelemetryDeviceDetails(total))).ToList());
+    }
+
+    private static IReadOnlyList<string> BuildTelemetryDeviceDetails(EnergyTelemetryReasonTotal total)
+    {
+        var lines = new List<string>
+        {
+            ModText.Get("ui.energyMeter.deviceTotal", "Today total: {{value}}", new { value = FormatWh(total.Wh) })
+        };
+        if (!TryGetTelemetryDeviceQualifiedItemId(total.DeviceId, out var qualifiedItemId))
+            return lines;
+
+        foreach (var port in MachinePortCatalog.GetPorts(qualifiedItemId))
+        {
+            lines.Add(ModText.Get(
+                "ui.machine.port.line",
+                "Port {{role}}: {{side}} - {{description}}",
+                new
+                {
+                    role = ModText.Get(port.RoleKey, port.RoleKey),
+                    side = ModText.Get(port.SideKey, port.SideKey),
+                    description = ModText.Get(port.DescriptionKey, port.DescriptionKey)
+                }));
+        }
+
+        return lines;
+    }
+
+    private static bool TryGetTelemetryDeviceQualifiedItemId(string deviceId, out string qualifiedItemId)
+    {
+        qualifiedItemId = string.Empty;
+        if (string.IsNullOrWhiteSpace(deviceId))
+            return false;
+
+        var separator = deviceId.IndexOf(':');
+        var identity = separator >= 0 && separator + 1 < deviceId.Length ? deviceId[(separator + 1)..] : deviceId;
+        var parts = identity.Split('|');
+        if (parts.Length < 3 || !string.Equals(parts[0], "machine", StringComparison.Ordinal))
+            return false;
+
+        qualifiedItemId = parts[1];
+        return !string.IsNullOrWhiteSpace(qualifiedItemId);
+    }
+
+    private IReadOnlyList<string> BuildEnergyMonitorLines(Guid networkId)
+    {
+        var lines = new List<string>
+        {
+            ModText.Get("ui.energyMeter.network", "Network: {{network}}", new { network = FormatShortGuid(networkId) })
+        };
+
+        if (this.energy.TryGetNetworkEnergy(networkId, out var storedWh, out var capacityWh, out var code))
+        {
+            var percent = capacityWh > 0 ? storedWh / (decimal)capacityWh : 0m;
+            lines.Add(ModText.Get(
+                "ui.energyMeter.stored",
+                "Stored: {{stored}} / {{capacity}} ({{percent}})",
+                new { stored = FormatWh(storedWh), capacity = FormatWh(capacityWh), percent = percent.ToString("P0") }));
+        }
+        else
+        {
+            lines.Add(ModText.Get("hud.energyMonitor.failed", "Energy report failed: {{code}}.", new { code = FormatEnergyCode(code) }));
+        }
+
+        var snapshot = this.telemetry.GetSnapshot(networkId);
+        lines.Add(ModText.Get(
+            "ui.energyMeter.lastTick",
+            "Last flow: +{{generated}} / -{{consumed}} / net {{net}}",
+            new { generated = FormatWh(snapshot.LastGeneratedWh), consumed = FormatWh(snapshot.LastConsumedWh), net = FormatSignedWh(snapshot.LastNetWh) }));
+        lines.Add(ModText.Get(
+            "ui.energyMeter.today",
+            "Today: +{{generated}} / -{{consumed}} / net {{net}}",
+            new { generated = FormatWh(snapshot.TodayGeneratedWh), consumed = FormatWh(snapshot.TodayConsumedWh), net = FormatSignedWh(snapshot.TodayNetWh) }));
+        lines.Add(ModText.Get("ui.energyMeter.topProducers", "Top producers: {{items}}", new { items = FormatTelemetryTotals(snapshot.TopProducers) }));
+        lines.Add(ModText.Get("ui.energyMeter.topConsumers", "Top consumers: {{items}}", new { items = FormatTelemetryTotals(snapshot.TopConsumers) }));
+        if (!string.IsNullOrWhiteSpace(snapshot.LastWarning))
+            lines.Add(ModText.Get("ui.energyMeter.warning", "Warning: {{message}}", new { message = snapshot.LastWarning }));
+
+        return lines;
     }
 
     private bool TrySendSnapshotRequest(Guid machineGuid)
@@ -1056,7 +1392,7 @@ internal sealed class MachineRuntimeService
                 networkId,
                 state.StoredWh,
                 ModItemCatalog.UniqueId,
-                "carbon-generator-route",
+                BuildMachineEnergyReason(state, "carbon-generator-route"),
                 out var acceptedWh,
                 out _,
                 out _)
@@ -1090,7 +1426,7 @@ internal sealed class MachineRuntimeService
                 networkId,
                 outputWh,
                 ModItemCatalog.UniqueId,
-                "battery-discharger",
+                BuildMachineEnergyReason(state, "battery-discharger"),
                 out var acceptedWh,
                 out _,
                 out _)
@@ -1121,7 +1457,7 @@ internal sealed class MachineRuntimeService
                     networkId,
                     needed,
                     ModItemCatalog.UniqueId,
-                    "battery-synthesizer-charge",
+                    BuildMachineEnergyReason(state, "battery-synthesizer-charge"),
                     allowPartial: true,
                     out var consumedWh,
                     out _,
@@ -1179,7 +1515,7 @@ internal sealed class MachineRuntimeService
                     networkId,
                     ElectricMachineRules.FurnaceWhPerRun,
                     ModItemCatalog.UniqueId,
-                    "electric-furnace",
+                    BuildMachineEnergyReason(machine, "electric-furnace"),
                     allowPartial: false,
                     out _,
                     out _,
@@ -1192,7 +1528,7 @@ internal sealed class MachineRuntimeService
                 || extracted is null
                 || extracted.Stack < recipe.InputCount)
             {
-                this.TryDepositEnergyRefund(networkId, ElectricMachineRules.FurnaceWhPerRun, "electric-furnace-refund");
+                this.TryDepositEnergyRefund(networkId, ElectricMachineRules.FurnaceWhPerRun, BuildMachineEnergyReason(machine, "electric-furnace-refund"));
                 if (extracted is not null && extracted.Stack > 0)
                     api.TryInsertItem(networkId, extracted, out _, out _, out _);
                 return false;
@@ -1242,7 +1578,7 @@ internal sealed class MachineRuntimeService
                     networkId,
                     ElectricMachineRules.GeodeCrusherWhPerRun,
                     ModItemCatalog.UniqueId,
-                    "electric-geode-crusher",
+                    BuildMachineEnergyReason(machine, "electric-geode-crusher"),
                     allowPartial: false,
                     out _,
                     out _,
@@ -1255,14 +1591,14 @@ internal sealed class MachineRuntimeService
                 || extracted is null
                 || extracted.Stack <= 0)
             {
-                this.TryDepositEnergyRefund(networkId, ElectricMachineRules.GeodeCrusherWhPerRun, "electric-geode-crusher-refund");
+                this.TryDepositEnergyRefund(networkId, ElectricMachineRules.GeodeCrusherWhPerRun, BuildMachineEnergyReason(machine, "electric-geode-crusher-refund"));
                 return false;
             }
 
             var output = Utility.getTreasureFromGeode(extracted);
             if (output is null)
             {
-                this.TryDepositEnergyRefund(networkId, ElectricMachineRules.GeodeCrusherWhPerRun, "electric-geode-crusher-refund");
+                this.TryDepositEnergyRefund(networkId, ElectricMachineRules.GeodeCrusherWhPerRun, BuildMachineEnergyReason(machine, "electric-geode-crusher-refund"));
                 api.TryInsertItem(networkId, extracted, out _, out _, out _);
                 return false;
             }
@@ -1414,15 +1750,15 @@ internal sealed class MachineRuntimeService
             if (sourceAvailable <= 0)
                 continue;
 
-            var maxCandidate = Math.Min(sourceAvailable, Math.Max(PoweredTransferRules.GetPoweredThroughput(tier), PrototypeTransferThroughput));
+            var maxCandidate = Math.Min(sourceAvailable, GetPoweredOperationLimit(tier, settings));
             var probe = source!.getOne();
             probe.Stack = maxCandidate;
             var targetCapacity = api.GetInsertCapacity(networkId, probe, maxCandidate);
-            var plan = this.PlanPoweredTransfer(networkId, sourceAvailable, targetCapacity, tier, state);
+            var plan = this.PlanPoweredTransfer(networkId, sourceAvailable, targetCapacity, tier, state, settings.CapacityMultiplier);
             if (plan.Mode == PoweredTransferRunMode.None)
                 continue;
 
-            if (!this.TryPayPoweredTransfer(networkId, plan))
+            if (!this.TryPayPoweredTransfer(networkId, state, plan))
                 continue;
 
             var moved = this.InsertFromChestSlotsIntoNetwork(api, networkId, chest, sourceSlots, probe, plan.PlannedItems);
@@ -1454,15 +1790,15 @@ internal sealed class MachineRuntimeService
         }
 
         var sourceAvailable = held.Stack;
-        var maxCandidate = Math.Min(sourceAvailable, Math.Max(PoweredTransferRules.GetPoweredThroughput(tier), PrototypeTransferThroughput));
+        var maxCandidate = Math.Min(sourceAvailable, GetPoweredOperationLimit(tier, settings));
         var probe = held.getOne();
         probe.Stack = maxCandidate;
         var targetCapacity = api.GetInsertCapacity(networkId, probe, maxCandidate);
-        var plan = this.PlanPoweredTransfer(networkId, sourceAvailable, targetCapacity, tier, state);
+        var plan = this.PlanPoweredTransfer(networkId, sourceAvailable, targetCapacity, tier, state, settings.CapacityMultiplier);
         if (plan.Mode == PoweredTransferRunMode.None)
             return false;
 
-        if (!this.TryPayPoweredTransfer(networkId, plan))
+        if (!this.TryPayPoweredTransfer(networkId, state, plan))
             return false;
 
         var moved = this.InsertItemIntoNetworkInChunks(api, networkId, held, plan.PlannedItems);
@@ -1536,7 +1872,7 @@ internal sealed class MachineRuntimeService
         if (targetMachine.heldObject.Value is not null || ModItemCatalog.IsSvsapmeBigCraftable(targetMachine.QualifiedItemId))
             return false;
 
-        var operationLimit = Math.Max(PoweredTransferRules.GetPoweredThroughput(tier), PrototypeTransferThroughput);
+        var operationLimit = GetPoweredOperationLimit(tier, settings);
         bool CandidateCanMove(Item item)
         {
             return MatchesPoweredFilter(item, settings)
@@ -1559,11 +1895,11 @@ internal sealed class MachineRuntimeService
         }
 
         var maxCandidate = Math.Min(sourceAvailable, operationLimit);
-        var plan = this.PlanPoweredTransfer(networkId, maxCandidate, maxCandidate, tier, state);
+        var plan = this.PlanPoweredTransfer(networkId, maxCandidate, maxCandidate, tier, state, settings.CapacityMultiplier);
         if (plan.Mode == PoweredTransferRunMode.None)
             return false;
 
-        if (!this.TryPayPoweredTransfer(networkId, plan))
+        if (!this.TryPayPoweredTransfer(networkId, state, plan))
             return false;
 
         var accepted = this.ExtractFirstMatchingItemsToMachine(
@@ -1593,7 +1929,7 @@ internal sealed class MachineRuntimeService
         PoweredMachineTier tier,
         PoweredTransferSettings settings)
     {
-        var operationLimit = Math.Max(PoweredTransferRules.GetPoweredThroughput(tier), PrototypeTransferThroughput);
+        var operationLimit = GetPoweredOperationLimit(tier, settings);
         bool CandidateCanMove(Item item)
         {
             if (!MatchesPoweredFilter(item, settings))
@@ -1632,11 +1968,11 @@ internal sealed class MachineRuntimeService
         var probe = prototype.getOne();
         probe.Stack = maxCandidate;
         var targetCapacity = GetChestAcceptCount(chest, probe, maxCandidate);
-        var plan = this.PlanPoweredTransfer(networkId, maxCandidate, targetCapacity, tier, state);
+        var plan = this.PlanPoweredTransfer(networkId, maxCandidate, targetCapacity, tier, state, settings.CapacityMultiplier);
         if (plan.Mode == PoweredTransferRunMode.None)
             return false;
 
-        if (!this.TryPayPoweredTransfer(networkId, plan))
+        if (!this.TryPayPoweredTransfer(networkId, state, plan))
             return false;
 
         var accepted = this.ExtractFirstMatchingItemsToChest(
@@ -1672,7 +2008,7 @@ internal sealed class MachineRuntimeService
         PoweredMachineTier tier,
         PoweredTransferSettings settings)
     {
-        var operationLimit = Math.Max(PoweredTransferRules.GetPoweredThroughput(tier), PrototypeTransferThroughput);
+        var operationLimit = GetPoweredOperationLimit(tier, settings);
         bool CandidateCanMove(Item item)
         {
             if (!MatchesPoweredFilter(item, settings))
@@ -1714,11 +2050,11 @@ internal sealed class MachineRuntimeService
         var probe = prototype.getOne();
         probe.Stack = maxCandidate;
         var targetCapacity = GetChestAcceptCount(chest, probe, maxCandidate);
-        var plan = this.PlanPoweredTransfer(networkId, maxCandidate, targetCapacity, tier, state);
+        var plan = this.PlanPoweredTransfer(networkId, maxCandidate, targetCapacity, tier, state, settings.CapacityMultiplier);
         if (plan.Mode == PoweredTransferRunMode.None)
             return false;
 
-        if (!this.TryPayPoweredTransfer(networkId, plan))
+        if (!this.TryPayPoweredTransfer(networkId, state, plan))
             return false;
 
         var accepted = this.ExtractFirstMatchingItemsToChest(
@@ -2057,7 +2393,7 @@ internal sealed class MachineRuntimeService
         if (string.IsNullOrWhiteSpace(filterQualifiedItemId))
             return false;
 
-        var count = Math.Max(1, settings.ItemsPerOperation);
+        var count = Math.Clamp(settings.ItemsPerOperation * settings.CapacityMultiplier, 1, 999);
         foreach (var target in targets)
         {
             if (this.TryFeedMachineFromNetwork(api, networkId, location, target.Tile, target.Object, filterQualifiedItemId, count, powered))
@@ -2079,7 +2415,7 @@ internal sealed class MachineRuntimeService
         if (api.GetInsertCapacity(networkId, probe, expectedCount) < expectedCount)
             return false;
 
-        if (powered && !this.TryPayMachineInterfaceAction(networkId))
+        if (powered && !this.TryPayMachineInterfaceAction(networkId, targetMachine))
             return false;
 
         var moving = held.getOne();
@@ -2087,7 +2423,7 @@ internal sealed class MachineRuntimeService
         if (!api.TryInsertItem(networkId, moving, out var remainder, out _, out _))
         {
             if (powered)
-                this.TryRefundMachineInterfaceAction(networkId);
+                this.TryRefundMachineInterfaceAction(networkId, targetMachine);
             return false;
         }
 
@@ -2098,7 +2434,7 @@ internal sealed class MachineRuntimeService
                 api.TryExtractItem(networkId, held.QualifiedItemId, held.Quality, moved, out _, out _, out _);
 
             if (powered)
-                this.TryRefundMachineInterfaceAction(networkId);
+                this.TryRefundMachineInterfaceAction(networkId, targetMachine);
             return false;
         }
 
@@ -2118,7 +2454,7 @@ internal sealed class MachineRuntimeService
         if (api.GetAvailableCount(networkId, qualifiedItemId, quality: null) < count)
             return false;
 
-        if (powered && !this.TryPayMachineInterfaceAction(networkId))
+        if (powered && !this.TryPayMachineInterfaceAction(networkId, targetMachine))
             return false;
 
         if (!api.TryExtractItem(networkId, qualifiedItemId, quality: null, count, out var extracted, out _, out _)
@@ -2126,7 +2462,7 @@ internal sealed class MachineRuntimeService
             || extracted.Stack <= 0)
         {
             if (powered)
-                this.TryRefundMachineInterfaceAction(networkId);
+                this.TryRefundMachineInterfaceAction(networkId, targetMachine);
             return false;
         }
 
@@ -2146,7 +2482,7 @@ internal sealed class MachineRuntimeService
 
         this.ReturnScratchInventory(api, networkId, scratchInventory, location, tile);
         if (!accepted && powered)
-            this.TryRefundMachineInterfaceAction(networkId);
+            this.TryRefundMachineInterfaceAction(networkId, targetMachine);
 
         return accepted;
     }
@@ -2157,26 +2493,26 @@ internal sealed class MachineRuntimeService
             && storedWh >= requiredWh;
     }
 
-    private bool TryPayMachineInterfaceAction(Guid networkId)
+    private bool TryPayMachineInterfaceAction(Guid networkId, SObject targetMachine)
     {
         return this.energy.TryConsumeWh(
             networkId,
             PoweredMachineInterfaceRules.WhPerAction,
             ModItemCatalog.UniqueId,
-            "powered-machine-interface",
+            BuildMachineEnergyReason(targetMachine, "powered-machine-interface"),
             allowPartial: false,
             out _,
             out _,
             out _);
     }
 
-    private bool TryRefundMachineInterfaceAction(Guid networkId)
+    private bool TryRefundMachineInterfaceAction(Guid networkId, SObject targetMachine)
     {
         return this.energy.TryDepositWh(
             networkId,
             PoweredMachineInterfaceRules.WhPerAction,
             ModItemCatalog.UniqueId,
-            "powered-machine-interface-refund",
+            BuildMachineEnergyReason(targetMachine, "powered-machine-interface-refund"),
             out _,
             out _,
             out _);
@@ -2210,7 +2546,7 @@ internal sealed class MachineRuntimeService
             endpoint.NetworkId,
             amountWh,
             ModItemCatalog.UniqueId,
-            "manual-electric-machine",
+            BuildMachineEnergyReason(location.Objects.GetValueOrDefault(tile), "manual-electric-machine"),
             allowPartial: false,
             out _,
             out _,
@@ -2228,10 +2564,16 @@ internal sealed class MachineRuntimeService
             return false;
         }
 
-        return this.TryDepositEnergyRefund(endpoint.NetworkId, amountWh, "manual-electric-machine-refund");
+        return this.TryDepositEnergyRefund(endpoint.NetworkId, amountWh, BuildMachineEnergyReason(location.Objects.GetValueOrDefault(tile), "manual-electric-machine-refund"));
     }
 
-    private PoweredTransferPlan PlanPoweredTransfer(Guid networkId, int sourceAvailable, int targetCapacity, PoweredMachineTier tier, MachineState state)
+    private PoweredTransferPlan PlanPoweredTransfer(
+        Guid networkId,
+        int sourceAvailable,
+        int targetCapacity,
+        PoweredMachineTier tier,
+        MachineState state,
+        int capacityMultiplier)
     {
         var storedWh = 0L;
         if (this.energy.TryGetNetworkEnergy(networkId, out var availableWh, out _, out _))
@@ -2243,10 +2585,17 @@ internal sealed class MachineRuntimeService
             tier,
             storedWh,
             ReadHalfWhCredit(state),
-            PrototypeTransferThroughput);
+            PrototypeTransferThroughput,
+            capacityMultiplier);
     }
 
-    private bool TryPayPoweredTransfer(Guid networkId, PoweredTransferPlan plan)
+    private static int GetPoweredOperationLimit(PoweredMachineTier tier, PoweredTransferSettings settings)
+    {
+        return PoweredTransferRules.GetEffectivePoweredThroughput(tier, PrototypeTransferThroughput)
+            * Math.Clamp(settings.CapacityMultiplier, 1, 2);
+    }
+
+    private bool TryPayPoweredTransfer(Guid networkId, MachineState state, PoweredTransferPlan plan)
     {
         if (plan.Mode != PoweredTransferRunMode.Powered || plan.WhToConsume <= 0)
             return true;
@@ -2255,7 +2604,7 @@ internal sealed class MachineRuntimeService
             networkId,
             plan.WhToConsume,
             ModItemCatalog.UniqueId,
-            "powered-transfer",
+            BuildMachineEnergyReason(state, "powered-transfer"),
             allowPartial: false,
             out _,
             out _,
@@ -2275,7 +2624,7 @@ internal sealed class MachineRuntimeService
                     networkId,
                     refund.RefundWh,
                     ModItemCatalog.UniqueId,
-                    "powered-transfer-refund",
+                    BuildMachineEnergyReason(state, "powered-transfer-refund"),
                     out var acceptedWh,
                     out var code,
                     out var message)
@@ -2547,6 +2896,7 @@ internal sealed class MachineRuntimeService
 
     private static PoweredTransferSettings GetPoweredTransferSettings(SObject placedObject, MachineState state)
     {
+        var upgrades = GetPoweredUpgradeSlots(placedObject, state);
         return new PoweredTransferSettings(
             GetPoweredFilterIds(placedObject, state),
             GetBoolModData(placedObject, state, SvsapTransferFilterBlacklistKey, false),
@@ -2555,7 +2905,66 @@ internal sealed class MachineRuntimeService
             GetPoweredQualityStrategy(placedObject, state),
             GetNonNegativeIntModData(placedObject, state, SvsapTransferMinSourceKeepKey, 0),
             GetNonNegativeIntModData(placedObject, state, SvsapTransferTargetKeepKey, 0),
-            GetIntModData(placedObject, state, SvsapTransferItemsPerOperationKey, 1));
+            GetIntModData(placedObject, state, SvsapTransferItemsPerOperationKey, 1),
+            HasPoweredUpgrade(upgrades, ModItemCatalog.SvsapCapacityCard) ? 2 : 1);
+    }
+
+    private static bool IsPoweredUpgradeCard(string qualifiedItemId)
+    {
+        return qualifiedItemId is
+            ("(O)" + ModItemCatalog.SvsapSpeedCard)
+            or ("(O)" + ModItemCatalog.SvsapCapacityCard)
+            or ("(O)" + ModItemCatalog.SvsapQualityCard)
+            or ("(O)" + ModItemCatalog.SvsapOreDictionaryCard);
+    }
+
+    private static bool HasPoweredUpgrade(IReadOnlyList<string> slots, string itemId)
+    {
+        return slots.Contains("(O)" + itemId, StringComparer.Ordinal);
+    }
+
+    private static List<string> GetPoweredUpgradeSlots(SObject placedObject, MachineState? state)
+    {
+        var raw = GetRawModData(placedObject, state, PoweredTransferUpgradeSlotsKey);
+        if (!string.IsNullOrWhiteSpace(raw))
+        {
+            try
+            {
+                var ids = JsonSerializer.Deserialize<List<string>>(raw);
+                if (ids is not null)
+                    return NormalizePoweredUpgradeSlots(ids);
+            }
+            catch
+            {
+                // Invalid card data is treated as an empty upgrade bank.
+            }
+        }
+
+        return NormalizePoweredUpgradeSlots(Array.Empty<string>());
+    }
+
+    private static void WritePoweredUpgradeSlots(SObject placedObject, IReadOnlyList<string> ids)
+    {
+        var slots = NormalizePoweredUpgradeSlots(ids);
+        if (slots.All(string.IsNullOrWhiteSpace))
+        {
+            placedObject.modData.Remove(PoweredTransferUpgradeSlotsKey);
+            return;
+        }
+
+        placedObject.modData[PoweredTransferUpgradeSlotsKey] = JsonSerializer.Serialize(slots);
+    }
+
+    private static List<string> NormalizePoweredUpgradeSlots(IEnumerable<string> ids)
+    {
+        var result = ids
+            .Take(PoweredTransferUpgradeSlotCount)
+            .Select(id => !string.IsNullOrWhiteSpace(id) && IsPoweredUpgradeCard(id.Trim()) ? id.Trim() : string.Empty)
+            .ToList();
+        while (result.Count < PoweredTransferUpgradeSlotCount)
+            result.Add(string.Empty);
+
+        return result;
     }
 
     private static List<string> GetPoweredFilterIds(SObject placedObject, MachineState? state)
@@ -3081,7 +3490,8 @@ internal sealed class MachineRuntimeService
         PoweredTransferQualityStrategy QualityStrategy,
         int MinSourceKeep,
         int TargetKeep,
-        int ItemsPerOperation);
+        int ItemsPerOperation,
+        int CapacityMultiplier);
 }
 
 internal sealed class PoweredTransferFilterSlotView
@@ -3098,3 +3508,16 @@ internal sealed class PoweredTransferFilterSlotView
         return new PoweredTransferFilterSlotView { SlotIndex = slotIndex };
     }
 }
+
+internal readonly record struct PoweredTransferMenuView(
+    bool IsBlacklist,
+    bool OreDictionaryEnabled,
+    string QualityStrategy,
+    int FacingDirection,
+    IReadOnlyList<PoweredTransferFilterSlotView> FilterSlots,
+    int Throughput,
+    int TransferIntervalTicks,
+    decimal EnergyPerActionWh,
+    IReadOnlyList<string> UpgradeSlotQualifiedItemIds);
+
+internal readonly record struct PoweredNetworkStatusView(bool Online, long StoredWh, long CapacityWh);

@@ -18,8 +18,11 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
     private const int LeftPanelWidth = 152;
     private const int RightPanelMinWidth = 150;
     private const int PanelGap = 18;
-    private const int GridTopOffset = 96;
-    private const int BottomButtonOffset = 64;
+    private const int GridTopOffset = 138;
+    private const int PreviewSlotSize = 36;
+    private const int InventoryCell = 52;
+    private const int InventorySlotSize = 48;
+    private const int InventorySlotCount = 36;
     private const int ViewRefreshTicks = 5;
     private static readonly Rectangle PanelSource = new(0, 256, 60, 60);
 
@@ -35,13 +38,18 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
     private readonly ClickableComponent filterModeButton;
     private readonly ClickableComponent addFilterButton;
     private readonly ClickableComponent clearFilterButton;
+    private readonly ClickableComponent collectAllButton;
     private readonly int columns;
     private readonly int rows;
     private readonly int pageSize;
     private IReadOnlyList<FarmPlotView> cachedViews = Array.Empty<FarmPlotView>();
-    private FarmDashboardView cachedDashboard = new(false, false, false, MachineInputModes.AllEligible, MachineFilterModes.Whitelist, 0, 0, 0, 0, 0m);
+    private FarmDashboardView cachedDashboard = new(false, false, false, MachineInputModes.AllEligible, MachineFilterModes.Whitelist, 0, 0, 0, 0, 0, 0, 0, 0, Array.Empty<string>(), 0m, 0L);
     private int cachedAtTick = -1;
     private int page;
+    private string? hoverText;
+
+    private Rectangle inventoryArea;
+    private int backpackColumns;
 
     public SingleBlockFarmMenu(SObject machine, GameLocation location, Vector2 tile, SingleBlockFarmService service)
         : base(
@@ -60,17 +68,32 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
         this.rows = layout.Rows;
         this.pageSize = layout.PageSize;
 
-        var buttonY = this.yPositionOnScreen + this.height - 64;
+        // Build player inventory area layout
+        var innerX = this.xPositionOnScreen + Pad;
+        var innerW = this.width - Pad * 2;
+        this.backpackColumns = Math.Clamp(innerW / InventoryCell, 4, 12);
+        var backpackRows = Math.Max(3, (int)Math.Ceiling(Game1.player.Items.Count / (double)this.backpackColumns));
+        var invW = this.backpackColumns * InventoryCell;
+        var invH = backpackRows * InventoryCell;
+        this.inventoryArea = new Rectangle(
+            innerX + Math.Max(0, (innerW - invW) / 2),
+            this.yPositionOnScreen + this.height - Pad - invH,
+            invW,
+            invH
+        );
+
+        var buttonY = this.inventoryArea.Y - 50;
         this.prevButton = new ClickableComponent(new Rectangle(this.GridBounds.X, buttonY, 104, 40), "prev", "<");
         this.nextButton = new ClickableComponent(new Rectangle(this.GridBounds.X + 116, buttonY, 104, 40), "next", ">");
         var left = this.LeftPanelBounds;
-        this.autoInButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 54, left.Width - 20, 34), "autoIn", ModText.Get("ui.processor.autoIn", "Auto In"));
-        this.inputModeButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 96, left.Width - 20, 34), "inputMode", ModText.Get("ui.processor.inputMode", "Input Mode"));
-        this.filterModeButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 138, left.Width - 20, 34), "filterMode", ModText.Get("ui.processor.filterMode", "W/B"));
-        this.addFilterButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 180, left.Width - 20, 34), "addFilter", ModText.Get("ui.processor.addFilter", "+ Held"));
-        this.clearFilterButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 222, left.Width - 20, 34), "clearFilter", ModText.Get("ui.processor.clearFilter", "Clear"));
+        this.autoInButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 92, left.Width - 20, 28), "autoIn", ModText.Get("ui.processor.autoIn", "Auto In"));
+        this.inputModeButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 124, left.Width - 20, 28), "inputMode", ModText.Get("ui.processor.inputMode", "Input Mode"));
+        this.filterModeButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 156, left.Width - 20, 28), "filterMode", ModText.Get("ui.processor.filterMode", "W/B"));
+        this.addFilterButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 188, left.Width - 20, 28), "addFilter", ModText.Get("ui.processor.addFilter", "+ Held"));
+        this.clearFilterButton = new ClickableComponent(new Rectangle(left.X + 10, left.Y + 220, left.Width - 20, 28), "clearFilter", ModText.Get("ui.processor.clearFilter", "Clear"));
         var right = this.RightPanelBounds;
-        this.autoOutButton = new ClickableComponent(new Rectangle(right.X + 10, right.Y + 54, right.Width - 20, 34), "autoOut", ModText.Get("ui.processor.autoOut", "Auto Out"));
+        this.autoOutButton = new ClickableComponent(new Rectangle(right.X + 10, right.Y + 96, right.Width - 20, 30), "autoOut", ModText.Get("ui.processor.autoOut", "Auto Out"));
+        this.collectAllButton = new ClickableComponent(new Rectangle(right.X + 10, right.Y + 132, right.Width - 20, 30), "collect", ModText.Get("ui.processor.collectAll", "Collect All"));
         if (this.upperRightCloseButton is not null)
         {
             this.upperRightCloseButton.bounds.X = this.xPositionOnScreen + this.width - 62;
@@ -86,7 +109,9 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
         var availableGridWidth = menuWidth - Pad * 2 - LeftPanelWidth - RightPanelMinWidth - PanelGap * 2;
         var columns = Math.Clamp(availableGridWidth / SlotSize, 1, MaxColumns);
 
-        var buttonY = menuHeight - BottomButtonOffset;
+        var backpackColumns = Math.Clamp((menuWidth - Pad * 2) / InventoryCell, 4, 12);
+        var backpackRows = Math.Max(3, (int)Math.Ceiling(InventorySlotCount / (double)backpackColumns));
+        var buttonY = menuHeight - Pad - backpackRows * InventoryCell - 50;
         var availableGridHeight = buttonY - GridTopOffset - 12;
         var rows = Math.Clamp(availableGridHeight / SlotSize, 1, MaxRows);
 
@@ -98,13 +123,19 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
         var layout = CalculateLayoutShape(menuWidth, menuHeight);
         var requiredWidth = Pad * 2 + LeftPanelWidth + RightPanelMinWidth + PanelGap * 2 + layout.Columns * SlotSize;
         var gridBottom = GridTopOffset + layout.Rows * SlotSize;
-        var buttonY = menuHeight - BottomButtonOffset;
+        var backpackColumns = Math.Clamp((menuWidth - Pad * 2) / InventoryCell, 4, 12);
+        var backpackRows = Math.Max(3, (int)Math.Ceiling(InventorySlotCount / (double)backpackColumns));
+        var buttonY = menuHeight - Pad - backpackRows * InventoryCell - 50;
         return requiredWidth <= menuWidth && gridBottom + 12 <= buttonY;
     }
 
     private Rectangle GridBounds => new(this.xPositionOnScreen + Pad + GridLeftOffset, this.yPositionOnScreen + GridTopOffset, this.columns * SlotSize, this.rows * SlotSize);
-    private Rectangle LeftPanelBounds => new(this.xPositionOnScreen + Pad, this.yPositionOnScreen + GridTopOffset, LeftPanelWidth, this.rows * SlotSize);
-    private Rectangle RightPanelBounds => new(this.GridBounds.Right + PanelGap, this.yPositionOnScreen + GridTopOffset, Math.Max(1, this.xPositionOnScreen + this.width - Pad - this.GridBounds.Right - PanelGap), this.rows * SlotSize);
+    private Rectangle LeftPanelBounds => new(this.xPositionOnScreen + Pad, this.yPositionOnScreen + GridTopOffset, LeftPanelWidth, Math.Max(this.rows * SlotSize, this.inventoryArea.Y - 58 - (this.yPositionOnScreen + GridTopOffset)));
+    private Rectangle RightPanelBounds => new(this.GridBounds.Right + PanelGap, this.yPositionOnScreen + GridTopOffset, Math.Max(1, this.xPositionOnScreen + this.width - Pad - this.GridBounds.Right - PanelGap), Math.Max(this.rows * SlotSize, this.inventoryArea.Y - 58 - (this.yPositionOnScreen + GridTopOffset)));
+
+    private Rectangle SeedInputSlotBounds => new(this.LeftPanelBounds.X + 14, this.LeftPanelBounds.Y + 48, PreviewSlotSize, PreviewSlotSize);
+    private Rectangle FertilizerInputSlotBounds => new(this.SeedInputSlotBounds.Right + 10, this.SeedInputSlotBounds.Y, PreviewSlotSize, PreviewSlotSize);
+    private Rectangle OutputSlotBounds => new(this.RightPanelBounds.X + 14, this.RightPanelBounds.Y + 48, PreviewSlotSize, PreviewSlotSize);
 
     public override void receiveLeftClick(int x, int y, bool playSound = true)
     {
@@ -136,6 +167,182 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
         if (this.filterModeButton.containsPoint(x, y)) { this.Show(this.service.ToggleFarmFilterMode(this.machine, this.location, this.tile)); return; }
         if (this.addFilterButton.containsPoint(x, y)) { this.Show(this.service.AddHeldFarmFilter(this.machine, this.location, this.tile, Game1.player.CurrentItem)); return; }
         if (this.clearFilterButton.containsPoint(x, y)) { this.Show(this.service.ClearFarmFilter(this.machine, this.location, this.tile)); return; }
+        if (this.collectAllButton.containsPoint(x, y)) { this.ShowAndDeliver(this.service.TryCollectFarmOutput(this.machine, this.location, this.tile)); return; }
+
+        if (this.SeedInputSlotBounds.Contains(x, y))
+        {
+            var held = Game1.player.CurrentItem;
+            var result = held is null
+                ? this.service.TryExtractFarmInput(this.machine, this.location, this.tile, fertilizer: false)
+                : this.service.TryLoadSeed(this.machine, this.location, this.tile, held.QualifiedItemId, Game1.player.FarmingLevel);
+            this.ShowAndDeliver(result);
+            if (result.Success && result.ConsumeEscrowedItem && held is not null)
+                ConsumeCurrentItem(1);
+            return;
+        }
+
+        if (this.FertilizerInputSlotBounds.Contains(x, y))
+        {
+            var held = Game1.player.CurrentItem;
+            var result = held is null
+                ? this.service.TryExtractFarmInput(this.machine, this.location, this.tile, fertilizer: true)
+                : this.service.TryLoadFertilizer(this.machine, this.location, this.tile, held.QualifiedItemId);
+            this.ShowAndDeliver(result);
+            if (result.Success && result.ConsumeEscrowedItem && held is not null)
+                ConsumeCurrentItem(1);
+            return;
+        }
+
+        if (this.OutputSlotBounds.Contains(x, y))
+        {
+            this.ShowAndDeliver(this.service.TryCollectFarmOutput(this.machine, this.location, this.tile));
+            return;
+        }
+
+        // Check if player clicked an inventory item slot
+        var inventoryIndex = this.HitInventorySlot(x, y);
+        if (inventoryIndex >= 0)
+        {
+            var item = Game1.player.Items[inventoryIndex];
+            if (item is not null)
+            {
+                // We'll let the user click the inventory items to seed/fertilize.
+                // Left-click with seeds/fertilizers will feed the farm just like standard world clicks.
+                // SvsapmeMachineActionRequest for LoadFarmSeed / LoadFarmFertilizer is supported.
+                // First, check what type of item it is:
+                var seedType = FarmCropCatalog.TryGetBySeed(item.QualifiedItemId, out _);
+                var fertType = FarmModuleRules.IsFertilizer(item.QualifiedItemId);
+                var moduleType = FarmModuleRules.TryGetModule(item.QualifiedItemId, out _);
+
+                if (seedType || fertType || moduleType)
+                {
+                    if (!StardewModdingAPI.Context.IsMainPlayer)
+                    {
+                        // Farmhand escrow
+                        var oldToolIndex = Game1.player.CurrentToolIndex;
+                        Game1.player.CurrentToolIndex = inventoryIndex;
+                        try
+                        {
+                            var kind = seedType ? SvsapmeMachineActionKind.LoadFarmSeed :
+                                       (fertType ? SvsapmeMachineActionKind.LoadFarmFertilizer : SvsapmeMachineActionKind.InstallFarmModule);
+                            if (this.service.TrySendClientAction(this.machine, kind, item.QualifiedItemId, Game1.player.FarmingLevel))
+                            {
+                                Game1.playSound("Ship");
+                                this.InvalidateCache();
+                            }
+                        }
+                        finally
+                        {
+                            Game1.player.CurrentToolIndex = oldToolIndex;
+                        }
+                    }
+                    else
+                    {
+                        var bulk = Game1.oldKBState.IsKeyDown(Microsoft.Xna.Framework.Input.Keys.LeftShift)
+                            || Game1.oldKBState.IsKeyDown(Microsoft.Xna.Framework.Input.Keys.RightShift);
+                        var transferCount = moduleType ? 1 : bulk ? item.Stack : 1;
+                        SvsapmeMachineActionApplyResult result;
+                        if (seedType)
+                            result = this.service.TryLoadSeed(this.machine, this.location, this.tile, item.QualifiedItemId, Game1.player.FarmingLevel, transferCount);
+                        else if (fertType)
+                            result = this.service.TryLoadFertilizer(this.machine, this.location, this.tile, item.QualifiedItemId, transferCount);
+                        else
+                            result = this.service.TryInstallModule(this.machine, this.location, this.tile, item.QualifiedItemId);
+
+                        if (result.Success)
+                        {
+                            if (item.Stack <= transferCount)
+                                Game1.player.Items[inventoryIndex] = null;
+                            else
+                                item.Stack -= transferCount;
+
+                            Game1.addHUDMessage(new HUDMessage(result.Message, HUDMessage.newQuest_type));
+                            Game1.playSound("Ship");
+                            this.InvalidateCache();
+                        }
+                        else
+                        {
+                            Game1.addHUDMessage(new HUDMessage(result.Message, HUDMessage.error_type));
+                            Game1.playSound("cancel");
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        var plotIndex = this.GetSlotIndexAt(x, y);
+        if (plotIndex >= 0 && plotIndex < views.Count)
+        {
+            var view = views[plotIndex];
+            if (view.Ready)
+            {
+                this.ShowAndDeliver(this.service.TryHarvestPlot(this.machine, this.location, this.tile, view.PlotIndex));
+                return;
+            }
+
+            var held = Game1.player.CurrentItem;
+            if (held is not null && FarmCropCatalog.TryGetBySeed(held.QualifiedItemId, out _))
+            {
+                if (StardewModdingAPI.Context.IsMainPlayer)
+                {
+                    var result = this.service.TryManualPlant(this.machine, this.location, this.tile, view.PlotIndex, held, Game1.player.FarmingLevel);
+                    if (result.Success)
+                    {
+                        if (held.Stack <= 1)
+                            Game1.player.Items[Game1.player.CurrentToolIndex] = null;
+                        else
+                            held.Stack -= 1;
+
+                        Game1.addHUDMessage(new HUDMessage(result.Message, HUDMessage.newQuest_type));
+                        Game1.playSound("dirtySheet");
+                        this.InvalidateCache();
+                    }
+                    else
+                    {
+                        Game1.addHUDMessage(new HUDMessage(result.Message, HUDMessage.error_type));
+                        Game1.playSound("cancel");
+                    }
+                }
+            }
+            return;
+        }
+
+        // Check if player clicked a module slot to uninstall
+        var moduleIndex = this.GetModuleIndexAt(x, y);
+        if (moduleIndex >= 0)
+        {
+            if (StardewModdingAPI.Context.IsMainPlayer)
+            {
+                var result = this.service.TryRemoveModule(this.machine, this.location, this.tile, moduleIndex);
+                if (result.Success)
+                {
+                    DeliverReturnedItems(result.ReturnedItems);
+                    Game1.addHUDMessage(new HUDMessage(result.Message, HUDMessage.newQuest_type));
+                    Game1.playSound("coin");
+                    this.InvalidateCache();
+                }
+                else
+                {
+                    Game1.addHUDMessage(new HUDMessage(result.Message, HUDMessage.error_type));
+                    Game1.playSound("cancel");
+                }
+            }
+            return;
+        }
+    }
+
+    public override void receiveRightClick(int x, int y, bool playSound = true)
+    {
+        var views = this.GetCachedViews();
+        var viewIndex = this.GetSlotIndexAt(x, y);
+        if (viewIndex < 0 || viewIndex >= views.Count)
+            return;
+
+        var heldSeed = Game1.player.CurrentItem is Item held && FarmCropCatalog.TryGetBySeed(held.QualifiedItemId, out _)
+            ? held.QualifiedItemId
+            : string.Empty;
+        this.Show(this.service.ToggleFarmPlotLock(this.machine, this.location, this.tile, views[viewIndex].PlotIndex, heldSeed));
     }
 
     public override void receiveScrollWheelAction(int direction)
@@ -147,18 +354,100 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
 
     public override void draw(SpriteBatch b)
     {
-        DrawPanel(b, new Rectangle(this.xPositionOnScreen, this.yPositionOnScreen, this.width, this.height), Color.White, true);
-        Utility.drawTextWithShadow(b, this.machine.DisplayName, Game1.dialogueFont, new Vector2(this.xPositionOnScreen + Pad, this.yPositionOnScreen + 26), Game1.textColor);
+        // 1. Draw outer wood frame and tech inset
+        SVSAPME.UI.SvsapmeUiText.DrawStardewAE2Frame(b, new Rectangle(this.xPositionOnScreen, this.yPositionOnScreen, this.width, this.height));
+
+        Utility.drawTextWithShadow(
+            b,
+            this.machine.DisplayName,
+            Game1.dialogueFont,
+            new Vector2(this.xPositionOnScreen + Pad + 12, this.yPositionOnScreen + 26),
+            Game1.textColor);
+
         var views = this.GetCachedViews();
         var dashboard = this.GetCachedDashboard();
         this.page = Math.Clamp(this.page, 0, this.GetMaxPage(views.Count));
-        b.DrawString(Game1.smallFont, $"Plots {dashboard.OccupiedPlots:N0}/{dashboard.OccupiedPlots + dashboard.EmptyPlots:N0}  Page {this.page + 1:N0}", new Vector2(this.GridBounds.X, this.yPositionOnScreen + 70), Game1.textColor);
+        var pages = this.GetMaxPage(views.Count) + 1;
+        SvsapmeUiText.DrawFittedLine(
+            b,
+            ModText.Get(
+                "ui.farm.gridSummary",
+                "Plots {{occupied}}/{{capacity}} | Page {{page}}/{{pages}}",
+                new
+                {
+                    occupied = dashboard.OccupiedPlots.ToString("N0"),
+                    capacity = (dashboard.OccupiedPlots + dashboard.EmptyPlots).ToString("N0"),
+                    page = (this.page + 1).ToString("N0"),
+                    pages = pages.ToString("N0")
+                }),
+            new Rectangle(this.GridBounds.X, this.yPositionOnScreen + 66, this.GridBounds.Width, 28),
+            Game1.textColor);
+        this.DrawModuleStrip(b, dashboard);
         this.DrawSidePanels(b, dashboard);
         this.DrawGrid(b, views);
+        this.DrawBottomSummary(b, dashboard);
+
+        // Draw Separator line before inventory
+        b.Draw(Game1.staminaRect, new Rectangle(this.xPositionOnScreen + Pad, this.inventoryArea.Y - 12, this.width - Pad * 2, 2), Color.SaddleBrown * 0.45f);
+
+        // Draw Player Inventory
+        this.DrawInventory(b);
+
         DrawButton(b, this.prevButton, this.page > 0);
         DrawButton(b, this.nextButton, this.page < this.GetMaxPage(views.Count));
         this.upperRightCloseButton?.draw(b);
+        if (!string.IsNullOrWhiteSpace(this.hoverText))
+            IClickableMenu.drawHoverText(b, this.hoverText, Game1.smallFont);
+
         this.drawMouse(b);
+    }
+
+    private void DrawInventory(SpriteBatch b)
+    {
+        for (var i = 0; i < Game1.player.Items.Count; i++)
+        {
+            var bounds = this.GetInventorySlotBounds(i);
+            if (!this.inventoryArea.Contains(bounds))
+                continue;
+
+            IClickableMenu.drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60), bounds.X, bounds.Y, bounds.Width, bounds.Height, Color.White * 0.78f, 1f, false);
+            Game1.player.Items[i]?.drawInMenu(b, new Vector2(bounds.X + 4, bounds.Y + 4), 0.68f, 1f, 0.86f, StackDrawType.Draw, Color.White, true);
+        }
+    }
+
+    private Rectangle GetInventorySlotBounds(int index)
+    {
+        var column = index % this.backpackColumns;
+        var row = index / this.backpackColumns;
+        return new Rectangle(this.inventoryArea.X + column * InventoryCell, this.inventoryArea.Y + row * InventoryCell, InventorySlotSize, InventorySlotSize);
+    }
+
+    private int HitInventorySlot(int x, int y)
+    {
+        if (!this.inventoryArea.Contains(x, y))
+            return -1;
+
+        var column = (x - this.inventoryArea.X) / InventoryCell;
+        var row = (y - this.inventoryArea.Y) / InventoryCell;
+        var index = row * this.backpackColumns + column;
+        return index >= 0 && index < Game1.player.Items.Count ? index : -1;
+    }
+
+    public override void performHoverAction(int x, int y)
+    {
+        this.hoverText = null;
+        var views = this.GetCachedViews();
+        var index = this.GetSlotIndexAt(x, y);
+        if (index >= 0 && index < views.Count)
+            this.hoverText = FormatPlotTooltip(views[index]);
+        else
+        {
+            var moduleIndex = this.GetModuleIndexAt(x, y);
+            if (moduleIndex >= 0)
+                this.hoverText = moduleIndex < this.GetCachedDashboard().ModuleQualifiedItemIds.Count
+                    ? FormatItem(this.GetCachedDashboard().ModuleQualifiedItemIds[moduleIndex])
+                    : ModText.Get("ui.farm.moduleSlot.empty", "Empty module slot");
+        }
     }
 
     private IReadOnlyList<FarmPlotView> GetCachedViews()
@@ -195,14 +484,105 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
         DrawPanel(b, this.RightPanelBounds, Color.White * 0.92f, true);
         b.DrawString(Game1.smallFont, ModText.Get("ui.processor.inputTitle", "Input"), new Vector2(this.LeftPanelBounds.X + 12, this.LeftPanelBounds.Y + 18), Game1.textColor);
         b.DrawString(Game1.smallFont, ModText.Get("ui.processor.outputTitle", "Output"), new Vector2(this.RightPanelBounds.X + 12, this.RightPanelBounds.Y + 18), Game1.textColor);
+        this.DrawFarmInputPreview(b, dashboard);
+        this.DrawFarmOutputPreview(b, dashboard);
         DrawButton(b, this.autoInButton, true);
         DrawButton(b, this.inputModeButton, true);
         DrawButton(b, this.filterModeButton, true);
         DrawButton(b, this.addFilterButton, Game1.player.CurrentItem is not null);
         DrawButton(b, this.clearFilterButton, dashboard.FilterCount > 0);
         DrawButton(b, this.autoOutButton, true);
-        this.DrawTinyLines(b, new[] { dashboard.AutoPullFromNetwork ? "ON" : "OFF", dashboard.InputMode, dashboard.FilterMode, $"Filter {dashboard.FilterCount:N0}" }, this.LeftPanelBounds.X + 12, this.LeftPanelBounds.Y + 270);
-        this.DrawTinyLines(b, new[] { dashboard.AutoPushOutputToNetwork ? "Auto ON" : "Auto OFF", $"Buffer {dashboard.OutputBufferStacks:N0}", $"Day {dashboard.EstimatedDailyValue:0}g" }, this.RightPanelBounds.X + 12, this.RightPanelBounds.Y + 104);
+        DrawButton(b, this.collectAllButton, dashboard.OutputBufferStacks > 0);
+        this.DrawStatusLines(
+            b,
+            new[]
+            {
+                SvsapmeUiText.FormatAuto(dashboard.AutoPullFromNetwork),
+                SvsapmeUiText.FormatInputMode(dashboard.InputMode),
+                SvsapmeUiText.FormatFilterMode(dashboard.FilterMode),
+                SvsapmeUiText.FormatFilterCount(dashboard.FilterCount),
+                SvsapmeUiText.FormatInputBufferCount(dashboard.InputBufferStacks),
+                SvsapmeUiText.FormatFertilizerCount(dashboard.FertilizerCount)
+            },
+            new Rectangle(this.LeftPanelBounds.X + 12, this.clearFilterButton.bounds.Bottom + 10, this.LeftPanelBounds.Width - 24, this.LeftPanelBounds.Bottom - this.clearFilterButton.bounds.Bottom - 18));
+        this.DrawStatusLines(
+            b,
+            new[]
+            {
+                SvsapmeUiText.FormatAuto(dashboard.AutoPushOutputToNetwork),
+                SvsapmeUiText.FormatBufferCount(dashboard.OutputBufferStacks),
+                SvsapmeUiText.FormatDayValue(dashboard.EstimatedDailyValue)
+            },
+            new Rectangle(this.RightPanelBounds.X + 12, this.collectAllButton.bounds.Bottom + 10, this.RightPanelBounds.Width - 24, this.RightPanelBounds.Bottom - this.collectAllButton.bounds.Bottom - 18));
+    }
+
+    private void DrawFarmInputPreview(SpriteBatch b, FarmDashboardView dashboard)
+    {
+        var seedSlot = this.SeedInputSlotBounds;
+        var fertilizerSlot = this.FertilizerInputSlotBounds;
+        DrawPanel(b, seedSlot, dashboard.InputBufferStacks > 0 ? Color.White : Color.Gray * 0.55f, true);
+        DrawPanel(b, fertilizerSlot, dashboard.FertilizerCount > 0 ? Color.White : Color.Gray * 0.55f, true);
+        SvsapmeUiText.DrawFittedLine(b, ModText.Get("ui.farm.inputSlot.seed", "Seed"), new Rectangle(seedSlot.X + 2, seedSlot.Bottom - 16, seedSlot.Width - 4, 14), Game1.textColor, 0.5f);
+        SvsapmeUiText.DrawFittedLine(b, ModText.Get("ui.farm.inputSlot.fertilizer", "Fert"), new Rectangle(fertilizerSlot.X + 2, fertilizerSlot.Bottom - 16, fertilizerSlot.Width - 4, 14), Game1.textColor, 0.5f);
+        DrawSlotBadge(b, seedSlot, dashboard.InputBufferStacks);
+        DrawSlotBadge(b, fertilizerSlot, dashboard.FertilizerCount);
+    }
+
+    private void DrawFarmOutputPreview(SpriteBatch b, FarmDashboardView dashboard)
+    {
+        var outputSlot = this.OutputSlotBounds;
+        DrawPanel(b, outputSlot, dashboard.OutputBufferStacks > 0 ? Color.White : Color.Gray * 0.55f, true);
+        SvsapmeUiText.DrawFittedLine(b, ModText.Get("ui.farm.outputSlot.buffer", "Out"), new Rectangle(outputSlot.X + 2, outputSlot.Bottom - 16, outputSlot.Width - 4, 14), Game1.textColor, 0.5f);
+        DrawSlotBadge(b, outputSlot, dashboard.OutputBufferStacks);
+    }
+
+    private void DrawModuleStrip(SpriteBatch b, FarmDashboardView dashboard)
+    {
+        if (dashboard.ModuleSlotsCapacity <= 0)
+            return;
+
+        var y = this.GridBounds.Y - 46;
+        var labelBounds = new Rectangle(this.GridBounds.X, y + 6, 88, 24);
+        SvsapmeUiText.DrawFittedLine(
+            b,
+            ModText.Get("ui.farm.moduleTitle", "Modules {{used}}/{{capacity}}", new { used = dashboard.ModuleSlotsUsed.ToString("N0"), capacity = dashboard.ModuleSlotsCapacity.ToString("N0") }),
+            labelBounds,
+            Game1.textColor,
+            0.56f);
+
+        for (var i = 0; i < dashboard.ModuleSlotsCapacity; i++)
+        {
+            var slot = this.GetModuleSlotBounds(i);
+            DrawPanel(b, slot, i < dashboard.ModuleQualifiedItemIds.Count ? Color.White : Color.Gray * 0.55f, true);
+            if (i < dashboard.ModuleQualifiedItemIds.Count)
+                ItemRegistry.Create(dashboard.ModuleQualifiedItemIds[i]).drawInMenu(b, new Vector2(slot.X + 2, slot.Y + 2), 0.5f);
+        }
+    }
+
+    private void DrawBottomSummary(SpriteBatch b, FarmDashboardView dashboard)
+    {
+        var top = this.GridBounds.Bottom + 8;
+        var height = Math.Min(36, this.prevButton.bounds.Y - top - 6);
+        if (height < 20)
+            return;
+
+        var bounds = new Rectangle(this.GridBounds.X, top, this.GridBounds.Width, height);
+        DrawPanel(b, bounds, Color.White * 0.68f, false);
+        SvsapmeUiText.DrawFittedLine(
+            b,
+            ModText.Get(
+                "ui.farm.bottomSummary",
+                "Day value {{value}}g  Energy {{energy}} Wh/day  Input {{input}}  Output {{output}}",
+                new
+                {
+                    value = dashboard.EstimatedDailyValue.ToString("0.##"),
+                    energy = dashboard.EstimatedDailyEnergyWh.ToString("N0"),
+                    input = dashboard.InputBufferStacks.ToString("N0"),
+                    output = dashboard.OutputBufferStacks.ToString("N0")
+                }),
+            new Rectangle(bounds.X + 8, bounds.Y + 8, bounds.Width - 16, bounds.Height - 12),
+            Game1.textColor,
+            0.58f);
     }
 
     private void DrawGrid(SpriteBatch b, IReadOnlyList<FarmPlotView> views)
@@ -229,20 +609,22 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
                 b.Draw(Game1.staminaRect, new Rectangle(bounds.X + 4, bounds.Y + 4, (int)((bounds.Width - 8) * done), 4), view.Ready ? Color.LimeGreen : Color.Orange);
             }
 
-            var size = Game1.tinyFont.MeasureString(view.Eta);
-            var scale = size.X > bounds.Width - 8 ? Math.Max(0.55f, (bounds.Width - 8) / size.X) : 1f;
-            b.DrawString(Game1.tinyFont, view.Eta, new Vector2(bounds.X + (bounds.Width - size.X * scale) / 2f, bounds.Bottom - 17), Game1.textColor, 0f, Vector2.Zero, scale, SpriteEffects.None, 1f);
+            var status = PixelStatus.Idle;
+            if (view.Ready)
+                status = PixelStatus.Ready;
+            else if (view.RequiredUnits > 0)
+                status = PixelStatus.Processing;
+
+            SvsapmeUiText.DrawPixelStatusLight(b, bounds.X + 4, bounds.Y + 12, status);
+            SvsapmeUiText.DrawSlotStatusLine(b, bounds, status);
+            if (view.IsLocked)
+                SvsapmeUiText.DrawPixelLock(b, bounds.Right - 12, bounds.Y + 3);
         }
     }
 
-    private void DrawTinyLines(SpriteBatch b, IEnumerable<string> lines, int x, int y)
+    private void DrawStatusLines(SpriteBatch b, IEnumerable<string> lines, Rectangle bounds)
     {
-        var currentY = y;
-        foreach (var line in lines)
-        {
-            b.DrawString(Game1.tinyFont, line, new Vector2(x, currentY), Game1.textColor);
-            currentY += 24;
-        }
+        SvsapmeUiText.DrawFittedLines(b, lines, bounds, Game1.textColor);
     }
 
     private void Show(SvsapmeMachineActionApplyResult result)
@@ -252,9 +634,106 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
         Game1.playSound(result.Success ? "smallSelect" : "cancel");
     }
 
+    private void ShowAndDeliver(SvsapmeMachineActionApplyResult result)
+    {
+        if (result.Success)
+            DeliverReturnedItems(result.ReturnedItems);
+        this.Show(result);
+    }
+
+    private static void DeliverReturnedItems(IEnumerable<BufferedItemStack> returnedItems)
+    {
+        foreach (var stack in returnedItems)
+        {
+            var item = BufferedItemCodec.CreateItem(stack);
+            var remainder = Game1.player.addItemToInventory(item);
+            if (remainder is not null)
+                Game1.createItemDebris(remainder, Game1.player.Position, Game1.player.FacingDirection, Game1.currentLocation);
+        }
+    }
+
+    private static void ConsumeCurrentItem(int count)
+    {
+        var index = Game1.player.CurrentToolIndex;
+        var item = Game1.player.CurrentItem;
+        if (item is null)
+            return;
+        item.Stack -= Math.Max(1, count);
+        if (item.Stack <= 0 && index >= 0 && index < Game1.player.Items.Count)
+            Game1.player.Items[index] = null;
+    }
+
     private int GetMaxPage(int count)
     {
         return Math.Max(0, (Math.Max(1, count) - 1) / this.pageSize);
+    }
+
+    private int GetSlotIndexAt(int x, int y)
+    {
+        var grid = this.GridBounds;
+        if (!grid.Contains(x, y))
+            return -1;
+
+        var column = (x - grid.X) / SlotSize;
+        var row = (y - grid.Y) / SlotSize;
+        return this.page * this.pageSize + row * this.columns + column;
+    }
+
+    private Rectangle GetModuleSlotBounds(int index)
+    {
+        return new Rectangle(this.GridBounds.X + 94 + index * (PreviewSlotSize + 6), this.GridBounds.Y - 48, PreviewSlotSize, PreviewSlotSize);
+    }
+
+    private int GetModuleIndexAt(int x, int y)
+    {
+        var dashboard = this.GetCachedDashboard();
+        for (var i = 0; i < dashboard.ModuleSlotsCapacity; i++)
+        {
+            if (this.GetModuleSlotBounds(i).Contains(x, y))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private static string FormatPlotTooltip(FarmPlotView view)
+    {
+        var seed = string.IsNullOrWhiteSpace(view.SeedQualifiedItemId)
+            ? ModText.Get("ui.processor.slot.empty", "Empty")
+            : FormatItem(view.SeedQualifiedItemId);
+        var harvest = string.IsNullOrWhiteSpace(view.HarvestQualifiedItemId)
+            ? ModText.Get("ui.processor.slot.empty", "Empty")
+            : FormatItem(view.HarvestQualifiedItemId);
+        var fertilizer = string.IsNullOrWhiteSpace(view.FertilizerQualifiedItemId)
+            ? ModText.Get("ui.farm.fertilizerNone", "Fertilizer: none bound")
+            : FormatItem(view.FertilizerQualifiedItemId);
+        var progress = view.RequiredUnits > 0
+            ? $"{Math.Min(view.ProgressUnits, view.RequiredUnits):N0}/{view.RequiredUnits:N0}"
+            : "0/0";
+        return ModText.Get(
+            "ui.farm.tooltip.plot",
+            "Seed: {{seed}}\nHarvest: {{harvest}}\nETA: {{eta}}\nProgress: {{progress}}\nFertilizer: {{fertilizer}}\nLock: {{lock}}",
+            new
+            {
+                seed,
+                harvest,
+                eta = view.Eta,
+                progress,
+                fertilizer,
+                @lock = view.IsLocked ? FormatItem(view.LockedSeedQualifiedItemId) : ModText.Get("ui.farm.unlocked", "Unlocked")
+            });
+    }
+
+    private static string FormatItem(string qualifiedItemId)
+    {
+        try
+        {
+            return ItemRegistry.Create(qualifiedItemId).DisplayName;
+        }
+        catch
+        {
+            return qualifiedItemId;
+        }
     }
 
     private static void DrawPanel(SpriteBatch b, Rectangle panel, Color tint, bool drawShadow)
@@ -269,6 +748,19 @@ internal sealed class SingleBlockFarmMenu : IClickableMenu
         var size = Game1.smallFont.MeasureString(button.label);
         var scale = size.X > button.bounds.Width - 18 ? Math.Max(0.62f, (button.bounds.Width - 18) / size.X) : 1f;
         b.DrawString(Game1.smallFont, button.label, new Vector2(button.bounds.X + (button.bounds.Width - size.X * scale) / 2f, button.bounds.Y + (button.bounds.Height - size.Y * scale) / 2f), color, 0f, Vector2.Zero, scale, SpriteEffects.None, 1f);
+    }
+
+    private static void DrawSlotBadge(SpriteBatch b, Rectangle slot, int count)
+    {
+        if (count <= 0)
+            return;
+
+        var text = count > 99 ? "99+" : count.ToString("N0");
+        var size = Game1.smallFont.MeasureString(text);
+        var scale = Math.Min(0.55f, (slot.Width - 6) / Math.Max(1f, size.X));
+        var pos = new Vector2(slot.Right - size.X * scale - 3, slot.Y + 2);
+        b.Draw(Game1.staminaRect, new Rectangle((int)pos.X - 2, (int)pos.Y, (int)(size.X * scale) + 4, (int)(size.Y * scale)), Color.Black * 0.45f);
+        b.DrawString(Game1.smallFont, text, pos, Color.White, 0f, Vector2.Zero, scale, SpriteEffects.None, 1f);
     }
 }
 

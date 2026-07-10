@@ -6,19 +6,23 @@ internal static class SvsapmeActionEscrowRules
 {
     public static bool ActionMayEscrowHeldItem(SvsapmeMachineActionKind kind)
     {
-        return kind is SvsapmeMachineActionKind.ConfigurePoweredFilter
-            or SvsapmeMachineActionKind.LoadFarmSeed
+        return kind is SvsapmeMachineActionKind.LoadFarmSeed
             or SvsapmeMachineActionKind.LoadFarmFertilizer
             or SvsapmeMachineActionKind.InstallFarmModule
+            or SvsapmeMachineActionKind.PlantFarmPlot
             or SvsapmeMachineActionKind.FuelCarbonGenerator
             or SvsapmeMachineActionKind.StartElectricFurnace
             or SvsapmeMachineActionKind.StartElectricGeodeCrusher
-            or SvsapmeMachineActionKind.LoadProcessorInput;
+            or SvsapmeMachineActionKind.LoadProcessorInput
+            or SvsapmeMachineActionKind.InstallPoweredUpgrade;
     }
 
     public static int GetPrimaryEscrowCount(SvsapmeMachineActionKind kind, int requestedCount)
     {
-        return kind is SvsapmeMachineActionKind.StartElectricFurnace
+        return kind is SvsapmeMachineActionKind.LoadFarmSeed
+            or SvsapmeMachineActionKind.LoadFarmFertilizer
+            or SvsapmeMachineActionKind.PlantFarmPlot
+            or SvsapmeMachineActionKind.StartElectricFurnace
             or SvsapmeMachineActionKind.LoadProcessorInput
             ? Math.Clamp(requestedCount, 1, 999)
             : 1;

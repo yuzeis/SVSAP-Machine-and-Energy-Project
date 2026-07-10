@@ -615,7 +615,13 @@ internal sealed class SvsapmeFullMatrixE2EService
         var exporter = this.PlaceLinkedMachine(fixture.Location, exporterTile, "(BC)" + ModItemCatalog.PoweredExporterCopper, fixture.NetworkId);
         this.RegisterMachine(exporter, fixture.Location, exporterTile, 0);
         this.runtime.TryConfigurePoweredFilter(exporter, fixture.Location, exporterTile, "(O)390", 1);
-        var toggle = this.runtime.TryConfigurePoweredFilter(exporter, fixture.Location, exporterTile, "(O)" + ModItemCatalog.SvsapQualityCard, 1);
+        var install = this.runtime.TryInstallPoweredUpgrade(
+            exporter,
+            fixture.Location,
+            exporterTile,
+            0,
+            "(O)" + ModItemCatalog.SvsapQualityCard);
+        var toggle = this.runtime.TryTogglePoweredQualityStrategy(exporter, fixture.Location, exporterTile, out _);
         this.SetNetworkEnergy(fixture, 1_000);
         var silver = ItemRegistry.Create("(O)390", 5);
         silver.Quality = 1;
@@ -625,7 +631,7 @@ internal sealed class SvsapmeFullMatrixE2EService
         this.getSvsapApi()!.TryInsertItem(fixture.NetworkId, gold, out _, out _, out _);
         this.runtime.RunRouteTickForE2E();
         var movedQuality = targetChest.Items.FirstOrDefault(item => item is not null)?.Quality ?? -1;
-        return (toggle.Success && movedQuality == 2, $"toggle={toggle.Success} movedQuality={movedQuality}");
+        return (install.Success && toggle && movedQuality == 2, $"install={install.Success} toggle={toggle} movedQuality={movedQuality}");
     }
 
     private (bool, string) TestCrossLocationNetwork()

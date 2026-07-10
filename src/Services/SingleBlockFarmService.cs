@@ -99,7 +99,7 @@ internal sealed class SingleBlockFarmService
         this.Suppress(e);
     }
 
-    private bool TrySendClientAction(SObject placedObject, SvsapmeMachineActionKind actionKind, string qualifiedItemId, int farmingLevel)
+    internal bool TrySendClientAction(SObject placedObject, SvsapmeMachineActionKind actionKind, string qualifiedItemId, int farmingLevel)
     {
         if (this.sendClientAction is null)
         {
@@ -157,20 +157,22 @@ internal sealed class SingleBlockFarmService
 
         NormalizeLegacyFarmState(state.Farm);
         var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
+        SingleBlockFarmRules.NormalizePlotIndices(state.Farm, tier.Plots);
         var views = new List<FarmPlotView>();
         for (var i = 0; i < tier.Plots; i++)
         {
-            if (i >= state.Farm.Plots.Count)
+            var plot = state.Farm.Plots.FirstOrDefault(candidate => candidate.PlotIndex == i);
+            var lockedSeed = state.Farm.PlotLocks.GetValueOrDefault(i) ?? plot?.LockedSeedQualifiedItemId ?? string.Empty;
+            if (plot is null)
             {
-                views.Add(new FarmPlotView(i, string.Empty, string.Empty, string.Empty, 0, 0, false, string.Empty));
+                views.Add(new FarmPlotView(i, string.Empty, string.Empty, string.Empty, 0, 0, false, string.Empty, !string.IsNullOrWhiteSpace(lockedSeed), lockedSeed));
                 continue;
             }
 
-            var plot = state.Farm.Plots[i];
             var seed = string.IsNullOrWhiteSpace(plot.SeedQualifiedItemId) ? state.Farm.BoundSeedQualifiedItemId : plot.SeedQualifiedItemId;
             if (!FarmCropCatalog.TryGetBySeed(seed, out var crop))
             {
-                views.Add(new FarmPlotView(i, seed, string.Empty, ModText.Get("ui.farm.plot.unknown", "Unknown"), 0, 0, false, plot.FertilizerQualifiedItemId));
+                views.Add(new FarmPlotView(i, seed, string.Empty, ModText.Get("ui.farm.plot.unknown", "Unknown"), 0, 0, false, plot.FertilizerQualifiedItemId, !string.IsNullOrWhiteSpace(lockedSeed), lockedSeed));
                 continue;
             }
 
@@ -185,7 +187,9 @@ internal sealed class SingleBlockFarmService
                 Math.Min(plot.ProgressUnits, required),
                 required,
                 ready,
-                plot.FertilizerQualifiedItemId));
+                plot.FertilizerQualifiedItemId,
+                !string.IsNullOrWhiteSpace(lockedSeed),
+                lockedSeed));
         }
 
         return views;
@@ -197,11 +201,12 @@ internal sealed class SingleBlockFarmService
             || !TryReadMachineGuid(placedObject, out var machineGuid)
             || !this.repository.TryGet(machineGuid, out var state))
         {
-            return new FarmDashboardView(false, false, false, MachineInputModes.AllEligible, MachineFilterModes.Whitelist, 0, 0, 0, 0, 0m);
+            return new FarmDashboardView(false, false, false, MachineInputModes.AllEligible, MachineFilterModes.Whitelist, 0, 0, 0, 0, 0, 0, 0, 0, Array.Empty<string>(), 0m, 0L);
         }
 
         var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
         var occupied = SingleBlockFarmRules.CountOccupied(state.Farm);
+        var moduleItems = FarmModuleRules.GetInstalledModuleItems(state.Farm).ToList();
         return new FarmDashboardView(
             true,
             state.Farm.AutoPullFromNetwork,
@@ -209,10 +214,16 @@ internal sealed class SingleBlockFarmService
             state.Farm.InputMode,
             state.Farm.FilterMode,
             state.Farm.SeedFilterQualifiedItemIds.Count,
+            state.Farm.InputBuffer.Count,
+            state.Farm.InternalFertilizerCount,
             occupied,
             Math.Max(0, tier.Plots - occupied),
             state.OutputBuffer.Count,
-            EstimateFarmDailyValue(state.Farm));
+            FarmModuleRules.GetUsedSlots(state.Farm),
+            tier.ModuleSlots,
+            moduleItems,
+            EstimateFarmDailyValue(state.Farm),
+            CalculateFarmRequiredWh(occupied, SingleBlockFarmRules.GetModuleSnapshot(state.Farm), this.getConfig().FarmEnergyCostMultiplier));
     }
 
     internal SvsapmeMachineActionApplyResult ToggleFarmAutoPull(SObject placedObject, GameLocation location, Vector2 tile)
@@ -532,7 +543,8 @@ internal sealed class SingleBlockFarmService
         GameLocation location,
         Vector2 tile,
         string seedQualifiedItemId,
-        int placedByFarmingLevel)
+        int placedByFarmingLevel,
+        int count = 1)
     {
         if (!IsFarmMachine(placedObject.QualifiedItemId))
             return new(false, false, ModText.Get("hud.farm.notFarm", "Target machine is not a Single-Block Farm."));
@@ -548,7 +560,9 @@ internal sealed class SingleBlockFarmService
         }
 
         SingleBlockFarmRules.BindSeed(state.Farm, crop, placedByFarmingLevel);
-        AddBufferedInput(state.Farm.InputBuffer, ItemRegistry.Create(seedQualifiedItemId));
+        var seed = ItemRegistry.Create(seedQualifiedItemId);
+        seed.Stack = Math.Clamp(count, 1, 999);
+        AddBufferedInput(state.Farm.InputBuffer, seed);
         this.repository.Save();
         return new(true, true, ModText.Get("hud.farm.seedLoaded", "{{crop}} seed loaded. Internal seeds: {{count}}.", new { crop = crop.DisplayName, count = CountSeedInputs(state.Farm).ToString("N0") }));
     }
@@ -557,7 +571,8 @@ internal sealed class SingleBlockFarmService
         SObject placedObject,
         GameLocation location,
         Vector2 tile,
-        string fertilizerQualifiedItemId)
+        string fertilizerQualifiedItemId,
+        int count = 1)
     {
         if (!IsFarmMachine(placedObject.QualifiedItemId))
             return new(false, false, ModText.Get("hud.farm.notFarm", "Target machine is not a Single-Block Farm."));
@@ -576,7 +591,7 @@ internal sealed class SingleBlockFarmService
             return new(false, false, ModText.Get("hud.farm.clearBeforeFertilizerChange", "Clear the farm before changing its fertilizer type."));
 
         state.Farm.BoundFertilizerQualifiedItemId = fertilizerQualifiedItemId;
-        state.Farm.InternalFertilizerCount++;
+        state.Farm.InternalFertilizerCount += Math.Clamp(count, 1, 999);
         this.repository.Save();
         return new(true, true, ModText.Get("hud.farm.fertilizerLoaded", "Fertilizer loaded. Internal fertilizer: {{count}}.", new { count = state.Farm.InternalFertilizerCount.ToString("N0") }));
     }
@@ -603,6 +618,247 @@ internal sealed class SingleBlockFarmService
             this.repository.Save();
 
         return new(result.Success, result.ConsumeHeldItem, result.Message);
+    }
+
+    internal SvsapmeMachineActionApplyResult TryManualPlant(
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile,
+        Item seedItem,
+        int farmingLevel)
+    {
+        var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
+        var plotIndex = 0;
+        if (this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
+            && TryReadMachineGuid(placedObject, out var machineGuid)
+            && this.repository.TryGet(machineGuid, out var state))
+        {
+            SingleBlockFarmRules.NormalizePlotIndices(state.Farm, tier.Plots);
+            var occupied = state.Farm.Plots.Select(plot => plot.PlotIndex).ToHashSet();
+            plotIndex = Enumerable.Range(0, tier.Plots).FirstOrDefault(index => !occupied.Contains(index));
+        }
+
+        return this.TryManualPlant(placedObject, location, tile, plotIndex, seedItem, farmingLevel);
+    }
+
+    internal SvsapmeMachineActionApplyResult TryManualPlant(
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile,
+        int plotIndex,
+        Item seedItem,
+        int farmingLevel)
+    {
+        if (!IsFarmMachine(placedObject.QualifiedItemId))
+            return new(false, false, ModText.Get("hud.farm.notFarm", "Target machine is not a Single-Block Farm."));
+
+        if (!FarmCropCatalog.TryGetBySeed(seedItem.QualifiedItemId, out var crop))
+            return new(false, false, ModText.Get("hud.farm.holdSeed", "Hold a supported Data/Crops seed."));
+
+        if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
+            || !TryReadMachineGuid(placedObject, out var machineGuid)
+            || !this.repository.TryGet(machineGuid, out var state))
+        {
+            return new(false, false, ModText.Get("hud.farm.registerFailed", "SVSAPME could not register this farm."));
+        }
+
+        var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
+        SingleBlockFarmRules.NormalizePlotIndices(state.Farm, tier.Plots);
+        if (plotIndex < 0 || plotIndex >= tier.Plots)
+            return new(false, false, ModText.Get("hud.farm.invalidPlot", "That farm plot does not exist."));
+        if (state.Farm.Plots.Any(plot => plot.PlotIndex == plotIndex))
+            return new(false, false, ModText.Get("hud.farm.plotOccupied", "That farm plot is already occupied."));
+
+        var lockedSeed = state.Farm.PlotLocks.GetValueOrDefault(plotIndex) ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(lockedSeed)
+            && !string.Equals(lockedSeed, crop.SeedQualifiedItemId, StringComparison.Ordinal))
+        {
+            return new(false, false, ModText.Get("hud.farm.plotLockedToSeed", "That plot is locked to a different seed."));
+        }
+
+        state.Farm.Plots.Add(new FarmPlotState
+        {
+            PlotIndex = plotIndex,
+            SeedQualifiedItemId = crop.SeedQualifiedItemId,
+            HarvestQualifiedItemId = crop.HarvestQualifiedItemId,
+            PlacedByFarmingLevel = farmingLevel,
+            FertilizerQualifiedItemId = state.Farm.BoundFertilizerQualifiedItemId,
+            ProgressUnits = 0,
+            InRegrow = false,
+            IsLocked = !string.IsNullOrWhiteSpace(lockedSeed),
+            LockedSeedQualifiedItemId = lockedSeed
+        });
+
+        this.repository.Save();
+        return new(true, true, ModText.Get("hud.farm.seedLoaded", "{{crop}} seed loaded. Internal seeds: {{count}}.", new { crop = crop.DisplayName, count = state.Farm.Plots.Count.ToString("N0") }));
+    }
+
+    internal SvsapmeMachineActionApplyResult TryRemoveModule(SObject placedObject, GameLocation location, Vector2 tile, int index)
+    {
+        if (!IsFarmMachine(placedObject.QualifiedItemId))
+            return new(false, false, ModText.Get("hud.farm.notFarm", "Target machine is not a Single-Block Farm."));
+
+        if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
+            || !TryReadMachineGuid(placedObject, out var machineGuid)
+            || !this.repository.TryGet(machineGuid, out var state))
+        {
+            return new(false, false, ModText.Get("hud.farm.registerFailed", "SVSAPME could not register this farm."));
+        }
+
+        if (index < 0 || index >= state.Farm.InstalledModuleQualifiedItemIds.Count)
+            return new(false, false, ModText.Get("hud.farm.invalidModuleSlot", "That farm module slot does not exist."));
+
+        var removedId = state.Farm.InstalledModuleQualifiedItemIds[index];
+        state.Farm.InstalledModuleQualifiedItemIds.RemoveAt(index);
+        FarmModuleRules.RecalculateModuleSnapshot(state.Farm);
+        this.repository.Save();
+
+        var item = ItemRegistry.Create(removedId);
+        return new SvsapmeMachineActionApplyResult(
+            true,
+            false,
+            ModText.Get("hud.farm.moduleRemoved", "Removed module: {{item}}.", new { item = item.DisplayName }))
+        {
+            ReturnedItems = new List<BufferedItemStack> { BufferedItemCodec.FromItem(item) }
+        };
+    }
+
+    internal SvsapmeMachineActionApplyResult TryHarvestPlot(SObject placedObject, GameLocation location, Vector2 tile, int plotIndex)
+    {
+        if (!this.TryGetFarmState(placedObject, location, tile, out var state, out var failure))
+            return new(false, false, failure);
+
+        var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
+        SingleBlockFarmRules.NormalizePlotIndices(state.Farm, tier.Plots);
+        var plot = state.Farm.Plots.FirstOrDefault(candidate => candidate.PlotIndex == plotIndex);
+        if (plot is null || !FarmCropCatalog.TryGetBySeed(plot.SeedQualifiedItemId, out var crop))
+            return new(false, false, ModText.Get("hud.farm.plotEmpty", "That farm plot is empty."));
+
+        var required = FarmGrowthRules.GetRequiredProgressUnits(plot.InRegrow ? crop.RegrowDays : crop.BaseGrowthDays);
+        if (plot.ProgressUnits < required)
+            return new(false, false, ModText.Get("hud.farm.plotNotReady", "That crop is not ready to harvest."));
+
+        var returned = new List<BufferedItemStack>();
+        SingleBlockFarmRules.AddHarvestOutput(returned, state.Farm, crop, plot);
+        if (crop.RegrowDays > 0)
+        {
+            plot.ProgressUnits = 0;
+            plot.InRegrow = true;
+        }
+        else
+        {
+            if (plot.IsLocked && !string.IsNullOrWhiteSpace(plot.LockedSeedQualifiedItemId))
+                state.Farm.PlotLocks[plot.PlotIndex] = plot.LockedSeedQualifiedItemId;
+            state.Farm.Plots.Remove(plot);
+        }
+
+        this.repository.Save();
+        return new SvsapmeMachineActionApplyResult(true, false, ModText.Get("hud.farm.plotHarvested", "Crop harvested."))
+        {
+            ReturnedItems = returned
+        };
+    }
+
+    internal SvsapmeMachineActionApplyResult ToggleFarmPlotLock(SObject placedObject, GameLocation location, Vector2 tile, int plotIndex, string seedQualifiedItemId = "")
+    {
+        if (!this.TryGetFarmState(placedObject, location, tile, out var state, out var failure))
+            return new(false, false, failure);
+
+        var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
+        if (plotIndex < 0 || plotIndex >= tier.Plots)
+            return new(false, false, ModText.Get("hud.farm.invalidPlot", "That farm plot does not exist."));
+
+        SingleBlockFarmRules.NormalizePlotIndices(state.Farm, tier.Plots);
+        var plot = state.Farm.Plots.FirstOrDefault(candidate => candidate.PlotIndex == plotIndex);
+        var existing = state.Farm.PlotLocks.GetValueOrDefault(plotIndex) ?? plot?.LockedSeedQualifiedItemId ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(existing))
+        {
+            state.Farm.PlotLocks.Remove(plotIndex);
+            if (plot is not null)
+            {
+                plot.IsLocked = false;
+                plot.LockedSeedQualifiedItemId = string.Empty;
+            }
+            this.repository.Save();
+            return new(true, false, ModText.Get("hud.farm.plotUnlocked", "Farm plot unlocked."));
+        }
+
+        var targetSeed = !string.IsNullOrWhiteSpace(seedQualifiedItemId) ? seedQualifiedItemId : plot?.SeedQualifiedItemId ?? string.Empty;
+        if (!FarmCropCatalog.TryGetBySeed(targetSeed, out _))
+            return new(false, false, ModText.Get("hud.farm.lockNeedsSeed", "Plant the plot or hold a supported seed before locking it."));
+
+        state.Farm.PlotLocks[plotIndex] = targetSeed;
+        if (plot is not null)
+        {
+            plot.IsLocked = true;
+            plot.LockedSeedQualifiedItemId = targetSeed;
+        }
+        this.repository.Save();
+        return new(true, false, ModText.Get("hud.farm.plotLocked", "Farm plot locked to its current crop."));
+    }
+
+    internal SvsapmeMachineActionApplyResult TryCollectFarmOutput(SObject placedObject, GameLocation location, Vector2 tile)
+    {
+        if (!this.TryGetFarmState(placedObject, location, tile, out var state, out var failure))
+            return new(false, false, failure);
+        if (state.OutputBuffer.Count == 0)
+            return new(false, false, ModText.Get("hud.farm.outputEmpty", "The farm output buffer is empty."));
+
+        var returned = state.OutputBuffer.ToList();
+        state.OutputBuffer.Clear();
+        this.repository.Save();
+        return new SvsapmeMachineActionApplyResult(true, false, ModText.Get("hud.farm.outputCollected", "Collected {{count}} farm output stack(s).", new { count = returned.Count.ToString("N0") }))
+        {
+            ReturnedItems = returned
+        };
+    }
+
+    internal SvsapmeMachineActionApplyResult TryExtractFarmInput(SObject placedObject, GameLocation location, Vector2 tile, bool fertilizer)
+    {
+        if (!this.TryGetFarmState(placedObject, location, tile, out var state, out var failure))
+            return new(false, false, failure);
+
+        BufferedItemStack returned;
+        if (fertilizer)
+        {
+            if (state.Farm.InternalFertilizerCount <= 0 || string.IsNullOrWhiteSpace(state.Farm.BoundFertilizerQualifiedItemId))
+                return new(false, false, ModText.Get("hud.farm.inputEmpty", "That farm input is empty."));
+            returned = new BufferedItemStack { QualifiedItemId = state.Farm.BoundFertilizerQualifiedItemId, Stack = state.Farm.InternalFertilizerCount };
+            state.Farm.InternalFertilizerCount = 0;
+            state.Farm.BoundFertilizerQualifiedItemId = string.Empty;
+        }
+        else
+        {
+            if (state.Farm.InputBuffer.Count == 0)
+                return new(false, false, ModText.Get("hud.farm.inputEmpty", "That farm input is empty."));
+            returned = state.Farm.InputBuffer[0];
+            state.Farm.InputBuffer.RemoveAt(0);
+        }
+
+        this.repository.Save();
+        return new SvsapmeMachineActionApplyResult(true, false, ModText.Get("hud.farm.inputExtracted", "Farm input removed."))
+        {
+            ReturnedItems = new List<BufferedItemStack> { returned }
+        };
+    }
+
+    private bool TryGetFarmState(SObject placedObject, GameLocation location, Vector2 tile, out MachineState state, out string failure)
+    {
+        state = null!;
+        if (!IsFarmMachine(placedObject.QualifiedItemId))
+        {
+            failure = ModText.Get("hud.farm.notFarm", "Target machine is not a Single-Block Farm.");
+            return false;
+        }
+        if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
+            || !TryReadMachineGuid(placedObject, out var machineGuid)
+            || !this.repository.TryGet(machineGuid, out state))
+        {
+            failure = ModText.Get("hud.farm.registerFailed", "SVSAPME could not register this farm.");
+            return false;
+        }
+        failure = string.Empty;
+        return true;
     }
 
     public void OnDayStarted(object? sender, DayStartedEventArgs e)
@@ -639,6 +895,7 @@ internal sealed class SingleBlockFarmService
         var modules = SingleBlockFarmRules.GetModuleSnapshot(state.Farm);
         var season = location.GetSeason().ToString();
         NormalizeLegacyFarmState(state.Farm);
+        SingleBlockFarmRules.NormalizePlotIndices(state.Farm, tier.Plots);
 
         var planned = this.PlanMixedFarmPlanting(api, networkId, state.Farm, tier, modules, season);
         var chargedOccupied = Math.Min(tier.Plots, state.Farm.Plots.Count + planned.Count);
@@ -648,7 +905,7 @@ internal sealed class SingleBlockFarmService
                 networkId,
                 requiredWh,
                 ModItemCatalog.UniqueId,
-                "single-block-farm-day",
+                BuildMachineEnergyReason(state, "single-block-farm-day"),
                 allowPartial: false,
                 out _,
                 out _,
@@ -663,19 +920,11 @@ internal sealed class SingleBlockFarmService
         var changed = false;
         foreach (var seed in planned)
         {
-            if (state.Farm.Plots.Count >= tier.Plots)
+            if (!TryApplyPlannedFarmSeed(state.Farm, tier, seed))
             {
                 this.RollbackPlannedSeed(api, networkId, state.Farm, seed);
                 continue;
             }
-
-            state.Farm.Plots.Add(new FarmPlotState
-            {
-                SeedQualifiedItemId = seed.Crop.SeedQualifiedItemId,
-                HarvestQualifiedItemId = seed.Crop.HarvestQualifiedItemId,
-                PlacedByFarmingLevel = seed.FarmingLevel,
-                FertilizerQualifiedItemId = seed.FertilizerQualifiedItemId
-            });
             changed = true;
         }
 
@@ -697,26 +946,60 @@ internal sealed class SingleBlockFarmService
         string season)
     {
         var planned = new List<PlannedFarmSeed>();
-        var emptyPlots = Math.Max(0, tier.Plots - farm.Plots.Count);
-        for (var i = 0; i < emptyPlots; i++)
+        foreach (var plotIndex in GetMixedFarmPlantingOrder(farm, tier.Plots))
         {
-            if (TryTakeBufferedSeed(farm, modules, season, out var seedItem, out var crop))
+            var requiredSeed = farm.PlotLocks.GetValueOrDefault(plotIndex) ?? string.Empty;
+            if (TryTakeBufferedSeed(farm, modules, season, requiredSeed, out var seedItem, out var crop))
             {
-                planned.Add(new PlannedFarmSeed(seedItem, crop, FarmSeedSource.InputBuffer, farm.PlacedByFarmingLevel));
+                planned.Add(new PlannedFarmSeed(seedItem, crop, FarmSeedSource.InputBuffer, farm.PlacedByFarmingLevel, plotIndex));
                 continue;
             }
 
             if (farm.AutoPullFromNetwork
-                && TryExtractNetworkSeed(api, networkId, farm, modules, season, out seedItem, out crop))
+                && TryExtractNetworkSeed(api, networkId, farm, modules, season, requiredSeed, out seedItem, out crop))
             {
-                planned.Add(new PlannedFarmSeed(seedItem, crop, FarmSeedSource.Network, farm.PlacedByFarmingLevel));
+                planned.Add(new PlannedFarmSeed(seedItem, crop, FarmSeedSource.Network, farm.PlacedByFarmingLevel, plotIndex));
                 continue;
             }
 
-            break;
+            if (string.IsNullOrWhiteSpace(requiredSeed))
+                break;
         }
 
         return planned;
+    }
+
+    internal static IReadOnlyList<int> GetMixedFarmPlantingOrder(FarmMachineState farm, int capacity)
+    {
+        var occupied = farm.Plots.Select(plot => plot.PlotIndex).ToHashSet();
+        return Enumerable.Range(0, Math.Max(0, capacity))
+            .Where(index => !occupied.Contains(index))
+            .OrderByDescending(index => farm.PlotLocks.ContainsKey(index))
+            .ThenBy(index => index)
+            .ToList();
+    }
+
+    internal static bool TryApplyPlannedFarmSeed(FarmMachineState farm, FarmTierInfo tier, PlannedFarmSeed seed)
+    {
+        if (farm.Plots.Count >= tier.Plots
+            || seed.TargetPlotIndex < 0
+            || seed.TargetPlotIndex >= tier.Plots
+            || farm.Plots.Any(plot => plot.PlotIndex == seed.TargetPlotIndex))
+        {
+            return false;
+        }
+
+        farm.Plots.Add(new FarmPlotState
+        {
+            PlotIndex = seed.TargetPlotIndex,
+            SeedQualifiedItemId = seed.Crop.SeedQualifiedItemId,
+            HarvestQualifiedItemId = seed.Crop.HarvestQualifiedItemId,
+            PlacedByFarmingLevel = seed.FarmingLevel,
+            FertilizerQualifiedItemId = seed.FertilizerQualifiedItemId,
+            IsLocked = farm.PlotLocks.ContainsKey(seed.TargetPlotIndex),
+            LockedSeedQualifiedItemId = farm.PlotLocks.GetValueOrDefault(seed.TargetPlotIndex) ?? string.Empty
+        });
+        return true;
     }
 
     private static void AssignPlannedFertilizer(
@@ -769,10 +1052,11 @@ internal sealed class SingleBlockFarmService
         AddBufferedInput(farm.InputBuffer, seed.SeedItem);
     }
 
-    private static bool TryTakeBufferedSeed(
+    internal static bool TryTakeBufferedSeed(
         FarmMachineState farm,
         FarmModuleSnapshot modules,
         string season,
+        string requiredSeedQualifiedItemId,
         out Item seedItem,
         out FarmCropSpec crop)
     {
@@ -783,6 +1067,8 @@ internal sealed class SingleBlockFarmService
             var item = BufferedItemCodec.CreateItem(farm.InputBuffer[i]);
             if (item.Stack <= 0
                 || !FarmCropCatalog.TryGetBySeed(item.QualifiedItemId, out crop!)
+                || (!string.IsNullOrWhiteSpace(requiredSeedQualifiedItemId)
+                    && !string.Equals(requiredSeedQualifiedItemId, item.QualifiedItemId, StringComparison.Ordinal))
                 || !CanFarmCropGrowToday(crop, modules, season)
                 || !MatchesFarmSeedFilter(farm, item))
             {
@@ -806,6 +1092,7 @@ internal sealed class SingleBlockFarmService
         FarmMachineState farm,
         FarmModuleSnapshot modules,
         string season,
+        string requiredSeedQualifiedItemId,
         out Item seedItem,
         out FarmCropSpec crop)
     {
@@ -814,6 +1101,8 @@ internal sealed class SingleBlockFarmService
         if (!api.TryExtractFirstMatchingItem(
                 networkId,
                 item => FarmCropCatalog.TryGetBySeed(item.QualifiedItemId, out var candidate)
+                    && (string.IsNullOrWhiteSpace(requiredSeedQualifiedItemId)
+                        || string.Equals(requiredSeedQualifiedItemId, item.QualifiedItemId, StringComparison.Ordinal))
                     && CanFarmCropGrowToday(candidate, modules, season)
                     && MatchesFarmSeedFilter(farm, item),
                 _ => 1,
@@ -834,7 +1123,7 @@ internal sealed class SingleBlockFarmService
         return true;
     }
 
-    private static bool ApplyMixedFarmGrowth(
+    internal static bool ApplyMixedFarmGrowth(
         FarmMachineState farm,
         IList<BufferedItemStack> outputBuffer,
         FarmModuleSnapshot modules,
@@ -869,6 +1158,8 @@ internal sealed class SingleBlockFarmService
             }
             else
             {
+                if (plot.IsLocked && !string.IsNullOrWhiteSpace(plot.LockedSeedQualifiedItemId))
+                    farm.PlotLocks[plot.PlotIndex] = plot.LockedSeedQualifiedItemId;
                 farm.Plots.Remove(plot);
             }
         }
@@ -1044,6 +1335,11 @@ internal sealed class SingleBlockFarmService
             this.monitor.Log($"Could not suppress input after SVSAPME farm interaction: {ex.Message}", LogLevel.Trace);
         }
     }
+
+    private static string BuildMachineEnergyReason(MachineState state, string operation)
+    {
+        return $"machine|{state.QualifiedItemId}|{state.MachineGuid:N}|{operation}";
+    }
 }
 
 internal enum FarmSeedSource
@@ -1054,18 +1350,20 @@ internal enum FarmSeedSource
 
 internal sealed class PlannedFarmSeed
 {
-    public PlannedFarmSeed(Item seedItem, FarmCropSpec crop, FarmSeedSource source, int farmingLevel)
+    public PlannedFarmSeed(Item seedItem, FarmCropSpec crop, FarmSeedSource source, int farmingLevel, int targetPlotIndex)
     {
         this.SeedItem = seedItem;
         this.Crop = crop;
         this.Source = source;
         this.FarmingLevel = farmingLevel;
+        this.TargetPlotIndex = targetPlotIndex;
     }
 
     public Item SeedItem { get; }
     public FarmCropSpec Crop { get; }
     public FarmSeedSource Source { get; }
     public int FarmingLevel { get; }
+    public int TargetPlotIndex { get; }
     public string FertilizerQualifiedItemId { get; set; } = string.Empty;
 }
 
@@ -1077,7 +1375,9 @@ internal readonly record struct FarmPlotView(
     long ProgressUnits,
     long RequiredUnits,
     bool Ready,
-    string FertilizerQualifiedItemId);
+    string FertilizerQualifiedItemId,
+    bool IsLocked,
+    string LockedSeedQualifiedItemId);
 
 internal readonly record struct FarmDashboardView(
     bool Available,
@@ -1086,7 +1386,13 @@ internal readonly record struct FarmDashboardView(
     string InputMode,
     string FilterMode,
     int FilterCount,
+    int InputBufferStacks,
+    int FertilizerCount,
     int OccupiedPlots,
     int EmptyPlots,
     int OutputBufferStacks,
-    decimal EstimatedDailyValue);
+    int ModuleSlotsUsed,
+    int ModuleSlotsCapacity,
+    IReadOnlyList<string> ModuleQualifiedItemIds,
+    decimal EstimatedDailyValue,
+    long EstimatedDailyEnergyWh);

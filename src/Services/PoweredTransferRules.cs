@@ -40,11 +40,13 @@ internal static class PoweredTransferRules
         PoweredMachineTier tier,
         long storedWh,
         int halfWhCredit,
-        int prototypeThroughput)
+        int prototypeThroughput,
+        int poweredThroughputMultiplier = 1)
     {
+        var multiplier = Math.Clamp(poweredThroughputMultiplier, 1, 2);
         var acceleratedItems = Math.Min(
             Math.Min(Math.Max(0, sourceAvailable), Math.Max(0, targetCapacity)),
-            GetEffectivePoweredThroughput(tier, prototypeThroughput));
+            GetEffectivePoweredThroughput(tier, prototypeThroughput) * multiplier);
         if (acceleratedItems <= 0)
             return PoweredTransferPlan.None;
 

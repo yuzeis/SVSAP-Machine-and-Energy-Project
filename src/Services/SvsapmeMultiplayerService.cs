@@ -16,7 +16,10 @@ internal sealed class SvsapmeMultiplayerService
 {
     private const int ReconciledTransactionLimit = 256;
     private const int PendingDeliveryRetentionDays = 7;
+    private const int ClientActionResponseTimeoutTicks = 300;
+    private const int ClientActionRetryLimit = 3;
     private const string ReconciledTransactionModDataKey = ModItemCatalog.UniqueId + "/ReconciledDeliveries";
+    private const string DurableRemoteDeliveryModDataKey = ModItemCatalog.UniqueId + "/DurableRemoteDeliveries";
     private const string PersistentActionEscrowModDataKey = ModItemCatalog.UniqueId + "/PendingActionEscrows";
 
     private readonly IModHelper helper;
@@ -24,6 +27,7 @@ internal sealed class SvsapmeMultiplayerService
     private readonly MachineStateRepository repository;
     private readonly MachineRegistryService registry;
     private readonly EnergyNetworkManager energy;
+    private readonly EnergyTelemetryService telemetry;
     private readonly MachineRuntimeService machineRuntime;
     private readonly SingleBlockFarmService singleBlockFarm;
     private readonly SingleBlockProcessorService singleBlockProcessor;
@@ -44,6 +48,7 @@ internal sealed class SvsapmeMultiplayerService
         MachineStateRepository repository,
         MachineRegistryService registry,
         EnergyNetworkManager energy,
+        EnergyTelemetryService telemetry,
         MachineRuntimeService machineRuntime,
         SingleBlockFarmService singleBlockFarm,
         SingleBlockProcessorService singleBlockProcessor,
@@ -55,6 +60,7 @@ internal sealed class SvsapmeMultiplayerService
         this.repository = repository;
         this.registry = registry;
         this.energy = energy;
+        this.telemetry = telemetry;
         this.machineRuntime = machineRuntime;
         this.singleBlockFarm = singleBlockFarm;
         this.singleBlockProcessor = singleBlockProcessor;
@@ -70,6 +76,11 @@ internal sealed class SvsapmeMultiplayerService
 
     public int PendingClientMachineActionCount => this.pendingClientActionsByMachine.Count;
 
+    internal bool IsMachineActionPending(Guid machineGuid)
+    {
+        return machineGuid != Guid.Empty && this.pendingClientActionsByMachine.ContainsKey(machineGuid);
+    }
+
     public void OnDayStarted(object? sender, DayStartedEventArgs e)
     {
         if (!Context.IsMainPlayer || !Context.IsWorldReady)
@@ -80,6 +91,11 @@ internal sealed class SvsapmeMultiplayerService
     }
 
     public bool TrySendMachineSnapshotRequest(Guid machineGuid)
+    {
+        return this.TrySendMachineSnapshotRequest(machineGuid, offset: 0, limit: 64, notify: true);
+    }
+
+    internal bool TrySendMachineSnapshotRequest(Guid machineGuid, int offset, int limit, bool notify)
     {
         if (Context.IsMainPlayer || machineGuid == Guid.Empty)
             return false;
@@ -96,12 +112,15 @@ internal sealed class SvsapmeMultiplayerService
             this.helper.Multiplayer.SendMessage(
                 new SvsapmeMachineSnapshotRequest
                 {
-                    MachineGuid = machineGuid
+                    MachineGuid = machineGuid,
+                    Offset = Math.Max(0, offset),
+                    Limit = Math.Clamp(limit, 1, 64)
                 },
                 SvsapmeMultiplayerMessageTypes.MachineSnapshotRequest,
                 modIDs: new[] { this.manifest.UniqueID },
                 playerIDs: new[] { host.PlayerID });
-            Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.multiplayer.snapshotRequested", "Requested SVSAPME machine status from host."), HUDMessage.newQuest_type));
+            if (notify)
+                Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.multiplayer.snapshotRequested", "Requested SVSAPME machine status from host."), HUDMessage.newQuest_type));
             return true;
         }
         catch (Exception ex)
@@ -184,6 +203,7 @@ internal sealed class SvsapmeMultiplayerService
                 SvsapmeMultiplayerMessageTypes.MachineActionRequest,
                 modIDs: new[] { this.manifest.UniqueID },
                 playerIDs: new[] { host.PlayerID });
+            this.MarkPendingClientActionSent(request);
         }
         catch (Exception ex)
         {
@@ -203,8 +223,10 @@ internal sealed class SvsapmeMultiplayerService
         this.reconciledTransactionOrder.Clear();
         this.actionResponses.Clear();
         this.pendingActionEscrows.ClearWithoutRestore();
-        this.RestoreDurableActionEscrows();
         this.pendingClientActionsByMachine.Clear();
+        if (!Context.IsMainPlayer)
+            this.RehydrateDurableActionEscrows();
+        this.RestoreDurableRemoteDeliveries();
         this.blockedPeerActionMessages.Clear();
         this.ClientGameplayEnabled = true;
         this.clientGameplayDisabledMessage = string.Empty;
@@ -257,7 +279,12 @@ internal sealed class SvsapmeMultiplayerService
             var message = this.CreateVersionMismatchMessage(hostVersion, thisVersion);
             this.DisableClientGameplay(message);
             this.WarnPeerVersionMismatch(e.Peer, message, hostVersion, thisVersion);
+            return;
         }
+
+        this.ClientGameplayEnabled = true;
+        this.clientGameplayDisabledMessage = string.Empty;
+        this.RetryPendingClientActions(force: true);
     }
 
     public void OnPeerDisconnected(object? sender, PeerDisconnectedEventArgs e)
@@ -268,13 +295,19 @@ internal sealed class SvsapmeMultiplayerService
         {
             this.ClientGameplayEnabled = false;
             this.clientGameplayDisabledMessage = ModText.Get("hud.multiplayer.hostMissingSvsapme", "SVSAPME gameplay is disabled because the host is missing SVSAPME.");
-            this.RestorePendingActionEscrows();
-            this.pendingClientActionsByMachine.Clear();
             this.reconciledTransactions.Clear();
             this.reconciledTransactionOrder.Clear();
             this.actionResponses.Clear();
             return;
         }
+    }
+
+    public void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
+    {
+        if (Context.IsMainPlayer || !Context.IsWorldReady || !this.ClientGameplayEnabled || !e.IsMultipleOf(30))
+            return;
+
+        this.RetryPendingClientActions(force: false);
     }
 
     public void OnModMessageReceived(object? sender, ModMessageReceivedEventArgs e)
@@ -346,7 +379,7 @@ internal sealed class SvsapmeMultiplayerService
     private void HandleMachineSnapshotRequest(ModMessageReceivedEventArgs e)
     {
         var request = e.ReadAs<SvsapmeMachineSnapshotRequest>();
-        var response = this.CreateMachineSnapshotResponse(request.MachineGuid);
+        var response = this.CreateMachineSnapshotResponse(request.MachineGuid, request.Offset, request.Limit);
         this.helper.Multiplayer.SendMessage(
             response,
             SvsapmeMultiplayerMessageTypes.MachineSnapshotResponse,
@@ -366,65 +399,73 @@ internal sealed class SvsapmeMultiplayerService
             return;
         }
 
-        var title = string.IsNullOrWhiteSpace(response.DisplayName)
-            ? ModText.Get("ui.machine.remoteTitle", "SVSAPME Machine")
-            : response.DisplayName;
-        var actions = new List<SvsapmeMenuAction>();
-        if (response.CanCollectProcessorOutput)
+        if (Game1.activeClickableMenu is IRemoteMachineMenu remoteMenu
+            && remoteMenu.MachineGuid == response.MachineGuid)
         {
-            actions.Add(new SvsapmeMenuAction(
-                ModText.Get("ui.processor.collectAll", "Collect All"),
-                () =>
-                {
-                    var sent = this.TrySendMachineActionRequest(new SvsapmeMachineActionRequest
-                    {
-                        TransactionId = Guid.NewGuid(),
-                        MachineGuid = response.MachineGuid,
-                        ActionKind = SvsapmeMachineActionKind.CollectProcessorOutput,
-                        Count = 0
-                    });
-                    if (!sent)
-                        return null;
-
-                    Game1.activeClickableMenu?.exitThisMenu();
-                    return ModText.Get("hud.multiplayer.actionSent", "SVSAPME action sent to host.");
-                },
-                () => response.ProcessorReadyStacks > 0));
+            remoteMenu.ApplySnapshot(response);
+            return;
         }
 
-        Game1.activeClickableMenu = new SvsapmeStatusMenu(title, () => response.Lines, actions);
+        Game1.activeClickableMenu = new RemoteMachineControlMenu(
+            response,
+            this.TrySendMachineActionRequest,
+            (machineGuid, offset, limit) => this.TrySendMachineSnapshotRequest(machineGuid, offset, limit, notify: false),
+            this.IsMachineActionPending);
     }
 
     private void HandleMachineActionRequest(ModMessageReceivedEventArgs e)
     {
-        var request = e.ReadAs<SvsapmeMachineActionRequest>();
-        if (this.blockedPeerActionMessages.TryGetValue(e.FromPlayerID, out var blockMessage))
+        SvsapmeMachineActionRequest? request = null;
+        try
         {
-            var blocked = CreateFailureActionResponse(request, blockMessage);
-            this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, blocked);
-            this.SendMachineActionResponse(blocked, e.FromPlayerID);
-            return;
-        }
+            request = e.ReadAs<SvsapmeMachineActionRequest>();
+            if (this.blockedPeerActionMessages.TryGetValue(e.FromPlayerID, out var blockMessage))
+            {
+                var blocked = CreateFailureActionResponse(request, blockMessage);
+                this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, blocked);
+                this.SendMachineActionResponse(blocked, e.FromPlayerID);
+                return;
+            }
 
-        if (this.actionResponses.TryGet(e.FromPlayerID, request.TransactionId, out var cached))
+            if (this.actionResponses.TryGet(e.FromPlayerID, request.TransactionId, out var cached))
+            {
+                this.SendMachineActionResponse(cached, e.FromPlayerID);
+                return;
+            }
+
+            if (this.TryGetPendingDeliveryResponse(e.FromPlayerID, request.TransactionId, out var pendingDeliveryResponse))
+            {
+                this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, pendingDeliveryResponse);
+                this.SendMachineActionResponse(pendingDeliveryResponse, e.FromPlayerID);
+                return;
+            }
+
+            var response = this.ExecuteMachineActionRequest(request, e.FromPlayerID);
+            if (response.Success && response.ReturnedItems.Count > 0)
+                this.RememberPendingDelivery(e.FromPlayerID, request, response);
+
+            this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, response);
+            this.SendMachineActionResponse(response, e.FromPlayerID);
+        }
+        catch (Exception ex)
         {
-            this.SendMachineActionResponse(cached, e.FromPlayerID);
-            return;
+            this.monitor.Log($"Failed to execute SVSAPME machine action from {e.FromPlayerID}: {ex.Message}", LogLevel.Warn);
+            if (request is null || request.TransactionId == Guid.Empty)
+                return;
+
+            var failure = CreateFailureActionResponse(
+                request,
+                ModText.Get("hud.multiplayer.actionFailed", "SVSAPME action failed; please retry."));
+            this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, failure);
+            try
+            {
+                this.SendMachineActionResponse(failure, e.FromPlayerID);
+            }
+            catch (Exception sendEx)
+            {
+                this.monitor.Log($"Failed to send SVSAPME machine action failure response to {e.FromPlayerID}: {sendEx.Message}", LogLevel.Warn);
+            }
         }
-
-        if (this.TryGetPendingDeliveryResponse(e.FromPlayerID, request.TransactionId, out var pendingDeliveryResponse))
-        {
-            this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, pendingDeliveryResponse);
-            this.SendMachineActionResponse(pendingDeliveryResponse, e.FromPlayerID);
-            return;
-        }
-
-        var response = this.ExecuteMachineActionRequest(request, e.FromPlayerID);
-        if (response.Success && response.ReturnedItems.Count > 0)
-            this.RememberPendingDelivery(e.FromPlayerID, request, response);
-
-        this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, response);
-        this.SendMachineActionResponse(response, e.FromPlayerID);
     }
 
     private void SendMachineActionResponse(SvsapmeMachineActionResponse response, long playerId)
@@ -442,6 +483,10 @@ internal sealed class SvsapmeMultiplayerService
         {
             if (response.Success && response.ReturnedItems.Count > 0)
                 this.TrySendMachineDeliveryAck(response);
+            this.ResolvePendingActionEscrow(
+                response.TransactionId,
+                SvsapmeActionEscrowRules.ShouldRestoreOnResponse(response.Success, response.ConsumeEscrowedItem));
+            this.ClearPendingClientAction(response);
             return;
         }
 
@@ -456,8 +501,17 @@ internal sealed class SvsapmeMultiplayerService
             SvsapmeActionEscrowRules.ShouldRestoreOnResponse(response.Success, response.ConsumeEscrowedItem));
         this.ClearPendingClientAction(response);
 
+        if (response.Snapshot is not null
+            && Game1.activeClickableMenu is IRemoteMachineMenu remoteMenu
+            && remoteMenu.MachineGuid == response.MachineGuid)
+        {
+            remoteMenu.ApplySnapshot(response.Snapshot);
+        }
+
         Game1.addHUDMessage(new HUDMessage(
-            LocalizeMachineActionResponse(response.Success),
+            string.IsNullOrWhiteSpace(response.Message)
+                ? LocalizeMachineActionResponse(response.Success)
+                : response.Message,
             response.Success ? HUDMessage.newQuest_type : HUDMessage.error_type));
     }
 
@@ -497,7 +551,7 @@ internal sealed class SvsapmeMultiplayerService
 
         if (this.pendingActionEscrows.Track(request.TransactionId, escrowedItem))
         {
-            if (this.TrackDurableActionEscrow(request.TransactionId, escrowedItem))
+            if (this.TrackDurableActionEscrow(request, escrowedItem))
                 return true;
 
             this.ResolvePendingActionEscrow(request.TransactionId, restore: true);
@@ -527,22 +581,84 @@ internal sealed class SvsapmeMultiplayerService
                 tile,
                 request.QualifiedItemId,
                 Math.Clamp(request.Count, 1, 999)),
+            SvsapmeMachineActionKind.SetPoweredFilterSlot => WrapPoweredAction(
+                this.machineRuntime.TrySetPoweredFilterSlot(placedObject, location, tile, request.SlotIndex, request.QualifiedItemId, out var setFilterMessage),
+                setFilterMessage),
+            SvsapmeMachineActionKind.ClearPoweredFilterSlot => WrapPoweredAction(
+                this.machineRuntime.TryClearPoweredFilterSlot(placedObject, location, tile, request.SlotIndex, out var clearFilterSlotMessage),
+                clearFilterSlotMessage),
+            SvsapmeMachineActionKind.TogglePoweredFilterMode => WrapPoweredAction(
+                this.machineRuntime.TryTogglePoweredFilterMode(placedObject, location, tile, out var toggleFilterMessage),
+                toggleFilterMessage),
+            SvsapmeMachineActionKind.TogglePoweredOreDictionaryMode => WrapPoweredAction(
+                this.machineRuntime.TryTogglePoweredOreDictionaryMode(placedObject, location, tile, out var toggleOreMessage),
+                toggleOreMessage),
+            SvsapmeMachineActionKind.CyclePoweredQualityStrategy => WrapPoweredAction(
+                this.machineRuntime.TryTogglePoweredQualityStrategy(placedObject, location, tile, out var qualityMessage),
+                qualityMessage),
+            SvsapmeMachineActionKind.ClearPoweredFilters => WrapPoweredAction(
+                this.machineRuntime.TryClearPoweredFilter(placedObject, location, tile, out var clearFiltersMessage),
+                clearFiltersMessage),
+            SvsapmeMachineActionKind.SetPoweredFacingDirection => WrapPoweredAction(
+                this.machineRuntime.TrySetPoweredFacingDirection(placedObject, location, tile, request.Direction, out var directionMessage),
+                directionMessage),
+            SvsapmeMachineActionKind.InstallPoweredUpgrade => this.machineRuntime.TryInstallPoweredUpgrade(
+                placedObject,
+                location,
+                tile,
+                request.SlotIndex,
+                request.QualifiedItemId),
+            SvsapmeMachineActionKind.RemovePoweredUpgrade => this.machineRuntime.TryRemovePoweredUpgrade(
+                placedObject,
+                location,
+                tile,
+                request.SlotIndex),
             SvsapmeMachineActionKind.LoadFarmSeed => this.singleBlockFarm.TryLoadSeed(
                 placedObject,
                 location,
                 tile,
                 request.QualifiedItemId,
-                placedByFarmingLevel: Math.Clamp(request.FarmingLevel, 0, 10)),
+                placedByFarmingLevel: Math.Clamp(request.FarmingLevel, 0, 10),
+                count: Math.Clamp(request.Count, 1, 999)),
             SvsapmeMachineActionKind.LoadFarmFertilizer => this.singleBlockFarm.TryLoadFertilizer(
                 placedObject,
                 location,
                 tile,
-                request.QualifiedItemId),
+                request.QualifiedItemId,
+                Math.Clamp(request.Count, 1, 999)),
+            SvsapmeMachineActionKind.ExtractFarmSeed => this.singleBlockFarm.TryExtractFarmInput(placedObject, location, tile, fertilizer: false),
+            SvsapmeMachineActionKind.ExtractFarmFertilizer => this.singleBlockFarm.TryExtractFarmInput(placedObject, location, tile, fertilizer: true),
             SvsapmeMachineActionKind.InstallFarmModule => this.singleBlockFarm.TryInstallModule(
                 placedObject,
                 location,
                 tile,
                 request.QualifiedItemId),
+            SvsapmeMachineActionKind.RemoveFarmModule => this.singleBlockFarm.TryRemoveModule(placedObject, location, tile, request.SlotIndex),
+            SvsapmeMachineActionKind.ToggleFarmAutoPull => this.singleBlockFarm.ToggleFarmAutoPull(placedObject, location, tile),
+            SvsapmeMachineActionKind.ToggleFarmAutoPush => this.singleBlockFarm.ToggleFarmAutoPush(placedObject, location, tile),
+            SvsapmeMachineActionKind.ToggleFarmInputMode => this.singleBlockFarm.ToggleFarmInputMode(placedObject, location, tile),
+            SvsapmeMachineActionKind.ToggleFarmFilterMode => this.singleBlockFarm.ToggleFarmFilterMode(placedObject, location, tile),
+            SvsapmeMachineActionKind.AddFarmFilter => this.singleBlockFarm.AddHeldFarmFilter(
+                placedObject,
+                location,
+                tile,
+                TryCreateRequestItem(request)),
+            SvsapmeMachineActionKind.ClearFarmFilter => this.singleBlockFarm.ClearFarmFilter(placedObject, location, tile),
+            SvsapmeMachineActionKind.PlantFarmPlot => this.singleBlockFarm.TryManualPlant(
+                placedObject,
+                location,
+                tile,
+                request.SlotIndex,
+                CreateRequestItem(request),
+                Math.Clamp(request.FarmingLevel, 0, 10)),
+            SvsapmeMachineActionKind.HarvestFarmPlot => this.singleBlockFarm.TryHarvestPlot(placedObject, location, tile, request.SlotIndex),
+            SvsapmeMachineActionKind.ToggleFarmPlotLock => this.singleBlockFarm.ToggleFarmPlotLock(
+                placedObject,
+                location,
+                tile,
+                request.SlotIndex,
+                request.QualifiedItemId),
+            SvsapmeMachineActionKind.CollectFarmOutput => this.singleBlockFarm.TryCollectFarmOutput(placedObject, location, tile),
             SvsapmeMachineActionKind.FuelCarbonGenerator => this.machineRuntime.TryFuelCarbonGenerator(
                 placedObject,
                 location,
@@ -563,31 +679,27 @@ internal sealed class SvsapmeMultiplayerService
                 placedObject,
                 location,
                 tile,
-                new BufferedItemStack
-                {
-                    QualifiedItemId = request.QualifiedItemId,
-                    Stack = Math.Clamp(request.Count, 1, 999),
-                    Quality = request.Quality,
-                    PreservedParentSheetIndex = request.PreservedParentSheetIndex,
-                    PreserveType = request.PreserveType,
-                    Price = request.Price,
-                    Edibility = request.Edibility,
-                    Category = request.Category,
-                    Type = request.Type,
-                    Name = request.Name,
-                    DisplayName = request.DisplayName,
-                    Color = request.Color,
-                    ModData = request.ModData ?? new()
-                }),
+                CreateRequestStack(request)),
+            SvsapmeMachineActionKind.ExtractProcessorInput => this.singleBlockProcessor.TryExtractProcessorInput(placedObject, location, tile),
+            SvsapmeMachineActionKind.ToggleProcessorAutoPull => this.singleBlockProcessor.ToggleProcessorAutoPull(placedObject, location, tile),
+            SvsapmeMachineActionKind.ToggleProcessorAutoPush => this.singleBlockProcessor.ToggleProcessorAutoPush(placedObject, location, tile),
+            SvsapmeMachineActionKind.ToggleProcessorInputMode => this.singleBlockProcessor.ToggleProcessorInputMode(placedObject, location, tile),
+            SvsapmeMachineActionKind.ToggleProcessorFilterMode => this.singleBlockProcessor.ToggleProcessorFilterMode(placedObject, location, tile),
+            SvsapmeMachineActionKind.AddProcessorFilter => this.singleBlockProcessor.AddHeldProcessorFilter(
+                placedObject,
+                location,
+                tile,
+                TryCreateRequestItem(request)),
+            SvsapmeMachineActionKind.ClearProcessorFilter => this.singleBlockProcessor.ClearProcessorFilter(placedObject, location, tile),
             SvsapmeMachineActionKind.CollectProcessorOutput => this.singleBlockProcessor.TryCollectOutputForRemotePlayer(
                 placedObject,
                 location,
                 tile,
-                Math.Max(0, request.Count)),
+                request.SlotIndex >= 0 ? request.SlotIndex + 1 : Math.Max(0, request.Count)),
             _ => new SvsapmeMachineActionApplyResult(false, false, ModText.Get("hud.multiplayer.unsupportedAction", "Unsupported SVSAPME machine action."))
         };
 
-        return new SvsapmeMachineActionResponse
+        var response = new SvsapmeMachineActionResponse
         {
             TransactionId = request.TransactionId,
             MachineGuid = request.MachineGuid,
@@ -596,6 +708,53 @@ internal sealed class SvsapmeMultiplayerService
             Message = result.Message,
             ReturnedItems = result.ReturnedItems
         };
+
+        if (result.Success)
+            response.Snapshot = this.CreateMachineSnapshotResponse(request.MachineGuid, request.Offset, request.Limit);
+
+        return response;
+    }
+
+    private static SvsapmeMachineActionApplyResult WrapPoweredAction(bool success, string message)
+    {
+        return new SvsapmeMachineActionApplyResult(success, false, message);
+    }
+
+    private static BufferedItemStack CreateRequestStack(SvsapmeMachineActionRequest request)
+    {
+        return new BufferedItemStack
+        {
+            QualifiedItemId = request.QualifiedItemId,
+            Stack = Math.Clamp(request.Count, 1, 999),
+            Quality = request.Quality,
+            PreservedParentSheetIndex = request.PreservedParentSheetIndex,
+            PreserveType = request.PreserveType,
+            Price = request.Price,
+            Edibility = request.Edibility,
+            Category = request.Category,
+            Type = request.Type,
+            Name = request.Name,
+            DisplayName = request.DisplayName,
+            Color = request.Color,
+            ModData = request.ModData ?? new()
+        };
+    }
+
+    private static Item CreateRequestItem(SvsapmeMachineActionRequest request)
+    {
+        return BufferedItemCodec.CreateItem(CreateRequestStack(request));
+    }
+
+    private static Item? TryCreateRequestItem(SvsapmeMachineActionRequest request)
+    {
+        try
+        {
+            return string.IsNullOrWhiteSpace(request.QualifiedItemId) ? null : CreateRequestItem(request);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private bool TryReservePendingClientAction(SvsapmeMachineActionRequest request, out string message)
@@ -611,8 +770,81 @@ internal sealed class SvsapmeMultiplayerService
             return false;
         }
 
-        this.pendingClientActionsByMachine[request.MachineGuid] = new PendingClientAction(request.TransactionId);
+        this.pendingClientActionsByMachine[request.MachineGuid] = new PendingClientAction(request);
         return true;
+    }
+
+    private void MarkPendingClientActionSent(SvsapmeMachineActionRequest request)
+    {
+        if (request.MachineGuid == Guid.Empty)
+            return;
+
+        if (this.pendingClientActionsByMachine.TryGetValue(request.MachineGuid, out var pending)
+            && pending.TransactionId == request.TransactionId)
+        {
+            pending.LastSentTick = Game1.ticks;
+        }
+    }
+
+    private void RetryPendingClientActions(bool force)
+    {
+        if (Context.IsMainPlayer || this.pendingClientActionsByMachine.Count == 0)
+            return;
+
+        var host = this.helper.Multiplayer.GetConnectedPlayers().FirstOrDefault(peer => peer.IsHost);
+        var hostMod = host?.HasSmapi == true ? host.GetMod(this.manifest.UniqueID) : null;
+        if (host is null
+            || hostMod is null
+            || !string.Equals(hostMod.Version.ToString(), this.manifest.Version.ToString(), StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var tick = Game1.ticks;
+        foreach (var pending in this.pendingClientActionsByMachine.Values.ToList())
+        {
+            if (force)
+            {
+                pending.RetryCount = 0;
+                pending.RetryLimitNotified = false;
+                pending.LastSentTick = tick - ClientActionResponseTimeoutTicks;
+            }
+
+            var elapsed = tick >= pending.LastSentTick
+                ? tick - pending.LastSentTick
+                : ClientActionResponseTimeoutTicks;
+            if (elapsed < ClientActionResponseTimeoutTicks)
+                continue;
+
+            if (pending.RetryCount >= ClientActionRetryLimit)
+            {
+                if (!pending.RetryLimitNotified)
+                {
+                    pending.RetryLimitNotified = true;
+                    Game1.addHUDMessage(new HUDMessage(
+                        ModText.Get("hud.multiplayer.actionReconcilePending", "SVSAPME is keeping the item safe while waiting to reconcile this action with the host."),
+                        HUDMessage.error_type));
+                }
+                continue;
+            }
+
+            try
+            {
+                this.helper.Multiplayer.SendMessage(
+                    pending.Request,
+                    SvsapmeMultiplayerMessageTypes.MachineActionRequest,
+                    modIDs: new[] { this.manifest.UniqueID },
+                    playerIDs: new[] { host.PlayerID });
+                pending.LastSentTick = tick;
+                pending.RetryCount++;
+            }
+            catch (Exception ex)
+            {
+                pending.LastSentTick = tick;
+                pending.RetryCount++;
+                this.monitor.Log($"Failed to retry SVSAPME action {pending.TransactionId:N}: {ex.Message}", LogLevel.Trace);
+            }
+        }
     }
 
     private void ClearPendingClientAction(SvsapmeMachineActionRequest request)
@@ -755,29 +987,45 @@ internal sealed class SvsapmeMultiplayerService
 
     private int PruneConfirmedExpiredPendingDeliveries(int currentDay)
     {
-        var expired = this.repository.Data.PendingRemoteDeliveries
-            .Where(delivery => IsExpiredPendingDelivery(delivery, currentDay))
-            .ToList();
+        var changed = false;
         var removed = 0;
-        foreach (var delivery in expired)
+        var queued = 0;
+        foreach (var delivery in this.repository.Data.PendingRemoteDeliveries.ToList())
         {
-            if (!PlayerHasPersistedReconciledTransaction(delivery.PlayerId, delivery.TransactionId))
+            if (delivery.CreatedDay <= 0)
+            {
+                delivery.CreatedDay = currentDay;
+                delivery.CreatedTick = Game1.ticks;
+                changed = true;
                 continue;
+            }
+
+            if (!IsExpiredPendingDelivery(delivery, currentDay))
+                continue;
+
+            if (!PlayerHasPersistedReconciledTransaction(delivery.PlayerId, delivery.TransactionId)
+                && !this.QueueDurableRemoteDeliveryForPlayer(delivery))
+            {
+                continue;
+            }
+
+            if (!PlayerHasPersistedReconciledTransaction(delivery.PlayerId, delivery.TransactionId))
+                queued++;
 
             this.repository.Data.PendingRemoteDeliveries.Remove(delivery);
             removed++;
+            changed = true;
         }
 
         if (removed > 0)
-            this.monitor.Log($"Pruned {removed:N0} confirmed expired SVSAPME pending remote delivery record(s).", LogLevel.Info);
+            this.monitor.Log($"Pruned {removed - queued:N0} confirmed and queued {queued:N0} expired SVSAPME pending remote delivery record(s).", LogLevel.Info);
 
-        return removed;
+        return changed ? Math.Max(removed, 1) : 0;
     }
 
     private static bool IsExpiredPendingDelivery(PendingRemoteDelivery delivery, int currentDay)
     {
-        return delivery.CreatedDay > 0
-            && currentDay - delivery.CreatedDay >= PendingDeliveryRetentionDays
+        return currentDay - delivery.CreatedDay >= PendingDeliveryRetentionDays
             && delivery.ReturnedItems.Count > 0;
     }
 
@@ -852,7 +1100,8 @@ internal sealed class SvsapmeMultiplayerService
 
     private static bool RequiresActiveEndpoint(SvsapmeMachineActionKind actionKind)
     {
-        return actionKind != SvsapmeMachineActionKind.CollectProcessorOutput;
+        return actionKind is SvsapmeMachineActionKind.StartElectricFurnace
+            or SvsapmeMachineActionKind.StartElectricGeodeCrusher;
     }
 
     private static bool Fail(string failureMessage, out string message)
@@ -937,20 +1186,24 @@ internal sealed class SvsapmeMultiplayerService
         return resolved;
     }
 
-    private bool TrackDurableActionEscrow(Guid transactionId, Item item)
+    private bool TrackDurableActionEscrow(SvsapmeMachineActionRequest request, Item item)
     {
         var player = Game1.player;
-        if (player is null || transactionId == Guid.Empty)
+        if (player is null || request.TransactionId == Guid.Empty || request.MachineGuid == Guid.Empty)
             return false;
 
         try
         {
-            var records = this.ReadDurableActionEscrows(player)
-                .Where(record => record.TransactionId != transactionId)
+            if (!this.TryReadDurableActionEscrows(player, out var existing))
+                return false;
+
+            var records = existing
+                .Where(record => record.TransactionId != request.TransactionId)
                 .ToList();
             records.Add(new PersistentActionEscrowRecord
             {
-                TransactionId = transactionId,
+                TransactionId = request.TransactionId,
+                Request = request,
                 Item = BufferedItemCodec.FromItem(item)
             });
             this.WriteDurableActionEscrows(player, records);
@@ -958,7 +1211,7 @@ internal sealed class SvsapmeMultiplayerService
         }
         catch (Exception ex)
         {
-            this.monitor.Log($"Failed to persist SVSAPME action escrow {transactionId:N}: {ex.Message}", LogLevel.Warn);
+            this.monitor.Log($"Failed to persist SVSAPME action escrow {request.TransactionId:N}: {ex.Message}", LogLevel.Warn);
             return false;
         }
     }
@@ -971,7 +1224,10 @@ internal sealed class SvsapmeMultiplayerService
 
         try
         {
-            var records = this.ReadDurableActionEscrows(player)
+            if (!this.TryReadDurableActionEscrows(player, out var existing))
+                return;
+
+            var records = existing
                 .Where(record => record.TransactionId != transactionId)
                 .ToList();
             this.WriteDurableActionEscrows(player, records);
@@ -982,59 +1238,81 @@ internal sealed class SvsapmeMultiplayerService
         }
     }
 
-    private void ClearDurableActionEscrows()
-    {
-        Game1.player?.modData.Remove(PersistentActionEscrowModDataKey);
-    }
-
-    private int RestoreDurableActionEscrows()
+    private int RehydrateDurableActionEscrows()
     {
         var player = Game1.player;
         if (player is null)
             return 0;
 
-        var records = this.ReadDurableActionEscrows(player);
+        if (!this.TryReadDurableActionEscrows(player, out var records))
+            return 0;
+
         if (records.Count == 0)
             return 0;
 
-        this.ClearDurableActionEscrows();
-        var restored = 0;
+        var loaded = 0;
         foreach (var record in records)
         {
+            var request = record.Request;
+            if (record.TransactionId == Guid.Empty
+                || request is null
+                || request.TransactionId != record.TransactionId
+                || request.MachineGuid == Guid.Empty)
+            {
+                this.monitor.Log($"Durable SVSAPME action escrow {record.TransactionId:N} has no replayable request and remains quarantined.", LogLevel.Warn);
+                continue;
+            }
+
+            if (this.pendingClientActionsByMachine.TryGetValue(request.MachineGuid, out var existing)
+                && existing.TransactionId != request.TransactionId)
+            {
+                this.monitor.Log($"Durable SVSAPME action escrow {record.TransactionId:N} conflicts with another pending action for machine {request.MachineGuid:N} and remains quarantined.", LogLevel.Warn);
+                continue;
+            }
+
             try
             {
-                RestoreEscrowedItem(BufferedItemCodec.CreateItem(record.Item));
-                restored++;
+                var item = BufferedItemCodec.CreateItem(record.Item);
+                if (!this.pendingActionEscrows.Track(record.TransactionId, item))
+                    continue;
+
+                var pending = new PendingClientAction(request)
+                {
+                    LastSentTick = Game1.ticks - ClientActionResponseTimeoutTicks
+                };
+                this.pendingClientActionsByMachine[request.MachineGuid] = pending;
+                loaded++;
             }
             catch (Exception ex)
             {
-                this.monitor.Log($"Failed to restore durable SVSAPME action escrow {record.TransactionId:N}: {ex.Message}", LogLevel.Warn);
+                this.monitor.Log($"Failed to rehydrate durable SVSAPME action escrow {record.TransactionId:N}: {ex.Message}", LogLevel.Warn);
             }
         }
 
-        if (restored > 0)
-            this.monitor.Log($"Restored {restored:N0} durable SVSAPME action escrow item(s).", LogLevel.Warn);
+        if (loaded > 0)
+            this.monitor.Log($"Rehydrated {loaded:N0} durable SVSAPME action escrow item(s) for host reconciliation.", LogLevel.Warn);
 
-        return restored;
+        return loaded;
     }
 
-    private List<PersistentActionEscrowRecord> ReadDurableActionEscrows(Farmer player)
+    private bool TryReadDurableActionEscrows(Farmer player, out List<PersistentActionEscrowRecord> records)
     {
+        records = new List<PersistentActionEscrowRecord>();
         if (!player.modData.TryGetValue(PersistentActionEscrowModDataKey, out var raw)
             || string.IsNullOrWhiteSpace(raw))
         {
-            return new List<PersistentActionEscrowRecord>();
+            return true;
         }
 
         try
         {
-            return JsonSerializer.Deserialize<List<PersistentActionEscrowRecord>>(raw) ?? new List<PersistentActionEscrowRecord>();
+            records = JsonSerializer.Deserialize<List<PersistentActionEscrowRecord>>(raw) ?? new List<PersistentActionEscrowRecord>();
+            return true;
         }
         catch (Exception ex)
         {
-            this.monitor.Log($"Could not parse durable SVSAPME action escrows; clearing malformed payload: {ex.Message}", LogLevel.Warn);
-            player.modData.Remove(PersistentActionEscrowModDataKey);
-            return new List<PersistentActionEscrowRecord>();
+            this.monitor.Log($"Could not parse durable SVSAPME action escrows; payload remains quarantined: {ex.Message}", LogLevel.Warn);
+            return false;
         }
     }
 
@@ -1047,6 +1325,123 @@ internal sealed class SvsapmeMultiplayerService
         }
 
         player.modData[PersistentActionEscrowModDataKey] = JsonSerializer.Serialize(records);
+    }
+
+    private bool QueueDurableRemoteDeliveryForPlayer(PendingRemoteDelivery delivery)
+    {
+        if (delivery.TransactionId == Guid.Empty
+            || delivery.PlayerId <= 0
+            || delivery.ReturnedItems.Count == 0)
+        {
+            return false;
+        }
+
+        var player = Game1.GetPlayer(delivery.PlayerId, onlyOnline: false);
+        if (player is null)
+            return false;
+
+        try
+        {
+            var records = this.ReadDurableRemoteDeliveries(player)
+                .Where(record => record.TransactionId != delivery.TransactionId)
+                .ToList();
+            records.Add(new DurableRemoteDeliveryRecord
+            {
+                TransactionId = delivery.TransactionId,
+                MachineGuid = delivery.MachineGuid,
+                Message = delivery.Message,
+                ConsumeEscrowedItem = delivery.ConsumeEscrowedItem,
+                CreatedDay = delivery.CreatedDay,
+                ReturnedItems = delivery.ReturnedItems
+            });
+
+            while (records.Count > ReconciledTransactionLimit)
+                records.RemoveAt(0);
+
+            this.WriteDurableRemoteDeliveries(player, records);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            this.monitor.Log($"Failed to queue expired SVSAPME delivery {delivery.TransactionId:N} for player {delivery.PlayerId}: {ex.Message}", LogLevel.Warn);
+            return false;
+        }
+    }
+
+    private int RestoreDurableRemoteDeliveries()
+    {
+        var player = Game1.player;
+        if (player is null)
+            return 0;
+
+        var records = this.ReadDurableRemoteDeliveries(player);
+        if (records.Count == 0)
+            return 0;
+
+        var remaining = new List<DurableRemoteDeliveryRecord>();
+        var restored = 0;
+        var changed = false;
+        foreach (var record in records)
+        {
+            if (record.TransactionId == Guid.Empty || record.ReturnedItems.Count == 0)
+            {
+                changed = true;
+                continue;
+            }
+
+            try
+            {
+                DeliverReturnedItems(record.ReturnedItems);
+                PersistReconciledTransaction(record.TransactionId);
+                restored++;
+                changed = true;
+            }
+            catch (Exception ex)
+            {
+                remaining.Add(record);
+                this.monitor.Log($"Failed to restore durable SVSAPME delivery {record.TransactionId:N}: {ex.Message}", LogLevel.Warn);
+            }
+        }
+
+        if (!changed)
+            return 0;
+
+        this.WriteDurableRemoteDeliveries(player, remaining);
+        if (restored > 0)
+            this.monitor.Log($"Restored {restored:N0} durable SVSAPME remote delivery record(s).", LogLevel.Warn);
+
+        return restored;
+    }
+
+    private List<DurableRemoteDeliveryRecord> ReadDurableRemoteDeliveries(Farmer player)
+    {
+        if (!player.modData.TryGetValue(DurableRemoteDeliveryModDataKey, out var raw)
+            || string.IsNullOrWhiteSpace(raw))
+        {
+            return new List<DurableRemoteDeliveryRecord>();
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<DurableRemoteDeliveryRecord>>(raw) ?? new List<DurableRemoteDeliveryRecord>();
+        }
+        catch (Exception ex)
+        {
+            this.monitor.Log($"Could not parse durable SVSAPME remote deliveries; clearing malformed payload: {ex.Message}", LogLevel.Warn);
+            player.modData.Remove(DurableRemoteDeliveryModDataKey);
+            return new List<DurableRemoteDeliveryRecord>();
+        }
+    }
+
+    private void WriteDurableRemoteDeliveries(Farmer player, IReadOnlyCollection<DurableRemoteDeliveryRecord> records)
+    {
+        if (records.Count == 0)
+        {
+            player.modData.Remove(DurableRemoteDeliveryModDataKey);
+            return;
+        }
+
+        player.modData[DurableRemoteDeliveryModDataKey] = JsonSerializer.Serialize(records);
     }
 
     private void HandleEnergyDebugRequest(ModMessageReceivedEventArgs e)
@@ -1063,6 +1458,12 @@ internal sealed class SvsapmeMultiplayerService
             response.CapacityWh = capacityWh;
             response.Code = SvsapmeEnergyErrorCode.None.ToString();
             response.Message = $"{storedWh}/{capacityWh} Wh";
+            var snapshot = this.telemetry.GetSnapshot(request.NetworkId);
+            response.LastTickGeneratedWh = snapshot.LastGeneratedWh;
+            response.LastTickConsumedWh = snapshot.LastConsumedWh;
+            response.TodayGeneratedWh = snapshot.TodayGeneratedWh;
+            response.TodayConsumedWh = snapshot.TodayConsumedWh;
+            response.LastWarning = snapshot.LastWarning;
         }
         else
         {
@@ -1078,7 +1479,7 @@ internal sealed class SvsapmeMultiplayerService
             playerIDs: new[] { e.FromPlayerID });
     }
 
-    private SvsapmeMachineSnapshotResponse CreateMachineSnapshotResponse(Guid machineGuid)
+    private SvsapmeMachineSnapshotResponse CreateMachineSnapshotResponse(Guid machineGuid, int offset, int limit)
     {
         if (!this.repository.TryGet(machineGuid, out var state))
         {
@@ -1099,7 +1500,7 @@ internal sealed class SvsapmeMultiplayerService
             processorReady = SingleBlockProcessorRules.CountReady(state.Processor) + state.Processor.OutputBuffer.Count;
         }
 
-        return new SvsapmeMachineSnapshotResponse
+        var response = new SvsapmeMachineSnapshotResponse
         {
             MachineGuid = machineGuid,
             Success = true,
@@ -1115,8 +1516,260 @@ internal sealed class SvsapmeMultiplayerService
             OutputBufferStacks = state.OutputBuffer.Count,
             CanCollectProcessorOutput = canCollectProcessor,
             ProcessorReadyStacks = processorReady,
+            Revision = Game1.ticks,
+            MenuKind = ResolveMenuKind(state.QualifiedItemId),
             Lines = this.CreateMachineSnapshotLines(state)
         };
+
+        var location = Game1.getLocationFromName(state.LocationName);
+        var tile = new Vector2(state.TileX, state.TileY);
+        if (location is null
+            || !location.Objects.TryGetValue(tile, out var placedObject)
+            || placedObject.QualifiedItemId != state.QualifiedItemId)
+        {
+            response.Success = false;
+            response.Message = ModText.Get("hud.multiplayer.machineTileMissing", "Machine is missing from its recorded tile.");
+            return response;
+        }
+
+        var normalizedOffset = Math.Max(0, offset);
+        var normalizedLimit = Math.Clamp(limit, 1, 64);
+        switch (response.MenuKind)
+        {
+            case SvsapmeMachineMenuKind.Farm:
+                response.Farm = this.CreateFarmMenuSnapshot(state, placedObject, location, tile, normalizedOffset, normalizedLimit);
+                break;
+            case SvsapmeMachineMenuKind.Processor:
+                response.Processor = this.CreateProcessorMenuSnapshot(state, placedObject, location, tile, normalizedOffset, normalizedLimit);
+                break;
+            case SvsapmeMachineMenuKind.PoweredTransfer:
+                response.PoweredTransfer = this.CreatePoweredTransferMenuSnapshot(placedObject, location, tile);
+                break;
+            case SvsapmeMachineMenuKind.EnergyMonitor:
+                response.EnergyMonitor = this.CreateEnergyMonitorSnapshot(location, tile);
+                break;
+        }
+
+        return response;
+    }
+
+    private SvsapmeFarmMenuSnapshot CreateFarmMenuSnapshot(
+        MachineState state,
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile,
+        int offset,
+        int limit)
+    {
+        var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
+        var dashboard = this.singleBlockFarm.GetDashboard(placedObject, location, tile);
+        var plots = this.singleBlockFarm.GetPlotViews(placedObject, location, tile);
+        var safeOffset = Math.Clamp(offset, 0, Math.Max(0, tier.Plots - 1));
+        return new SvsapmeFarmMenuSnapshot
+        {
+            PlotCapacity = tier.Plots,
+            Offset = safeOffset,
+            AutoPullFromNetwork = dashboard.AutoPullFromNetwork,
+            AutoPushOutputToNetwork = dashboard.AutoPushOutputToNetwork,
+            AutoHarvest = true,
+            InputMode = dashboard.InputMode,
+            FilterMode = dashboard.FilterMode,
+            SeedFilterQualifiedItemIds = state.Farm.SeedFilterQualifiedItemIds.ToList(),
+            InputBuffer = state.Farm.InputBuffer.Select(CloneBufferedStack).ToList(),
+            FertilizerQualifiedItemId = state.Farm.BoundFertilizerQualifiedItemId,
+            FertilizerCount = state.Farm.InternalFertilizerCount,
+            InstalledModuleQualifiedItemIds = state.Farm.InstalledModuleQualifiedItemIds.ToList(),
+            ModuleSlotCapacity = dashboard.ModuleSlotsCapacity,
+            Plots = plots
+                .Skip(safeOffset)
+                .Take(limit)
+                .Select(plot => new SvsapmeFarmPlotSnapshot
+                {
+                    PlotIndex = plot.PlotIndex,
+                    SeedQualifiedItemId = plot.SeedQualifiedItemId,
+                    HarvestQualifiedItemId = plot.HarvestQualifiedItemId,
+                    FertilizerQualifiedItemId = plot.FertilizerQualifiedItemId,
+                    LockedSeedQualifiedItemId = plot.LockedSeedQualifiedItemId,
+                    ProgressUnits = plot.ProgressUnits,
+                    RequiredUnits = plot.RequiredUnits,
+                    Ready = plot.Ready,
+                    IsLocked = plot.IsLocked
+                })
+                .ToList(),
+            OutputBuffer = state.OutputBuffer.Select(CloneBufferedStack).ToList(),
+            EstimatedDailyValue = dashboard.EstimatedDailyValue,
+            EstimatedDailyEnergyWh = dashboard.EstimatedDailyEnergyWh
+        };
+    }
+
+    private SvsapmeProcessorMenuSnapshot CreateProcessorMenuSnapshot(
+        MachineState state,
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile,
+        int offset,
+        int limit)
+    {
+        var tier = SingleBlockProcessorRules.GetTier(placedObject.QualifiedItemId);
+        var dashboard = this.singleBlockProcessor.GetDashboard(placedObject, location, tile);
+        var slots = this.singleBlockProcessor.GetSlotViews(placedObject, location, tile);
+        var safeOffset = Math.Clamp(offset, 0, Math.Max(0, tier.Slots - 1));
+        return new SvsapmeProcessorMenuSnapshot
+        {
+            SlotCapacity = tier.Slots,
+            Offset = safeOffset,
+            AutoPullFromNetwork = dashboard.AutoPullFromNetwork,
+            AutoPushOutputToNetwork = dashboard.AutoPushOutputToNetwork,
+            InputMode = dashboard.InputMode,
+            FilterMode = dashboard.FilterMode,
+            FilterQualifiedItemIds = state.Processor.FilterQualifiedItemIds.ToList(),
+            InputBuffer = state.Processor.InputBuffer.Select(CloneBufferedStack).ToList(),
+            OutputBuffer = state.Processor.OutputBuffer.Select(CloneBufferedStack).ToList(),
+            Slots = slots
+                .Skip(safeOffset)
+                .Take(limit)
+                .Select(slot => new SvsapmeProcessorSlotSnapshot
+                {
+                    SlotIndex = slot.SlotIndex,
+                    Input = slot.Input is null ? null : CloneBufferedStack(slot.Input),
+                    Output = slot.Output is null ? null : CloneBufferedStack(slot.Output),
+                    Ready = slot.Ready,
+                    CanEject = slot.CanEject,
+                    CanCollect = slot.CanCollect,
+                    Remaining = slot.Remaining,
+                    Total = slot.Total
+                })
+                .ToList(),
+            EstimatedDailyValue = dashboard.EstimatedDailyValue
+        };
+    }
+
+    private SvsapmePoweredTransferMenuSnapshot CreatePoweredTransferMenuSnapshot(
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile)
+    {
+        var view = this.machineRuntime.GetPoweredTransferMenuView(placedObject);
+        var networkStatus = this.machineRuntime.GetPoweredNetworkStatus(location, tile);
+
+        return new SvsapmePoweredTransferMenuSnapshot
+        {
+            IsBlacklist = view.IsBlacklist,
+            OreDictionaryEnabled = view.OreDictionaryEnabled,
+            QualityStrategy = view.QualityStrategy,
+            FacingDirection = view.FacingDirection,
+            FilterSlots = view.FilterSlots.Select(slot => new SvsapmeFilterSlotSnapshot
+            {
+                SlotIndex = slot.SlotIndex,
+                QualifiedItemId = slot.QualifiedItemId,
+                DisplayName = slot.DisplayName,
+                OreGroups = slot.OreGroups.ToList()
+            }).ToList(),
+            InstalledUpgradeQualifiedItemIds = view.UpgradeSlotQualifiedItemIds.ToList(),
+            UpgradeSlotCapacity = MachineRuntimeService.PoweredTransferUpgradeSlotCount,
+            Throughput = view.Throughput,
+            TransferIntervalTicks = view.TransferIntervalTicks,
+            EnergyPerActionWh = view.EnergyPerActionWh,
+            NetworkOnline = networkStatus.Online,
+            StoredWh = networkStatus.StoredWh,
+            CapacityWh = networkStatus.CapacityWh
+        };
+    }
+
+    private SvsapmeEnergyMonitorSnapshot? CreateEnergyMonitorSnapshot(GameLocation location, Vector2 tile)
+    {
+        var api = this.getSvsapApi();
+        if (api is null
+            || !api.TryGetLinkedEndpoint(location, tile, out var endpoint, out _, out _)
+            || endpoint is null)
+        {
+            return null;
+        }
+
+        var view = this.machineRuntime.GetEnergyMonitorView(endpoint.NetworkId);
+        return new SvsapmeEnergyMonitorSnapshot
+        {
+            NetworkId = endpoint.NetworkId,
+            Online = view.Online,
+            StatusText = view.StatusText,
+            StoredWh = view.StoredWh,
+            CapacityWh = view.CapacityWh,
+            LastTickGeneratedWh = view.LastGeneratedWh,
+            LastTickConsumedWh = view.LastConsumedWh,
+            TodayGeneratedWh = view.TodayGeneratedWh,
+            TodayConsumedWh = view.TodayConsumedWh,
+            LastWarning = view.Warning,
+            Producers = view.Producers.Select(device => new SvsapmeEnergyDeviceSnapshot
+            {
+                DeviceId = device.DeviceId,
+                DisplayName = device.DisplayName,
+                TotalWh = device.Wh,
+                Details = device.Details.ToList()
+            }).ToList(),
+            Consumers = view.Consumers.Select(device => new SvsapmeEnergyDeviceSnapshot
+            {
+                DeviceId = device.DeviceId,
+                DisplayName = device.DisplayName,
+                TotalWh = device.Wh,
+                Details = device.Details.ToList()
+            }).ToList()
+        };
+    }
+
+    private static BufferedItemStack CloneBufferedStack(BufferedItemStack source)
+    {
+        return new BufferedItemStack
+        {
+            QualifiedItemId = source.QualifiedItemId,
+            Stack = source.Stack,
+            Quality = source.Quality,
+            PreservedParentSheetIndex = source.PreservedParentSheetIndex,
+            PreserveType = source.PreserveType,
+            Price = source.Price,
+            Edibility = source.Edibility,
+            Category = source.Category,
+            Type = source.Type,
+            Name = source.Name,
+            DisplayName = source.DisplayName,
+            Color = source.Color,
+            ModData = new Dictionary<string, string>(source.ModData)
+        };
+    }
+
+    private static SvsapmeMachineMenuKind ResolveMenuKind(string qualifiedItemId)
+    {
+        if (SingleBlockProcessorRules.IsProcessorMachine(qualifiedItemId))
+            return SvsapmeMachineMenuKind.Processor;
+
+        if (qualifiedItemId is
+            "(BC)" + ModItemCatalog.CopperFarm
+            or "(BC)" + ModItemCatalog.SteelFarm
+            or "(BC)" + ModItemCatalog.GoldFarm
+            or "(BC)" + ModItemCatalog.IridiumFarm)
+        {
+            return SvsapmeMachineMenuKind.Farm;
+        }
+
+        if (qualifiedItemId is
+            "(BC)" + ModItemCatalog.PoweredImporterCopper
+            or "(BC)" + ModItemCatalog.PoweredImporterSteel
+            or "(BC)" + ModItemCatalog.PoweredImporterGold
+            or "(BC)" + ModItemCatalog.PoweredImporterIridium
+            or "(BC)" + ModItemCatalog.PoweredExporterCopper
+            or "(BC)" + ModItemCatalog.PoweredExporterSteel
+            or "(BC)" + ModItemCatalog.PoweredExporterGold
+            or "(BC)" + ModItemCatalog.PoweredExporterIridium
+            or "(BC)" + ModItemCatalog.PoweredMachineInterfaceCopper
+            or "(BC)" + ModItemCatalog.PoweredMachineInterfaceSteel
+            or "(BC)" + ModItemCatalog.PoweredMachineInterfaceGold
+            or "(BC)" + ModItemCatalog.PoweredMachineInterfaceIridium)
+        {
+            return SvsapmeMachineMenuKind.PoweredTransfer;
+        }
+
+        return qualifiedItemId == "(BC)" + ModItemCatalog.EnergyMonitorTerminal
+            ? SvsapmeMachineMenuKind.EnergyMonitor
+            : SvsapmeMachineMenuKind.Generic;
     }
 
     private List<string> CreateMachineSnapshotLines(MachineState state)
@@ -1131,6 +1784,19 @@ internal sealed class SvsapmeMultiplayerService
             ModText.Get("ui.machine.outputStacks", "Output buffer stacks: {{count}}", new { count = state.OutputBuffer.Count.ToString("N0") })
         };
 
+        foreach (var port in MachinePortCatalog.GetPorts(state.QualifiedItemId))
+        {
+            lines.Add(ModText.Get(
+                "ui.machine.port.line",
+                "Port {{role}}: {{side}} - {{description}}",
+                new
+                {
+                    role = ModText.Get(port.RoleKey, port.RoleKey),
+                    side = ModText.Get(port.SideKey, port.SideKey),
+                    description = ModText.Get(port.DescriptionKey, port.DescriptionKey)
+                }));
+        }
+
         var location = Game1.getLocationFromName(state.LocationName);
         var tile = new Vector2(state.TileX, state.TileY);
         var api = this.getSvsapApi();
@@ -1141,6 +1807,9 @@ internal sealed class SvsapmeMultiplayerService
             && this.energy.TryGetNetworkEnergy(endpoint.NetworkId, out var networkStoredWh, out var networkCapacityWh, out _))
         {
             lines.Add(ModText.Get("hud.energyMonitor.report", "SVSAPME energy: {{storedKwh}}/{{capacityKwh}} kWh.", new { storedKwh = $"{networkStoredWh / 1000m:0.00}", capacityKwh = $"{networkCapacityWh / 1000m:0.00}" }));
+            var telemetry = this.telemetry.GetSnapshot(endpoint.NetworkId);
+            lines.Add(ModText.Get("ui.energyMeter.lastTick", "Last flow: +{{generated}} / -{{consumed}} / net {{net}}", new { generated = FormatWh(telemetry.LastGeneratedWh), consumed = FormatWh(telemetry.LastConsumedWh), net = FormatSignedWh(telemetry.LastNetWh) }));
+            lines.Add(ModText.Get("ui.energyMeter.today", "Today: +{{generated}} / -{{consumed}} / net {{net}}", new { generated = FormatWh(telemetry.TodayGeneratedWh), consumed = FormatWh(telemetry.TodayConsumedWh), net = FormatSignedWh(telemetry.TodayNetWh) }));
         }
 
         if (!string.IsNullOrWhiteSpace(state.Farm.BoundSeedQualifiedItemId)
@@ -1190,6 +1859,17 @@ internal sealed class SvsapmeMultiplayerService
         return lines;
     }
 
+    private static string FormatWh(long wh)
+    {
+        return $"{Math.Max(0, wh) / 1000m:0.00} kWh";
+    }
+
+    private static string FormatSignedWh(long wh)
+    {
+        var sign = wh >= 0 ? "+" : "-";
+        return sign + FormatWh(Math.Abs(wh));
+    }
+
     private static string TryCreateDisplayName(string qualifiedItemId)
     {
         try
@@ -1212,15 +1892,6 @@ internal sealed class SvsapmeMultiplayerService
             ConsumeEscrowedItem = false,
             Message = message
         };
-    }
-
-    private void RestorePendingActionEscrows()
-    {
-        var restored = this.pendingActionEscrows.RestoreAll(RestoreEscrowedItem);
-        this.ClearDurableActionEscrows();
-        this.pendingClientActionsByMachine.Clear();
-        if (restored > 0)
-            this.monitor.Log($"Restored {restored:N0} pending SVSAPME action escrow item(s).", LogLevel.Warn);
     }
 
     private static string LocalizeMachineActionResponse(bool success)
@@ -1283,11 +1954,35 @@ internal sealed class SvsapmeMultiplayerService
             Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.multiplayer.allPlayersNeedMod", "SVSAPME: all players must install this mod for multiplayer SVSAPME gameplay."), HUDMessage.error_type));
     }
 
-    private sealed record PendingClientAction(Guid TransactionId);
+    private sealed class PendingClientAction
+    {
+        public PendingClientAction(SvsapmeMachineActionRequest request)
+        {
+            this.Request = request;
+            this.LastSentTick = Game1.ticks;
+        }
+
+        public Guid TransactionId => this.Request.TransactionId;
+        public SvsapmeMachineActionRequest Request { get; }
+        public int LastSentTick { get; set; }
+        public int RetryCount { get; set; }
+        public bool RetryLimitNotified { get; set; }
+    }
 
     private sealed class PersistentActionEscrowRecord
     {
         public Guid TransactionId { get; set; }
+        public SvsapmeMachineActionRequest? Request { get; set; }
         public BufferedItemStack Item { get; set; } = new();
+    }
+
+    private sealed class DurableRemoteDeliveryRecord
+    {
+        public Guid TransactionId { get; set; }
+        public Guid MachineGuid { get; set; }
+        public string Message { get; set; } = string.Empty;
+        public bool ConsumeEscrowedItem { get; set; }
+        public int CreatedDay { get; set; }
+        public List<BufferedItemStack> ReturnedItems { get; set; } = new();
     }
 }

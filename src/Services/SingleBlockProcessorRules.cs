@@ -70,6 +70,9 @@ internal static class SingleBlockProcessorRules
         while (processor.Slots.Count < tier.Slots)
             processor.Slots.Add(new SingleBlockProcessorSlotState());
 
+        foreach (var slot in processor.Slots)
+            UpdateCaskOutputQuality(slot);
+
         if (processor.Slots.Count > tier.Slots)
         {
             var overflow = processor.Slots.Skip(tier.Slots).ToList();
@@ -107,6 +110,7 @@ internal static class SingleBlockProcessorRules
             return;
 
         slot.RemainingDays = Math.Max(0, slot.RemainingDays - Math.Max(0, elapsedDays));
+        UpdateCaskOutputQuality(slot);
     }
 
     public static bool IsWorking(SingleBlockProcessorSlotState slot)
@@ -117,6 +121,25 @@ internal static class SingleBlockProcessorRules
     public static bool IsReady(SingleBlockProcessorSlotState slot)
     {
         return IsWorking(slot) && slot.RemainingMinutes <= 0 && slot.RemainingDays <= 0;
+    }
+
+    public static bool IsCaskSlot(SingleBlockProcessorSlotState slot)
+    {
+        return IsWorking(slot) && slot.TotalDays > 0;
+    }
+
+    public static bool CanEjectCaskOutput(SingleBlockProcessorSlotState slot)
+    {
+        return IsCaskSlot(slot)
+            && !IsReady(slot)
+            && slot.Input is not null
+            && slot.Output is not null
+            && slot.Output.Quality > slot.Input.Quality;
+    }
+
+    public static bool CanCollect(SingleBlockProcessorSlotState slot, bool includeWorkingCask)
+    {
+        return IsReady(slot) || (includeWorkingCask && IsCaskSlot(slot));
     }
 
     public static int CountActive(SingleBlockProcessorMachineState processor)
@@ -147,6 +170,14 @@ internal static class SingleBlockProcessorRules
     {
         if (IsReady(slot) && slot.Output is not null)
             return slot.Output;
+
+        if (IsCaskSlot(slot)
+            && slot.Input is not null
+            && slot.Output is not null
+            && slot.Output.Quality > slot.Input.Quality)
+        {
+            return slot.Output;
+        }
 
         if (slot.Input is not null)
             return slot.Input;
@@ -247,7 +278,7 @@ internal static class SingleBlockProcessorRules
         var days = GetCaskDaysRemaining(spec, input.Quality);
         var output = input.getOne();
         output.Stack = 1;
-        output.Quality = 4;
+        output.Quality = input.Quality;
         slot = new SingleBlockProcessorSlotState
         {
             Input = BufferedItemCodec.FromItem(input.getOne()),
@@ -259,6 +290,40 @@ internal static class SingleBlockProcessorRules
         };
         message = string.Empty;
         return true;
+    }
+
+    private static void UpdateCaskOutputQuality(SingleBlockProcessorSlotState slot)
+    {
+        if (!IsCaskSlot(slot) || slot.Input is null || slot.Output is null)
+            return;
+
+        var totalDays = GetCaskTotalDays(slot.Input.QualifiedItemId);
+        if (totalDays <= 0)
+            totalDays = Math.Max(1, slot.TotalDays);
+
+        var remaining = Math.Max(0, slot.RemainingDays);
+        var quality = remaining <= 0
+            ? 4
+            : remaining * 2 <= totalDays
+                ? 2
+                : remaining * 4 <= totalDays * 3
+                    ? 1
+                    : Math.Clamp(slot.Input.Quality, 0, 2);
+        slot.Output.Quality = Math.Max(slot.Input.Quality, quality);
+    }
+
+    private static int GetCaskTotalDays(string qualifiedItemId)
+    {
+        return qualifiedItemId switch
+        {
+            "(O)348" => 56,
+            "(O)303" => 34,
+            "(O)346" => 28,
+            "(O)459" => 28,
+            "(O)424" => 14,
+            "(O)426" => 14,
+            _ => 0
+        };
     }
 
     private static bool TryGetKegRecipe(Item input, out KegProcessorRecipe recipe)

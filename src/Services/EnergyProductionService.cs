@@ -56,7 +56,11 @@ internal sealed class EnergyProductionService
                     endpoint.NetworkId,
                     generatedWh,
                     ModItemCatalog.UniqueId,
-                    machine.QualifiedItemId == "(BC)" + ModItemCatalog.SolarNetworkPanel ? "solar-panel-daystarted" : "lightning-capacitor-daystarted",
+                    BuildMachineEnergyReason(
+                        machine,
+                        machine.QualifiedItemId == "(BC)" + ModItemCatalog.SolarNetworkPanel
+                            ? "solar-panel-daystarted"
+                            : "lightning-capacitor-daystarted"),
                     out var acceptedWh,
                     out var code,
                     out var message))
@@ -74,6 +78,11 @@ internal sealed class EnergyProductionService
     {
         _ = location.GetWeather();
         return EnergyProductionRules.GetSolarPanelWh(location.IsOutdoors, location.IsRainingHere(), location.IsLightningHere(), location.GetSeason());
+    }
+
+    private static string BuildMachineEnergyReason(MachineLocation machine, string operation)
+    {
+        return $"machine|{machine.QualifiedItemId}|{machine.MachineGuid:N}|{operation}";
     }
 
     private static long GetLightningCapacitorWh(GameLocation location)

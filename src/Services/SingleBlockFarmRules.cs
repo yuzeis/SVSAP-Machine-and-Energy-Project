@@ -51,6 +51,7 @@ internal static class SingleBlockFarmRules
         FarmModuleSnapshot modules,
         FarmDailyPlan plan)
     {
+        NormalizePlotIndices(farm, tier.Plots);
         var internalSeeds = Math.Min(Math.Max(0, farm.InternalSeedCount), plan.PlannedSeedCount);
         var networkSeeds = Math.Max(0, plan.PlannedSeedCount - internalSeeds);
         var internalFertilizer = Math.Min(Math.Max(0, farm.InternalFertilizerCount), plan.PlannedFertilizerCount);
@@ -58,10 +59,15 @@ internal static class SingleBlockFarmRules
         farm.InternalSeedCount -= internalSeeds;
         farm.InternalFertilizerCount -= internalFertilizer;
 
-        for (var i = 0; i < plan.PlannedSeedCount && farm.Plots.Count < tier.Plots; i++)
+        var freeIndices = Enumerable.Range(0, tier.Plots)
+            .Except(farm.Plots.Select(plot => plot.PlotIndex))
+            .Take(plan.PlannedSeedCount)
+            .ToList();
+        for (var i = 0; i < freeIndices.Count; i++)
         {
             farm.Plots.Add(new FarmPlotState
             {
+                PlotIndex = freeIndices[i],
                 SeedQualifiedItemId = crop.SeedQualifiedItemId,
                 HarvestQualifiedItemId = crop.HarvestQualifiedItemId,
                 PlacedByFarmingLevel = farm.PlacedByFarmingLevel,
@@ -74,23 +80,32 @@ internal static class SingleBlockFarmRules
         if (plan.CanGrowToday)
         {
             var dailyProgress = FarmGrowthRules.GetDailyProgressUnits(modules.LightFactorProduct, modules.HasThermostat ? modules.ThermostatFactor : 1.0m);
-            foreach (var plot in farm.Plots.ToList())
+            foreach (var plot in farm.Plots.OrderBy(plot => plot.PlotIndex).ToList())
             {
+                if (!FarmCropCatalog.TryGetBySeed(plot.SeedQualifiedItemId, out var plotCrop))
+                    plotCrop = crop;
+
                 plot.ProgressUnits += dailyProgress;
-                var baseDays = plot.InRegrow ? crop.RegrowDays : crop.BaseGrowthDays;
+                var baseDays = plot.InRegrow ? plotCrop.RegrowDays : plotCrop.BaseGrowthDays;
                 if (!FarmGrowthRules.IsMature(plot.ProgressUnits, baseDays))
                     continue;
 
                 harvested++;
-                outputStacks += AddHarvestOutput(outputBuffer, farm, crop, plot);
-                if (crop.RegrowDays > 0)
+                outputStacks += AddHarvestOutput(outputBuffer, farm, plotCrop, plot);
+                if (plotCrop.RegrowDays > 0)
                 {
                     plot.ProgressUnits = 0;
                     plot.InRegrow = true;
                 }
                 else
                 {
+                    var lockedSeed = plot.IsLocked ? plot.LockedSeedQualifiedItemId : string.Empty;
+                    var index = plot.PlotIndex;
                     farm.Plots.Remove(plot);
+                    if (!string.IsNullOrWhiteSpace(lockedSeed))
+                    {
+                        farm.PlotLocks[index] = lockedSeed;
+                    }
                 }
             }
         }
@@ -139,6 +154,31 @@ internal static class SingleBlockFarmRules
     public static int CountOccupied(FarmMachineState farm)
     {
         return farm.Plots.Count;
+    }
+
+    public static void NormalizePlotIndices(FarmMachineState farm, int capacity)
+    {
+        farm.PlotLocks ??= new Dictionary<int, string>();
+        var used = new HashSet<int>();
+        var next = 0;
+        foreach (var plot in farm.Plots)
+        {
+            if (plot.PlotIndex < 0 || plot.PlotIndex >= capacity || !used.Add(plot.PlotIndex))
+            {
+                while (next < capacity && used.Contains(next))
+                    next++;
+                plot.PlotIndex = Math.Min(next, Math.Max(0, capacity - 1));
+                used.Add(plot.PlotIndex);
+            }
+
+            if (plot.IsLocked && !string.IsNullOrWhiteSpace(plot.LockedSeedQualifiedItemId))
+                farm.PlotLocks[plot.PlotIndex] = plot.LockedSeedQualifiedItemId;
+        }
+
+        farm.Plots = farm.Plots
+            .Where(plot => plot.PlotIndex >= 0 && plot.PlotIndex < capacity)
+            .OrderBy(plot => plot.PlotIndex)
+            .ToList();
     }
 
     private static bool CanGrowToday(FarmCropSpec crop, FarmModuleSnapshot modules, string season)

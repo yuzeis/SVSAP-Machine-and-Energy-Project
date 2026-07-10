@@ -8,7 +8,8 @@ public enum SvsapmeEnergyErrorCode
     InsufficientEnergy = 3,
     StorageFull = 4,
     SubsystemDisabled = 5,
-    InternalError = 6
+    InternalError = 6,
+    NoEnergyCell = 7
 }
 
 public interface ISvsapmeEnergyApi

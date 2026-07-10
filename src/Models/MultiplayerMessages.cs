@@ -16,19 +16,59 @@ internal enum SvsapmeMachineActionKind
 {
     None,
     ConfigurePoweredFilter,
+    SetPoweredFilterSlot,
+    ClearPoweredFilterSlot,
+    TogglePoweredFilterMode,
+    TogglePoweredOreDictionaryMode,
+    CyclePoweredQualityStrategy,
+    ClearPoweredFilters,
+    SetPoweredFacingDirection,
+    InstallPoweredUpgrade,
+    RemovePoweredUpgrade,
     LoadFarmSeed,
     LoadFarmFertilizer,
+    ExtractFarmSeed,
+    ExtractFarmFertilizer,
     InstallFarmModule,
+    RemoveFarmModule,
+    ToggleFarmAutoPull,
+    ToggleFarmAutoPush,
+    ToggleFarmInputMode,
+    ToggleFarmFilterMode,
+    AddFarmFilter,
+    ClearFarmFilter,
+    PlantFarmPlot,
+    HarvestFarmPlot,
+    ToggleFarmPlotLock,
+    CollectFarmOutput,
     FuelCarbonGenerator,
     StartElectricFurnace,
     StartElectricGeodeCrusher,
     LoadProcessorInput,
+    ExtractProcessorInput,
+    ToggleProcessorAutoPull,
+    ToggleProcessorAutoPush,
+    ToggleProcessorInputMode,
+    ToggleProcessorFilterMode,
+    AddProcessorFilter,
+    ClearProcessorFilter,
     CollectProcessorOutput
+}
+
+internal enum SvsapmeMachineMenuKind
+{
+    Generic,
+    Farm,
+    Processor,
+    PoweredTransfer,
+    EnergyMonitor
 }
 
 internal sealed class SvsapmeMachineSnapshotRequest
 {
     public Guid MachineGuid { get; set; }
+    public int Offset { get; set; }
+    public int Limit { get; set; } = 64;
 }
 
 internal sealed class SvsapmeMachineSnapshotResponse
@@ -47,6 +87,12 @@ internal sealed class SvsapmeMachineSnapshotResponse
     public int OutputBufferStacks { get; set; }
     public bool CanCollectProcessorOutput { get; set; }
     public int ProcessorReadyStacks { get; set; }
+    public long Revision { get; set; }
+    public SvsapmeMachineMenuKind MenuKind { get; set; }
+    public SvsapmeFarmMenuSnapshot? Farm { get; set; }
+    public SvsapmeProcessorMenuSnapshot? Processor { get; set; }
+    public SvsapmePoweredTransferMenuSnapshot? PoweredTransfer { get; set; }
+    public SvsapmeEnergyMonitorSnapshot? EnergyMonitor { get; set; }
     public List<string> Lines { get; set; } = new();
 }
 
@@ -68,6 +114,10 @@ internal sealed class SvsapmeMachineActionRequest
     public string Name { get; set; } = string.Empty;
     public string DisplayName { get; set; } = string.Empty;
     public uint? Color { get; set; }
+    public int SlotIndex { get; set; } = -1;
+    public int Direction { get; set; } = -1;
+    public int Offset { get; set; }
+    public int Limit { get; set; } = 64;
     public Dictionary<string, string> ModData { get; set; } = new();
 }
 
@@ -79,6 +129,117 @@ internal sealed class SvsapmeMachineActionResponse
     public bool ConsumeEscrowedItem { get; set; }
     public string Message { get; set; } = string.Empty;
     public List<BufferedItemStack> ReturnedItems { get; set; } = new();
+    public SvsapmeMachineSnapshotResponse? Snapshot { get; set; }
+}
+
+internal sealed class SvsapmeFarmMenuSnapshot
+{
+    public int PlotCapacity { get; set; }
+    public int Offset { get; set; }
+    public bool AutoPullFromNetwork { get; set; }
+    public bool AutoPushOutputToNetwork { get; set; }
+    public bool AutoHarvest { get; set; } = true;
+    public string InputMode { get; set; } = string.Empty;
+    public string FilterMode { get; set; } = string.Empty;
+    public List<string> SeedFilterQualifiedItemIds { get; set; } = new();
+    public List<BufferedItemStack> InputBuffer { get; set; } = new();
+    public string FertilizerQualifiedItemId { get; set; } = string.Empty;
+    public int FertilizerCount { get; set; }
+    public List<string> InstalledModuleQualifiedItemIds { get; set; } = new();
+    public int ModuleSlotCapacity { get; set; }
+    public List<SvsapmeFarmPlotSnapshot> Plots { get; set; } = new();
+    public List<BufferedItemStack> OutputBuffer { get; set; } = new();
+    public decimal EstimatedDailyValue { get; set; }
+    public long EstimatedDailyEnergyWh { get; set; }
+}
+
+internal sealed class SvsapmeFarmPlotSnapshot
+{
+    public int PlotIndex { get; set; }
+    public string SeedQualifiedItemId { get; set; } = string.Empty;
+    public string HarvestQualifiedItemId { get; set; } = string.Empty;
+    public string FertilizerQualifiedItemId { get; set; } = string.Empty;
+    public string LockedSeedQualifiedItemId { get; set; } = string.Empty;
+    public long ProgressUnits { get; set; }
+    public long RequiredUnits { get; set; }
+    public bool Ready { get; set; }
+    public bool IsLocked { get; set; }
+}
+
+internal sealed class SvsapmeProcessorMenuSnapshot
+{
+    public int SlotCapacity { get; set; }
+    public int Offset { get; set; }
+    public bool AutoPullFromNetwork { get; set; }
+    public bool AutoPushOutputToNetwork { get; set; }
+    public string InputMode { get; set; } = string.Empty;
+    public string FilterMode { get; set; } = string.Empty;
+    public List<string> FilterQualifiedItemIds { get; set; } = new();
+    public List<BufferedItemStack> InputBuffer { get; set; } = new();
+    public List<BufferedItemStack> OutputBuffer { get; set; } = new();
+    public List<SvsapmeProcessorSlotSnapshot> Slots { get; set; } = new();
+    public decimal EstimatedDailyValue { get; set; }
+}
+
+internal sealed class SvsapmeProcessorSlotSnapshot
+{
+    public int SlotIndex { get; set; }
+    public BufferedItemStack? Input { get; set; }
+    public BufferedItemStack? Output { get; set; }
+    public bool Ready { get; set; }
+    public bool CanEject { get; set; }
+    public bool CanCollect { get; set; }
+    public int Remaining { get; set; }
+    public int Total { get; set; }
+}
+
+internal sealed class SvsapmePoweredTransferMenuSnapshot
+{
+    public bool IsBlacklist { get; set; }
+    public bool OreDictionaryEnabled { get; set; }
+    public string QualityStrategy { get; set; } = string.Empty;
+    public int FacingDirection { get; set; } = -1;
+    public List<SvsapmeFilterSlotSnapshot> FilterSlots { get; set; } = new();
+    public List<string> InstalledUpgradeQualifiedItemIds { get; set; } = new();
+    public int UpgradeSlotCapacity { get; set; }
+    public int Throughput { get; set; }
+    public int TransferIntervalTicks { get; set; }
+    public decimal EnergyPerActionWh { get; set; }
+    public bool NetworkOnline { get; set; }
+    public long StoredWh { get; set; }
+    public long CapacityWh { get; set; }
+}
+
+internal sealed class SvsapmeFilterSlotSnapshot
+{
+    public int SlotIndex { get; set; }
+    public string QualifiedItemId { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public List<string> OreGroups { get; set; } = new();
+}
+
+internal sealed class SvsapmeEnergyMonitorSnapshot
+{
+    public Guid NetworkId { get; set; }
+    public bool Online { get; set; }
+    public string StatusText { get; set; } = string.Empty;
+    public long StoredWh { get; set; }
+    public long CapacityWh { get; set; }
+    public long LastTickGeneratedWh { get; set; }
+    public long LastTickConsumedWh { get; set; }
+    public long TodayGeneratedWh { get; set; }
+    public long TodayConsumedWh { get; set; }
+    public string LastWarning { get; set; } = string.Empty;
+    public List<SvsapmeEnergyDeviceSnapshot> Producers { get; set; } = new();
+    public List<SvsapmeEnergyDeviceSnapshot> Consumers { get; set; } = new();
+}
+
+internal sealed class SvsapmeEnergyDeviceSnapshot
+{
+    public string DeviceId { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public long TotalWh { get; set; }
+    public List<string> Details { get; set; } = new();
 }
 
 internal sealed class SvsapmeMachineDeliveryAck
@@ -113,5 +274,10 @@ internal sealed class SvsapmeEnergyDebugResponse
     public string Message { get; set; } = string.Empty;
     public long StoredWh { get; set; }
     public long CapacityWh { get; set; }
+    public long LastTickGeneratedWh { get; set; }
+    public long LastTickConsumedWh { get; set; }
+    public long TodayGeneratedWh { get; set; }
+    public long TodayConsumedWh { get; set; }
+    public string LastWarning { get; set; } = string.Empty;
     public string Code { get; set; } = string.Empty;
 }

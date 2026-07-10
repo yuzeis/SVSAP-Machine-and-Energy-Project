@@ -72,6 +72,7 @@ internal sealed class SvsapmeSelfTestService
             "farm-crop-set" => TestFarmCropSet(),
             "farm-power-freeze" => TestFarmPowerFreeze(),
             "farm-daily-progress" => TestFarmDailyProgress(),
+            "farm-mixed-lock-production" => TestFarmMixedLockProduction(),
             "farm-single-crop-budget" => TestFarmEnergyBudgetRules(),
             "farm-module-economy" => TestFarmModuleEconomy(),
             "farm-fertilizer-quality" => TestFarmFertilizerQuality(),
@@ -86,6 +87,9 @@ internal sealed class SvsapmeSelfTestService
             "battery-discharge-gate" => TestBatteryDischargeGate(),
             "electric-machine-rules" => TestElectricMachineRules(),
             "gui-layout-bounds" => TestGuiLayoutBounds(),
+            "single-block-real-state-text-fit" => TestSingleBlockRealStateTextFit(),
+            "machine-port-definition-contract" => TestMachinePortDefinitionContract(),
+            "energy-telemetry-contract" => TestEnergyTelemetryContract(),
             "b10-parity" => SvsapmeBalanceTable.ValidateParity(),
             "no-arbitrage-audit" => SvsapmeBalanceTable.ValidateNoArbitrage(),
             _ => new[] { $"case is not implemented in the SVSAPME selftest harness: {testCase}" }
@@ -103,8 +107,8 @@ internal sealed class SvsapmeSelfTestService
         }
 
         var processorCompact = SingleBlockProcessorMenu.CalculateLayoutShape(menuWidth: 752, menuHeight: 672);
-        if (processorCompact.Columns < 4 || processorCompact.Rows < 6 || processorCompact.PageSize != processorCompact.Columns * processorCompact.Rows)
-            failures.Add("single-block processor compact layout must preserve a useful paged work-grid shape");
+        if (processorCompact.Columns < 5 || processorCompact.Rows < 4 || processorCompact.PageSize != processorCompact.Columns * processorCompact.Rows)
+            failures.Add("single-block processor compact layout must preserve a useful paged work-grid above the 12x3 backpack");
 
         if (!SingleBlockFarmMenu.LayoutFits(menuWidth: 930, menuHeight: 660)
             || !SingleBlockFarmMenu.LayoutFits(menuWidth: 752, menuHeight: 660))
@@ -113,11 +117,108 @@ internal sealed class SvsapmeSelfTestService
         }
 
         var farmCompact = SingleBlockFarmMenu.CalculateLayoutShape(menuWidth: 752, menuHeight: 660);
-        if (farmCompact.Columns < 5 || farmCompact.Rows < 7 || farmCompact.PageSize != farmCompact.Columns * farmCompact.Rows)
-            failures.Add("single-block farm compact layout must preserve a useful paged plot-grid shape");
+        if (farmCompact.Columns < 6 || farmCompact.Rows < 5 || farmCompact.PageSize != farmCompact.Columns * farmCompact.Rows)
+            failures.Add("single-block farm compact layout must preserve a useful paged plot-grid above the 12x3 backpack");
 
         if (!PoweredTransferMenu.LayoutFits(menuWidth: 1040) || !PoweredTransferMenu.LayoutFits(menuWidth: 720))
             failures.Add("powered importer/exporter menu controls must wrap instead of overflowing compact UI widths");
+
+        if (!RemoteMachineControlMenu.PoweredLayoutFits(menuWidth: 720, contentHeight: 374))
+            failures.Add("remote powered-transfer upgrades and two-column controls must stay above the compact 800x720 backpack area");
+
+        return failures;
+    }
+
+    private static IReadOnlyList<string> TestSingleBlockRealStateTextFit()
+    {
+        var failures = new List<string>();
+
+        if (SvsapmeUiText.FormatInputMode(MachineInputModes.AllEligible).Equals(MachineInputModes.AllEligible, StringComparison.Ordinal)
+            || SvsapmeUiText.FormatFilterMode(MachineFilterModes.Whitelist).Equals(MachineFilterModes.Whitelist, StringComparison.Ordinal))
+        {
+            failures.Add("single-block menus must render localized short labels instead of raw enum names");
+        }
+
+        if (typeof(SvsapmeUiText).GetMethod("DrawFittedLine") is null
+            || typeof(SvsapmeUiText).GetMethod("DrawFittedLines") is null)
+        {
+            failures.Add("single-block menus must use fitted small-font drawing helpers for localized status text");
+        }
+
+        if (SvsapmeUiText.FormatDayValue(123456m).Contains("Day ", StringComparison.Ordinal))
+            failures.Add("single-block daily value label must use compact localized text instead of the old Day prefix");
+
+        return failures;
+    }
+
+    private static IReadOnlyList<string> TestMachinePortDefinitionContract()
+    {
+        var failures = new List<string>();
+        var machineIds = new[]
+        {
+            ModItemCatalog.CarbonGenerator,
+            ModItemCatalog.SolarNetworkPanel,
+            ModItemCatalog.LightningCapacitor,
+            ModItemCatalog.CopperEnergyCell,
+            ModItemCatalog.IridiumEnergyCell,
+            ModItemCatalog.BatterySynthesizer,
+            ModItemCatalog.BatteryDischarger,
+            ModItemCatalog.EnergyMonitorTerminal,
+            ModItemCatalog.PoweredImporterCopper,
+            ModItemCatalog.PoweredExporterCopper,
+            ModItemCatalog.PoweredMachineInterfaceCopper,
+            ModItemCatalog.ElectricFurnace,
+            ModItemCatalog.ElectricGeodeCrusher,
+            ModItemCatalog.CopperFarm,
+            ModItemCatalog.IridiumFarm,
+            ModItemCatalog.CopperKeg,
+            ModItemCatalog.IridiumKeg,
+            ModItemCatalog.CopperCask,
+            ModItemCatalog.IridiumCask
+        };
+
+        foreach (var machineId in machineIds)
+        {
+            if (!MachinePortCatalog.HasRequiredPorts("(BC)" + machineId))
+                failures.Add($"{machineId} must have visible machine port definitions");
+        }
+
+        var carbonPorts = MachinePortCatalog.GetPorts("(BC)" + ModItemCatalog.CarbonGenerator);
+        if (!carbonPorts.Any(port => port.RoleKey == "ui.machine.port.fuelIn")
+            || !carbonPorts.Any(port => port.RoleKey == "ui.machine.port.energyOut"))
+        {
+            failures.Add("Carbon Generator must expose fuel input and energy output ports");
+        }
+
+        return failures;
+    }
+
+    private static IReadOnlyList<string> TestEnergyTelemetryContract()
+    {
+        var failures = new List<string>();
+        var telemetry = new EnergyTelemetryService();
+        var networkId = Guid.NewGuid();
+        telemetry.RecordDeposit(networkId, "test-producer", "selftest", 1000, 750, SvsapmeEnergyErrorCode.None, "ok");
+        telemetry.RecordConsume(networkId, "test-consumer", "selftest", 250, 250, SvsapmeEnergyErrorCode.None, "ok");
+        telemetry.RecordDeposit(networkId, "test-producer", "full", 100, 0, SvsapmeEnergyErrorCode.StorageFull, "storage full");
+        var snapshot = telemetry.GetSnapshot(networkId);
+
+        if (snapshot.TodayGeneratedWh != 750 || snapshot.TodayConsumedWh != 250 || snapshot.TodayNetWh != 500)
+            failures.Add("energy telemetry must aggregate generated, consumed, and net Wh for the current day");
+        if (snapshot.TopProducers.Count == 0
+            || snapshot.TopProducers[0].Reason != "selftest"
+            || snapshot.TopProducers[0].DeviceId != "test-producer:selftest")
+        {
+            failures.Add("energy telemetry must keep producer device and reason totals");
+        }
+        if (snapshot.TopConsumers.Count == 0
+            || snapshot.TopConsumers[0].Reason != "selftest"
+            || snapshot.TopConsumers[0].DeviceId != "test-consumer:selftest")
+        {
+            failures.Add("energy telemetry must keep consumer device and reason totals");
+        }
+        if (string.IsNullOrWhiteSpace(snapshot.LastWarning))
+            failures.Add("energy telemetry must preserve the latest user-visible warning");
 
         return failures;
     }
@@ -164,7 +265,8 @@ internal sealed class SvsapmeSelfTestService
                      (nameof(SvsapmeEnergyErrorCode.InsufficientEnergy), 3),
                      (nameof(SvsapmeEnergyErrorCode.StorageFull), 4),
                      (nameof(SvsapmeEnergyErrorCode.SubsystemDisabled), 5),
-                     (nameof(SvsapmeEnergyErrorCode.InternalError), 6)
+                     (nameof(SvsapmeEnergyErrorCode.InternalError), 6),
+                     (nameof(SvsapmeEnergyErrorCode.NoEnergyCell), 7)
                  })
         {
             if (!Enum.TryParse<SvsapmeEnergyErrorCode>(name, out var parsed) || (int)parsed != expected)
@@ -246,6 +348,35 @@ internal sealed class SvsapmeSelfTestService
             failures.Add("machine snapshot responses must carry host-authored display text for farmhand status menus");
         }
 
+        if (typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.MenuKind))?.PropertyType != typeof(SvsapmeMachineMenuKind)
+            || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.Farm))?.PropertyType != typeof(SvsapmeFarmMenuSnapshot)
+            || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.Processor))?.PropertyType != typeof(SvsapmeProcessorMenuSnapshot)
+            || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.PoweredTransfer))?.PropertyType != typeof(SvsapmePoweredTransferMenuSnapshot)
+            || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.EnergyMonitor))?.PropertyType != typeof(SvsapmeEnergyMonitorSnapshot))
+        {
+            failures.Add("machine snapshots must carry structured farm, processor, powered-transfer, and energy-monitor menu state");
+        }
+
+        if (typeof(SvsapmeProcessorSlotSnapshot).GetProperty(nameof(SvsapmeProcessorSlotSnapshot.CanEject))?.PropertyType != typeof(bool)
+            || typeof(SvsapmeProcessorSlotSnapshot).GetProperty(nameof(SvsapmeProcessorSlotSnapshot.CanCollect))?.PropertyType != typeof(bool))
+        {
+            failures.Add("processor snapshots must expose intermediate cask eject and collect-all state");
+        }
+
+        if (typeof(SvsapmePoweredTransferMenuSnapshot).GetProperty(nameof(SvsapmePoweredTransferMenuSnapshot.InstalledUpgradeQualifiedItemIds))?.PropertyType != typeof(List<string>)
+            || typeof(SvsapmePoweredTransferMenuSnapshot).GetProperty(nameof(SvsapmePoweredTransferMenuSnapshot.UpgradeSlotCapacity))?.PropertyType != typeof(int)
+            || typeof(SvsapmePoweredTransferMenuSnapshot).GetProperty(nameof(SvsapmePoweredTransferMenuSnapshot.NetworkOnline))?.PropertyType != typeof(bool)
+            || typeof(SvsapmePoweredTransferMenuSnapshot).GetProperty(nameof(SvsapmePoweredTransferMenuSnapshot.StoredWh))?.PropertyType != typeof(long)
+            || typeof(SvsapmePoweredTransferMenuSnapshot).GetProperty(nameof(SvsapmePoweredTransferMenuSnapshot.CapacityWh))?.PropertyType != typeof(long))
+        {
+            failures.Add("powered-transfer snapshots must expose physical upgrade slots plus live network energy state");
+        }
+
+        if (typeof(SvsapmeEnergyDeviceSnapshot).GetProperty(nameof(SvsapmeEnergyDeviceSnapshot.Details))?.PropertyType != typeof(List<string>)
+            || typeof(SvsapmeEnergyMonitorSnapshot).GetProperty(nameof(SvsapmeEnergyMonitorSnapshot.Online))?.PropertyType != typeof(bool)
+            || typeof(SvsapmeEnergyMonitorSnapshot).GetProperty(nameof(SvsapmeEnergyMonitorSnapshot.StatusText))?.PropertyType != typeof(string))
+            failures.Add("energy-device snapshots must carry localized port and usage tooltip details");
+
         if (typeof(SvsapmeMachineActionResponse).GetProperty(nameof(SvsapmeMachineActionResponse.ReturnedItems))?.PropertyType != typeof(List<BufferedItemStack>))
             failures.Add("machine action responses must carry returned item payloads for farmhand processor collection");
 
@@ -263,18 +394,39 @@ internal sealed class SvsapmeSelfTestService
             failures.Add("host pending remote deliveries must have a day-start expiry path that prunes confirmed stale payloads without automatic duplication");
         }
 
+        if (typeof(SvsapmeMultiplayerService).GetMethod("QueueDurableRemoteDeliveryForPlayer", nonPublicInstance) is null
+            || typeof(SvsapmeMultiplayerService).GetMethod("RestoreDurableRemoteDeliveries", nonPublicInstance)?.ReturnType != typeof(int))
+        {
+            failures.Add("expired unconfirmed SVSAPME deliveries must move to a player mailbox and restore on save load instead of staying in host pending forever");
+        }
+
         if (typeof(SvsapmeMultiplayerService).GetField("PendingDeliveryRetentionDays", nonPublicStatic)?.GetRawConstantValue() is not int retentionDays
             || retentionDays <= 0)
         {
             failures.Add("pending remote delivery expiry must use a positive retention window");
         }
 
+        if (typeof(SvsapmeMultiplayerService).GetField("DurableRemoteDeliveryModDataKey", nonPublicStatic)?.GetRawConstantValue() is not string deliveryMailboxKey
+            || string.IsNullOrWhiteSpace(deliveryMailboxKey))
+        {
+            failures.Add("durable remote delivery mailbox must use a stable player modData key");
+        }
+
         if (typeof(SvsapmeMultiplayerService).GetField("PersistentActionEscrowModDataKey", nonPublicStatic)?.GetRawConstantValue() is not string escrowKey
             || string.IsNullOrWhiteSpace(escrowKey)
-            || typeof(SvsapmeMultiplayerService).GetMethod("RestoreDurableActionEscrows", nonPublicInstance)?.ReturnType != typeof(int)
+            || typeof(SvsapmeMultiplayerService).GetMethod("RehydrateDurableActionEscrows", nonPublicInstance)?.ReturnType != typeof(int)
             || typeof(SvsapmeMultiplayerService).GetMethod("TrackDurableActionEscrow", nonPublicInstance)?.ReturnType != typeof(bool))
         {
-            failures.Add("farmhand item escrow must have a durable restore path across save/load or crash windows");
+            failures.Add("farmhand item escrow must rehydrate and replay the same transaction across save/load or crash windows");
+        }
+
+        if (typeof(SvsapmeMultiplayerService).GetMethod(nameof(SvsapmeMultiplayerService.OnUpdateTicked)) is null
+            || typeof(SvsapmeMultiplayerService).GetField("ClientActionResponseTimeoutTicks", nonPublicStatic)?.GetRawConstantValue() is not int timeoutTicks
+            || timeoutTicks <= 0
+            || typeof(SvsapmeMultiplayerService).GetField("ClientActionRetryLimit", nonPublicStatic)?.GetRawConstantValue() is not int retryLimit
+            || retryLimit <= 0)
+        {
+            failures.Add("farmhand action reconciliation must use a positive timeout and bounded retry limit");
         }
 
         if (typeof(MachineSaveData).GetProperty(nameof(MachineSaveData.SchemaVersion))?.PropertyType != typeof(int))
@@ -339,17 +491,21 @@ internal sealed class SvsapmeSelfTestService
     private static IReadOnlyList<string> TestEscrowRestore()
     {
         var failures = new List<string>();
-        if (!SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.ConfigurePoweredFilter)
-            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadFarmSeed)
+        if (!SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadFarmSeed)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadFarmFertilizer)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.InstallFarmModule)
+            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.PlantFarmPlot)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.FuelCarbonGenerator)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.StartElectricFurnace)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.StartElectricGeodeCrusher)
-            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadProcessorInput))
+            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadProcessorInput)
+            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.InstallPoweredUpgrade))
         {
             failures.Add("item-bearing SVSAPME machine actions must be escrow candidates");
         }
+
+        if (SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.ConfigurePoweredFilter))
+            failures.Add("powered transfer ghost filters must not consume or escrow the selected inventory item");
 
         if (SvsapmeActionEscrowRules.GetPrimaryEscrowCount(SvsapmeMachineActionKind.StartElectricFurnace, 5) != 5
             || SvsapmeActionEscrowRules.GetPrimaryEscrowCount(SvsapmeMachineActionKind.StartElectricGeodeCrusher, 1) != 1)
@@ -415,6 +571,8 @@ internal sealed class SvsapmeSelfTestService
         var fuel = typeof(MachineRuntimeService).GetMethod("TryFuelCarbonGenerator", nonPublicInstance);
         var startFurnace = typeof(MachineRuntimeService).GetMethod("TryStartElectricFurnaceManualUse", nonPublicInstance);
         var startGeodeCrusher = typeof(MachineRuntimeService).GetMethod("TryStartElectricGeodeCrusherManualUse", nonPublicInstance);
+        var installPoweredUpgrade = typeof(MachineRuntimeService).GetMethod("TryInstallPoweredUpgrade", nonPublicInstance);
+        var removePoweredUpgrade = typeof(MachineRuntimeService).GetMethod("TryRemovePoweredUpgrade", nonPublicInstance);
         var loadSeed = typeof(SingleBlockFarmService).GetMethod("TryLoadSeed", nonPublicInstance);
         var loadFertilizer = typeof(SingleBlockFarmService).GetMethod("TryLoadFertilizer", nonPublicInstance);
         var installModule = typeof(SingleBlockFarmService).GetMethod("TryInstallModule", nonPublicInstance);
@@ -429,6 +587,12 @@ internal sealed class SvsapmeSelfTestService
 
         if (startGeodeCrusher?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
             failures.Add("MachineRuntimeService must expose host-dispatchable Electric Geode Crusher starts");
+
+        if (installPoweredUpgrade?.ReturnType != typeof(SvsapmeMachineActionApplyResult)
+            || removePoweredUpgrade?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
+        {
+            failures.Add("MachineRuntimeService must expose host-dispatchable powered upgrade insert/eject actions");
+        }
 
         if (loadSeed?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
             failures.Add("SingleBlockFarmService must expose host-dispatchable seed loading");
@@ -476,7 +640,9 @@ internal sealed class SvsapmeSelfTestService
         if (typeof(SvsapmeMultiplayerService).GetMethod("TrySendMachineItemMovementReport", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic) is null)
             failures.Add("SvsapmeMultiplayerService must expose a client item-movement reporter for farmhand machine items");
 
-        if (typeof(SvsapmeMultiplayerService).GetMethod("TrySendMachineSnapshotRequest", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic) is null
+        var snapshotRequestMethods = typeof(SvsapmeMultiplayerService).GetMethods(
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+        if (!snapshotRequestMethods.Any(method => method.Name == "TrySendMachineSnapshotRequest" && method.ReturnType == typeof(bool))
             || typeof(SvsapmeMultiplayerService).GetMethod("CreateMachineSnapshotResponse", nonPublicInstance)?.ReturnType != typeof(SvsapmeMachineSnapshotResponse))
         {
             failures.Add("SvsapmeMultiplayerService must expose host-authored machine snapshots for farmhand status menus");
@@ -683,6 +849,72 @@ internal sealed class SvsapmeSelfTestService
 
         if (FarmGrowthRules.IsMature(daily * 20, 28))
             failures.Add("daily progress model should not mature before the ceil-formula day");
+
+        return failures;
+    }
+
+    private static IReadOnlyList<string> TestFarmMixedLockProduction()
+    {
+        var failures = new List<string>();
+        var parsnip = FarmCropCatalog.AcceptanceCrops.First(candidate => candidate.SeedQualifiedItemId == "(O)472");
+        var ancient = FarmCropCatalog.AcceptanceCrops.First(candidate => candidate.SeedQualifiedItemId == "(O)499");
+        var tier = EnergyTierTable.Farms.Single(entry => entry.Tier == EnergyTier.Copper);
+        var modules = new FarmModuleSnapshot(0, 1.0m, false, 1.0m, 0, 1);
+        var farm = new FarmMachineState { PlacedByFarmingLevel = 10 };
+        farm.PlotLocks[3] = ancient.SeedQualifiedItemId;
+        farm.InputBuffer.Add(BufferedItemCodec.FromItem(ItemRegistry.Create(ancient.SeedQualifiedItemId)));
+        farm.InputBuffer.Add(BufferedItemCodec.FromItem(ItemRegistry.Create(parsnip.SeedQualifiedItemId)));
+
+        var order = SingleBlockFarmService.GetMixedFarmPlantingOrder(farm, tier.Plots);
+        if (order.Count == 0 || order[0] != 3)
+            failures.Add("mixed farm production planner must service locked empty plots before unlocked plots");
+
+        if (!SingleBlockFarmService.TryTakeBufferedSeed(farm, modules, "spring", farm.PlotLocks[3], out var lockedSeed, out var lockedCrop)
+            || lockedCrop.SeedQualifiedItemId != ancient.SeedQualifiedItemId)
+        {
+            failures.Add("locked mixed farm plot must consume only its matching buffered seed");
+        }
+        else
+        {
+            var plannedLocked = new PlannedFarmSeed(lockedSeed, lockedCrop, FarmSeedSource.InputBuffer, 10, 3);
+            if (!SingleBlockFarmService.TryApplyPlannedFarmSeed(farm, tier, plannedLocked)
+                || farm.Plots.Single(plot => plot.PlotIndex == 3) is not { IsLocked: true } lockedPlot
+                || lockedPlot.LockedSeedQualifiedItemId != ancient.SeedQualifiedItemId)
+            {
+                failures.Add("production planting helper must preserve the locked crop identity on the created plot");
+            }
+        }
+
+        if (!SingleBlockFarmService.TryTakeBufferedSeed(farm, modules, "spring", string.Empty, out var openSeed, out var openCrop)
+            || openCrop.SeedQualifiedItemId != parsnip.SeedQualifiedItemId
+            || !SingleBlockFarmService.TryApplyPlannedFarmSeed(farm, tier, new PlannedFarmSeed(openSeed, openCrop, FarmSeedSource.InputBuffer, 10, 0)))
+        {
+            failures.Add("mixed farm production helper must plant a different eligible crop into an unlocked plot");
+        }
+
+        foreach (var plot in farm.Plots)
+        {
+            var crop = plot.PlotIndex == 3 ? ancient : parsnip;
+            plot.ProgressUnits = FarmGrowthRules.GetRequiredProgressUnits(crop.BaseGrowthDays) - FarmGrowthRules.GetDailyProgressUnits(1.0m, 1.0m);
+        }
+
+        var output = new List<BufferedItemStack>();
+        if (!SingleBlockFarmService.ApplyMixedFarmGrowth(farm, output, modules, "spring"))
+            failures.Add("mixed farm production growth helper must advance and harvest active plots");
+
+        if (!farm.PlotLocks.TryGetValue(3, out var lockedSeedId)
+            || lockedSeedId != ancient.SeedQualifiedItemId
+            || farm.Plots.All(plot => plot.PlotIndex != 3))
+        {
+            failures.Add("locked regrow plot must remain assigned to its crop after production-path harvest");
+        }
+
+        if (farm.Plots.Any(plot => plot.PlotIndex == 0)
+            || output.All(stack => stack.QualifiedItemId != parsnip.HarvestQualifiedItemId)
+            || output.All(stack => stack.QualifiedItemId != ancient.HarvestQualifiedItemId))
+        {
+            failures.Add("mixed production harvest must remove non-regrow plots and buffer each crop's own output");
+        }
 
         return failures;
     }
@@ -912,10 +1144,26 @@ internal sealed class SvsapmeSelfTestService
         var wine = ItemRegistry.Create("(O)348", 1);
         wine.Quality = 0;
         if (!SingleBlockProcessorRules.TryCreateJob(SingleBlockProcessorKind.Cask, wine, out var caskSlot, out _)
-            || caskSlot.Output?.Quality != 4
+            || caskSlot.Output?.Quality != 0
             || caskSlot.RemainingDays != 56)
         {
-            failures.Add("single-block cask must age normal wine to iridium over 56 days");
+            failures.Add("single-block cask must begin normal wine at its real current quality with 56 days remaining");
+        }
+        else
+        {
+            SingleBlockProcessorRules.AdvanceCaskSlot(caskSlot, 14);
+            if (caskSlot.Output?.Quality != 1 || !SingleBlockProcessorRules.CanEjectCaskOutput(caskSlot))
+                failures.Add("single-block cask must expose a manual eject point when wine reaches silver quality");
+            if (SingleBlockProcessorRules.GetRecoverableStack(caskSlot)?.Quality != 1)
+                failures.Add("interrupting a cask after a milestone must recover the achieved quality");
+
+            SingleBlockProcessorRules.AdvanceCaskSlot(caskSlot, 14);
+            if (caskSlot.Output?.Quality != 2 || !SingleBlockProcessorRules.CanEjectCaskOutput(caskSlot))
+                failures.Add("single-block cask must expose a manual eject point when wine reaches gold quality");
+
+            SingleBlockProcessorRules.AdvanceCaskSlot(caskSlot, 28);
+            if (caskSlot.Output?.Quality != 4 || !SingleBlockProcessorRules.IsReady(caskSlot))
+                failures.Add("single-block cask must finish wine at iridium quality after 56 days");
         }
 
         var iridiumWine = ItemRegistry.Create("(O)348", 1);
@@ -1524,6 +1772,21 @@ internal sealed class SvsapmeSelfTestService
         if (plan.RequiredHalfWh != 16 || plan.WhToConsume != 8 || plan.CreditAfterPrepay != 0)
             failures.Add("even powered transfer batches must debit exact half-Wh cost as whole Wh");
 
+        var capacityBoosted = PoweredTransferRules.PlanImporterExporter(
+            sourceAvailable: 64,
+            targetCapacity: 64,
+            PoweredMachineTier.Copper,
+            storedWh: 16,
+            halfWhCredit: 0,
+            prototypeThroughput: 4,
+            poweredThroughputMultiplier: 2);
+        if (capacityBoosted.Mode != PoweredTransferRunMode.Powered
+            || capacityBoosted.PlannedItems != 32
+            || capacityBoosted.WhToConsume != 16)
+        {
+            failures.Add("capacity-card multiplier must double paid powered throughput without changing per-item energy cost");
+        }
+
         var oddPayment = PoweredTransferRules.CreatePayment(plannedItems: 5, halfWhCredit: 0);
         if (oddPayment.WhToConsume != 3 || oddPayment.CreditAfterPrepay != 1)
             failures.Add("odd powered transfer batches must prepay one whole Wh and carry one half-Wh credit");
@@ -1619,6 +1882,13 @@ internal sealed class SvsapmeSelfTestService
         if (!PoweredMachineInterfaceRules.CanRunPoweredAction(1))
             failures.Add("powered interface should run one powered action with one stored Wh");
 
+        var nonPublicStatic = System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic;
+        if (typeof(MachineRuntimeService).GetMethod("GetChestSlotCapacity", nonPublicStatic)?.ReturnType != typeof(int)
+            || typeof(MachineRuntimeService).GetMethod("TryGetChestActualCapacity", nonPublicStatic)?.ReturnType != typeof(int))
+        {
+            failures.Add("powered importer/exporter chest capacity must use the game's actual chest capacity path before falling back to vanilla baselines");
+        }
+
         return failures;
     }
 
@@ -1694,6 +1964,7 @@ internal sealed class SvsapmeSelfTestService
         "farm-crop-set",
         "farm-power-freeze",
         "farm-daily-progress",
+        "farm-mixed-lock-production",
         "farm-single-crop-budget",
         "farm-module-economy",
         "farm-fertilizer-quality",
@@ -1708,6 +1979,9 @@ internal sealed class SvsapmeSelfTestService
         "battery-discharge-gate",
         "electric-machine-rules",
         "gui-layout-bounds",
+        "single-block-real-state-text-fit",
+        "machine-port-definition-contract",
+        "energy-telemetry-contract",
         "b10-parity",
         "no-arbitrage-audit"
     };

@@ -1,3 +1,4 @@
+using System.Linq;
 using SVSAPME.Models;
 using StardewModdingAPI;
 
@@ -6,7 +7,7 @@ namespace SVSAPME.Services;
 internal sealed class MachineStateRepository
 {
     private const string SaveKey = "machines";
-    private const int CurrentSchemaVersion = 3;
+    private const int CurrentSchemaVersion = 5;
 
     private readonly IModHelper helper;
     private readonly IMonitor monitor;
@@ -91,6 +92,8 @@ internal sealed class MachineStateRepository
             state.OutputBuffer ??= new();
             state.Farm ??= new();
             state.Farm.InputBuffer ??= new();
+            state.Farm.Plots ??= new();
+            state.Farm.PlotLocks ??= new();
             state.Farm.SeedFilterQualifiedItemIds ??= new();
             state.Farm.FertilizerFilterQualifiedItemIds ??= new();
             NormalizeMachineFilterState(state.Farm);
@@ -106,6 +109,23 @@ internal sealed class MachineStateRepository
                 changed = true;
             }
 
+            if (originalSchemaVersion < 5)
+            {
+                changed |= NormalizeFarmPlots(state.Farm);
+            }
+
+            foreach (var plot in state.Farm.Plots.Where(plot => plot.IsLocked && !string.IsNullOrWhiteSpace(plot.LockedSeedQualifiedItemId)))
+                state.Farm.PlotLocks[plot.PlotIndex] = plot.LockedSeedQualifiedItemId;
+
+            if (originalSchemaVersion < 4
+                && state.Farm.AutoPullFromNetwork
+                && string.Equals(state.Farm.InputMode, MachineInputModes.AllEligible, StringComparison.Ordinal)
+                && state.Farm.SeedFilterQualifiedItemIds.Count == 0)
+            {
+                state.Farm.AutoPullFromNetwork = false;
+                changed = true;
+            }
+
             if (originalSchemaVersion < 3
                 && state.Processor.AutoPullFromNetwork
                 && string.Equals(state.Processor.InputMode, MachineInputModes.AllEligible, StringComparison.Ordinal)
@@ -116,6 +136,63 @@ internal sealed class MachineStateRepository
             }
 
             state.ModData ??= new();
+        }
+
+        return changed;
+    }
+
+    private static bool NormalizeFarmPlots(FarmMachineState farm)
+    {
+        if (farm.Plots is null)
+        {
+            farm.Plots = new();
+            return true;
+        }
+
+        var changed = false;
+        var normalized = new List<FarmPlotState>(farm.Plots.Count);
+        var usedIndexes = new HashSet<int>();
+        var nextIndex = 0;
+
+        foreach (var plot in farm.Plots)
+        {
+            if (plot is null)
+            {
+                changed = true;
+                continue;
+            }
+
+            plot.SeedQualifiedItemId ??= string.Empty;
+            plot.HarvestQualifiedItemId ??= string.Empty;
+            plot.FertilizerQualifiedItemId ??= string.Empty;
+            plot.LockedSeedQualifiedItemId ??= string.Empty;
+
+            var assignedIndex = plot.PlotIndex;
+            if (assignedIndex < 0 || !usedIndexes.Add(assignedIndex))
+            {
+                while (usedIndexes.Contains(nextIndex))
+                    nextIndex++;
+
+                assignedIndex = nextIndex++;
+                if (plot.PlotIndex != assignedIndex)
+                {
+                    plot.PlotIndex = assignedIndex;
+                    changed = true;
+                }
+            }
+            else
+            {
+                nextIndex = Math.Max(nextIndex, assignedIndex + 1);
+            }
+
+            normalized.Add(plot);
+        }
+
+        normalized.Sort((left, right) => left.PlotIndex.CompareTo(right.PlotIndex));
+        if (normalized.Count != farm.Plots.Count || !normalized.SequenceEqual(farm.Plots))
+        {
+            farm.Plots = normalized;
+            changed = true;
         }
 
         return changed;

@@ -1,5 +1,7 @@
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
+using SVSAPME.Content;
+using SVSAPME.Models;
 using SVSAPME.Services;
 using StardewValley;
 using StardewValley.Menus;
@@ -11,8 +13,10 @@ internal sealed class PoweredTransferMenu : IClickableMenu
 {
     private const int Pad = 28;
     private const int Cell = 64;
+    private const int InventoryCell = 52;
     private const int FilterColumns = 3;
     private const int FilterRows = 3;
+    private const int UpgradeCell = 52;
     private const int ControlButtonWidth = 150;
     private const int ControlButtonHeight = 42;
     private const int ControlButtonGap = 10;
@@ -32,9 +36,11 @@ internal sealed class PoweredTransferMenu : IClickableMenu
     private ClickableComponent qualityButton = null!;
     private ClickableComponent clearButton = null!;
     private Rectangle filterArea;
+    private Rectangle upgradeArea;
     private Rectangle inventoryArea;
     private int backpackColumns;
     private int selectedSlot;
+    private int selectedUpgradeSlot = -1;
 
     public PoweredTransferMenu(SObject machine, GameLocation location, Vector2 tile, MachineRuntimeService runtime)
         : base(
@@ -64,6 +70,7 @@ internal sealed class PoweredTransferMenu : IClickableMenu
 
         this.filterArea = new Rectangle(innerX, top + 92, FilterColumns * Cell, FilterRows * Cell);
         var controlsX = this.filterArea.Right + 34;
+        this.upgradeArea = new Rectangle(controlsX, top + 34, MachineRuntimeService.PoweredTransferUpgradeSlotCount * UpgradeCell, UpgradeCell);
         var controlsY = this.filterArea.Y;
         var controlsAvailable = Math.Max(1, this.xPositionOnScreen + this.width - Pad - controlsX);
         var controlColumns = CalculateControlColumns(controlsAvailable);
@@ -92,10 +99,10 @@ internal sealed class PoweredTransferMenu : IClickableMenu
                 directions[i].Label));
         }
 
-        this.backpackColumns = Math.Clamp(innerW / Cell, 4, 12);
+        this.backpackColumns = Math.Clamp(innerW / InventoryCell, 4, 12);
         var backpackRows = Math.Max(3, (int)Math.Ceiling(Game1.player.Items.Count / (double)this.backpackColumns));
-        var invW = this.backpackColumns * Cell;
-        var invH = backpackRows * Cell;
+        var invW = this.backpackColumns * InventoryCell;
+        var invH = backpackRows * InventoryCell;
         this.inventoryArea = new Rectangle(
             innerX + Math.Max(0, (innerW - invW) / 2),
             this.yPositionOnScreen + this.height - Pad - invH,
@@ -111,9 +118,11 @@ internal sealed class PoweredTransferMenu : IClickableMenu
         var controlWidth = CalculateControlButtonWidth(controlsAvailable, controlColumns);
         var directionWidth = CalculateDirectionButtonWidth(controlsAvailable);
         var filterRight = Pad + FilterColumns * Cell;
+        var upgradeRight = controlsX + MachineRuntimeService.PoweredTransferUpgradeSlotCount * UpgradeCell;
         var controlRight = controlsX + Math.Min(controlColumns, 3) * controlWidth + Math.Max(0, Math.Min(controlColumns, 3) - 1) * ControlButtonGap;
         var directionRight = controlsX + 5 * directionWidth + 4 * DirectionButtonGap;
         return filterRight <= menuWidth - Pad
+            && upgradeRight <= menuWidth - Pad
             && controlRight <= menuWidth - Pad
             && directionRight <= menuWidth - Pad
             && controlColumns >= 1
@@ -176,25 +185,41 @@ internal sealed class PoweredTransferMenu : IClickableMenu
 
         if (this.modeButton.containsPoint(x, y))
         {
-            this.RunAction(() => this.runtime.TryTogglePoweredFilterMode(this.machine, this.location, this.tile, out var message) ? message : message);
+            this.RunAction(() =>
+            {
+                var success = this.runtime.TryTogglePoweredFilterMode(this.machine, this.location, this.tile, out var message);
+                return (success, message);
+            });
             return;
         }
 
         if (this.oreButton.containsPoint(x, y))
         {
-            this.RunAction(() => this.runtime.TryTogglePoweredOreDictionaryMode(this.machine, this.location, this.tile, out var message) ? message : message);
+            this.RunAction(() =>
+            {
+                var success = this.runtime.TryTogglePoweredOreDictionaryMode(this.machine, this.location, this.tile, out var message);
+                return (success, message);
+            });
             return;
         }
 
         if (this.qualityButton.containsPoint(x, y))
         {
-            this.RunAction(() => this.runtime.TryTogglePoweredQualityStrategy(this.machine, this.location, this.tile, out var message) ? message : message);
+            this.RunAction(() =>
+            {
+                var success = this.runtime.TryTogglePoweredQualityStrategy(this.machine, this.location, this.tile, out var message);
+                return (success, message);
+            });
             return;
         }
 
         if (this.clearButton.containsPoint(x, y))
         {
-            this.RunAction(() => this.runtime.TryClearPoweredFilter(this.machine, this.location, this.tile, out var message) ? message : message);
+            this.RunAction(() =>
+            {
+                var success = this.runtime.TryClearPoweredFilter(this.machine, this.location, this.tile, out var message);
+                return (success, message);
+            });
             return;
         }
 
@@ -203,7 +228,11 @@ internal sealed class PoweredTransferMenu : IClickableMenu
             if (!button.containsPoint(x, y) || !int.TryParse(button.name, out var direction))
                 continue;
 
-            this.RunAction(() => this.runtime.TrySetPoweredFacingDirection(this.machine, this.location, this.tile, direction, out var message) ? message : message);
+            this.RunAction(() =>
+            {
+                var success = this.runtime.TrySetPoweredFacingDirection(this.machine, this.location, this.tile, direction, out var message);
+                return (success, message);
+            });
             return;
         }
 
@@ -211,17 +240,28 @@ internal sealed class PoweredTransferMenu : IClickableMenu
         if (filterSlot >= 0)
         {
             this.selectedSlot = filterSlot;
-            var view = this.runtime.GetPoweredFilterSlotViews(this.machine).FirstOrDefault(slot => slot.SlotIndex == filterSlot);
-            if (view?.Occupied == true)
-                this.RunAction(() => this.runtime.TryClearPoweredFilterSlot(this.machine, this.location, this.tile, filterSlot, out var message) ? message : message);
+            this.selectedUpgradeSlot = -1;
+            Game1.playSound("smallSelect");
+            return;
+        }
+
+        var upgradeSlot = this.HitUpgradeSlot(x, y);
+        if (upgradeSlot >= 0)
+        {
+            var slots = this.runtime.GetPoweredUpgradeSlotIds(this.machine);
+            if (upgradeSlot < slots.Count && !string.IsNullOrWhiteSpace(slots[upgradeSlot]))
+                this.RemoveUpgrade(upgradeSlot);
             else
+            {
+                this.selectedUpgradeSlot = upgradeSlot;
                 Game1.playSound("smallSelect");
+            }
             return;
         }
 
         var inventoryIndex = this.HitInventorySlot(x, y);
         if (inventoryIndex >= 0)
-            this.SetFilterFromInventory(inventoryIndex);
+            this.HandleInventoryItem(inventoryIndex);
     }
 
     public override void receiveRightClick(int x, int y, bool playSound = true)
@@ -229,7 +269,18 @@ internal sealed class PoweredTransferMenu : IClickableMenu
         var filterSlot = this.HitFilterSlot(x, y);
         if (filterSlot >= 0)
         {
-            this.RunAction(() => this.runtime.TryClearPoweredFilterSlot(this.machine, this.location, this.tile, filterSlot, out var message) ? message : message);
+            this.RunAction(() =>
+            {
+                var success = this.runtime.TryClearPoweredFilterSlot(this.machine, this.location, this.tile, filterSlot, out var message);
+                return (success, message);
+            });
+            return;
+        }
+
+        var upgradeSlot = this.HitUpgradeSlot(x, y);
+        if (upgradeSlot >= 0)
+        {
+            this.RemoveUpgrade(upgradeSlot);
             return;
         }
 
@@ -238,17 +289,37 @@ internal sealed class PoweredTransferMenu : IClickableMenu
 
     public override void draw(SpriteBatch b)
     {
-        DrawPanel(b, new Rectangle(this.xPositionOnScreen, this.yPositionOnScreen, this.width, this.height));
-        Utility.drawTextWithShadow(b, this.machine.DisplayName, Game1.dialogueFont, new Vector2(this.xPositionOnScreen + Pad, this.yPositionOnScreen + 26), Game1.textColor);
+        SvsapmeUiText.DrawStardewAE2Frame(b, new Rectangle(this.xPositionOnScreen, this.yPositionOnScreen, this.width, this.height));
+        Utility.drawTextWithShadow(b, this.machine.DisplayName, Game1.dialogueFont, new Vector2(this.xPositionOnScreen + Pad + 12, this.yPositionOnScreen + 26), Game1.textColor);
 
         var slots = this.runtime.GetPoweredFilterSlotViews(this.machine);
+        var upgrades = this.runtime.GetPoweredUpgradeSlotIds(this.machine);
         this.DrawFilterSlots(b, slots);
+        this.DrawUpgradeSlots(b, upgrades);
         this.DrawControls(b);
         this.DrawSeparator(b);
         this.DrawInventory(b);
-        this.DrawHoverTooltip(b, slots);
+        this.DrawHoverTooltip(b, slots, upgrades);
         this.upperRightCloseButton?.draw(b);
         this.drawMouse(b);
+    }
+
+    private void DrawUpgradeSlots(SpriteBatch b, IReadOnlyList<string> slots)
+    {
+        for (var index = 0; index < MachineRuntimeService.PoweredTransferUpgradeSlotCount; index++)
+        {
+            var cell = this.GetUpgradeSlotBounds(index);
+            DrawInsetBox(b, cell, Color.White * 0.82f);
+            var qualifiedItemId = index < slots.Count ? slots[index] : string.Empty;
+            if (string.IsNullOrWhiteSpace(qualifiedItemId))
+                SvsapmeUiText.DrawGhostUpgradeSlot(b, cell);
+            else if (TryCreateItem(qualifiedItemId, out var item))
+                item.drawInMenu(b, new Vector2(cell.X + 4, cell.Y + 4), 0.68f, 1f, 0.86f, StackDrawType.Hide, Color.White, true);
+
+            if (index == this.selectedUpgradeSlot)
+                b.Draw(Game1.staminaRect, new Rectangle(cell.X - 2, cell.Y - 2, cell.Width + 4, cell.Height + 4), Color.Gold * 0.28f);
+            SvsapmeUiText.DrawSlotStatusLine(b, cell, string.IsNullOrWhiteSpace(qualifiedItemId) ? PixelStatus.Idle : PixelStatus.Ready);
+        }
     }
 
     private void DrawFilterSlots(SpriteBatch b, IReadOnlyList<PoweredTransferFilterSlotView> slots)
@@ -261,7 +332,8 @@ internal sealed class PoweredTransferMenu : IClickableMenu
                 b.Draw(Game1.staminaRect, new Rectangle(cell.X - 2, cell.Y - 2, cell.Width + 4, cell.Height + 4), Color.LightGreen * 0.35f);
 
             var view = slots.FirstOrDefault(slot => slot.SlotIndex == index);
-            view?.Item?.drawInMenu(b, new Vector2(cell.X + 8, cell.Y + 8), 1f, 1f, 0.86f, StackDrawType.Hide, Color.White, true);
+            view?.Item?.drawInMenu(b, new Vector2(cell.X + 8, cell.Y + 8), 1f, 1f, 0.86f, StackDrawType.Hide, Color.White * 0.58f, true);
+            SvsapmeUiText.DrawSlotStatusLine(b, cell, view?.Occupied == true ? PixelStatus.Ready : PixelStatus.Idle);
         }
     }
 
@@ -271,9 +343,14 @@ internal sealed class PoweredTransferMenu : IClickableMenu
             ? ModText.Get("ui.poweredTransfer.ore.on", "Ore: on")
             : ModText.Get("ui.poweredTransfer.ore.off", "Ore: off");
 
-        DrawButton(b, this.modeButton, true);
-        DrawButton(b, this.oreButton, true);
-        DrawButton(b, this.qualityButton, true);
+        var view = this.runtime.GetPoweredTransferMenuView(this.machine);
+        var isBlacklist = view.IsBlacklist;
+        var hasOreCard = this.runtime.HasPoweredUpgrade(this.machine, "(O)" + ModItemCatalog.SvsapOreDictionaryCard);
+        var hasQualityCard = this.runtime.HasPoweredUpgrade(this.machine, "(O)" + ModItemCatalog.SvsapQualityCard);
+
+        DrawButton(b, this.modeButton, true, isBlacklist ? Color.LightGreen : Color.White);
+        DrawButton(b, this.oreButton, hasOreCard, this.runtime.IsPoweredOreDictionaryModeEnabled(this.machine) ? Color.LightGreen : Color.White);
+        DrawButton(b, this.qualityButton, hasQualityCard);
         DrawButton(b, this.clearButton, true);
 
         var facing = this.runtime.GetPoweredFacingDirection(this.machine);
@@ -284,12 +361,38 @@ internal sealed class PoweredTransferMenu : IClickableMenu
         }
 
         var x = this.filterArea.Right + 34;
-        var y = this.filterArea.Bottom + 24;
-        foreach (var line in this.runtime.DescribePoweredConfigurationLines(this.machine).Take(7))
+        var y = this.filterArea.Bottom + 18;
+        var network = this.runtime.GetPoweredNetworkStatus(this.location, this.tile);
+        SvsapmeUiText.DrawPixelStatusLight(b, x, y + 6, network.Online ? PixelStatus.Ready : PixelStatus.Offline);
+        var networkText = network.Online
+            ? ModText.Get("ui.powered.networkStatus", "Power online: {{stored}} / {{capacity}}", new { stored = FormatWh(network.StoredWh), capacity = FormatWh(network.CapacityWh) })
+            : ModText.Get("ui.powered.network.offline", "Power offline or no energy cell");
+        SvsapmeUiText.DrawFittedLine(
+            b,
+            networkText,
+            new Rectangle(x + 18, y, this.xPositionOnScreen + this.width - Pad - x - 18, 22),
+            network.Online ? Game1.textColor : Color.Crimson);
+
+        var meter = new Rectangle(x, y + 25, this.xPositionOnScreen + this.width - Pad - x, 16);
+        b.Draw(Game1.staminaRect, meter, Color.Black * 0.42f);
+        var ratio = network.CapacityWh <= 0 ? 0m : Math.Clamp(network.StoredWh / (decimal)network.CapacityWh, 0m, 1m);
+        var fillWidth = (int)((meter.Width - 4) * ratio);
+        if (fillWidth > 0)
+            b.Draw(Game1.staminaRect, new Rectangle(meter.X + 2, meter.Y + 2, fillWidth, meter.Height - 4), ratio < 0.15m ? Color.Crimson : ratio < 0.4m ? Color.Orange : Color.LimeGreen);
+
+        var stats = new[]
         {
-            b.DrawString(Game1.smallFont, line, new Vector2(x, y), Game1.textColor);
-            y += 26;
-        }
+            ModText.Get("ui.powered.performance", "Throughput: {{count}} / interval: {{ticks}} ticks", new { count = view.Throughput.ToString("N0"), ticks = view.TransferIntervalTicks.ToString("N0") }),
+            ModText.Get("ui.powered.energy", "Energy: {{wh}} Wh/action", new { wh = view.EnergyPerActionWh.ToString("0.0#") }),
+            ModText.Get("ui.powered.direction", "Direction: {{direction}}", new { direction = this.directionButtons.FirstOrDefault(button => button.name == view.FacingDirection.ToString())?.label ?? ModText.Get("ui.machine.powered.direction.all", "all") })
+        };
+        var statsY = meter.Bottom + 6;
+        var availableHeight = Math.Max(28, this.inventoryArea.Y - 18 - statsY);
+        SvsapmeUiText.DrawFittedLines(
+            b,
+            stats,
+            new Rectangle(x, statsY, this.xPositionOnScreen + this.width - Pad - x, availableHeight),
+            Game1.textColor);
     }
 
     private void DrawInventory(SpriteBatch b)
@@ -301,11 +404,11 @@ internal sealed class PoweredTransferMenu : IClickableMenu
                 continue;
 
             DrawInsetBox(b, bounds, Color.White * 0.78f);
-            Game1.player.Items[i]?.drawInMenu(b, new Vector2(bounds.X + 8, bounds.Y + 8), 1f, 1f, 0.86f, StackDrawType.Draw, Color.White, true);
+            Game1.player.Items[i]?.drawInMenu(b, new Vector2(bounds.X + 4, bounds.Y + 4), 0.68f, 1f, 0.86f, StackDrawType.Draw, Color.White, true);
         }
     }
 
-    private void DrawHoverTooltip(SpriteBatch b, IReadOnlyList<PoweredTransferFilterSlotView> slots)
+    private void DrawHoverTooltip(SpriteBatch b, IReadOnlyList<PoweredTransferFilterSlotView> slots, IReadOnlyList<string> upgrades)
     {
         var mx = Game1.getMouseX();
         var my = Game1.getMouseY();
@@ -315,12 +418,23 @@ internal sealed class PoweredTransferMenu : IClickableMenu
             var view = slots.FirstOrDefault(slot => slot.SlotIndex == slotIndex);
             if (view?.Occupied == true)
             {
-                var lines = new List<string> { view.QualifiedItemId };
+                var lines = new List<string>();
                 if (view.OreGroups.Count > 0)
                     lines.Add(ModText.Get("ui.poweredTransfer.tooltip.oreGroups", "Ore groups: {{groups}}", new { groups = string.Join(", ", view.OreGroups) }));
                 IClickableMenu.drawHoverText(b, string.Join(Environment.NewLine, lines), Game1.smallFont, boldTitleText: view.DisplayName);
             }
 
+            return;
+        }
+
+        var upgradeIndex = this.HitUpgradeSlot(mx, my);
+        if (upgradeIndex >= 0)
+        {
+            var qualifiedItemId = upgradeIndex < upgrades.Count ? upgrades[upgradeIndex] : string.Empty;
+            if (TryCreateItem(qualifiedItemId, out var upgrade))
+                IClickableMenu.drawHoverText(b, upgrade.getDescription(), Game1.smallFont, boldTitleText: upgrade.DisplayName);
+            else
+                IClickableMenu.drawHoverText(b, ModText.Get("ui.powered.upgrade.empty", "Select this slot, then click a supported upgrade card in your backpack."), Game1.smallFont);
             return;
         }
 
@@ -348,8 +462,105 @@ internal sealed class PoweredTransferMenu : IClickableMenu
             return;
 
         var slot = this.FindTargetFilterSlot();
-        this.RunAction(() => this.runtime.TrySetPoweredFilterSlot(this.machine, this.location, this.tile, slot, item.QualifiedItemId, out var message) ? message : message);
+        this.RunAction(() =>
+        {
+            var success = this.runtime.TrySetPoweredFilterSlot(this.machine, this.location, this.tile, slot, item.QualifiedItemId, out var message);
+            return (success, message);
+        });
         this.selectedSlot = Math.Min(slot + 1, FilterColumns * FilterRows - 1);
+    }
+
+    private void HandleInventoryItem(int inventoryIndex)
+    {
+        if (inventoryIndex < 0 || inventoryIndex >= Game1.player.Items.Count)
+            return;
+
+        var item = Game1.player.Items[inventoryIndex];
+        if (item is null)
+            return;
+
+        if (!IsPoweredUpgradeCard(item.QualifiedItemId))
+        {
+            this.SetFilterFromInventory(inventoryIndex);
+            return;
+        }
+
+        var slots = this.runtime.GetPoweredUpgradeSlotIds(this.machine);
+        var target = this.selectedUpgradeSlot >= 0
+            ? this.selectedUpgradeSlot
+            : Enumerable.Range(0, MachineRuntimeService.PoweredTransferUpgradeSlotCount)
+                .FirstOrDefault(index => index >= slots.Count || string.IsNullOrWhiteSpace(slots[index]), -1);
+        if (target < 0)
+        {
+            Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.poweredUpgrade.full", "All powered upgrade slots are occupied."), HUDMessage.error_type));
+            Game1.playSound("cancel");
+            return;
+        }
+
+        var result = this.runtime.TryInstallPoweredUpgrade(this.machine, this.location, this.tile, target, item.QualifiedItemId);
+        if (result.Success && result.ConsumeEscrowedItem)
+        {
+            item.Stack--;
+            if (item.Stack <= 0)
+                Game1.player.Items[inventoryIndex] = null;
+            this.selectedUpgradeSlot = -1;
+        }
+
+        this.ShowResult(result);
+    }
+
+    private void RemoveUpgrade(int slotIndex)
+    {
+        var result = this.runtime.TryRemovePoweredUpgrade(this.machine, this.location, this.tile, slotIndex);
+        if (result.Success)
+            DeliverReturnedItems(result.ReturnedItems);
+        this.selectedUpgradeSlot = -1;
+        this.ShowResult(result);
+    }
+
+    private void ShowResult(SvsapmeMachineActionApplyResult result)
+    {
+        if (!string.IsNullOrWhiteSpace(result.Message))
+            Game1.addHUDMessage(new HUDMessage(result.Message, result.Success ? HUDMessage.newQuest_type : HUDMessage.error_type));
+        Game1.playSound(result.Success ? "smallSelect" : "cancel");
+    }
+
+    private static void DeliverReturnedItems(IEnumerable<BufferedItemStack> returnedItems)
+    {
+        foreach (var stack in returnedItems)
+        {
+            var item = BufferedItemCodec.CreateItem(stack);
+            if (!Game1.player.addItemToInventoryBool(item))
+                Game1.createItemDebris(item, Game1.player.getStandingPosition(), -1, Game1.currentLocation);
+        }
+    }
+
+    private static bool IsPoweredUpgradeCard(string qualifiedItemId)
+    {
+        return qualifiedItemId is
+            ("(O)" + ModItemCatalog.SvsapSpeedCard)
+            or ("(O)" + ModItemCatalog.SvsapCapacityCard)
+            or ("(O)" + ModItemCatalog.SvsapQualityCard)
+            or ("(O)" + ModItemCatalog.SvsapOreDictionaryCard);
+    }
+
+    private static string FormatWh(long value)
+    {
+        return Math.Abs(value) >= 1000 ? $"{value / 1000m:0.00} kWh" : $"{value:N0} Wh";
+    }
+
+    private static bool TryCreateItem(string qualifiedItemId, out Item item)
+    {
+        try
+        {
+            item = string.IsNullOrWhiteSpace(qualifiedItemId) ? null! : ItemRegistry.Create(qualifiedItemId);
+            return item is not null;
+        }
+        catch
+        {
+            item = null!;
+            return false;
+        }
     }
 
     private int FindTargetFilterSlot()
@@ -379,10 +590,19 @@ internal sealed class PoweredTransferMenu : IClickableMenu
         if (!this.inventoryArea.Contains(x, y))
             return -1;
 
-        var column = (x - this.inventoryArea.X) / Cell;
-        var row = (y - this.inventoryArea.Y) / Cell;
+        var column = (x - this.inventoryArea.X) / InventoryCell;
+        var row = (y - this.inventoryArea.Y) / InventoryCell;
         var index = row * this.backpackColumns + column;
         return index >= 0 && index < Game1.player.Items.Count ? index : -1;
+    }
+
+    private int HitUpgradeSlot(int x, int y)
+    {
+        if (!this.upgradeArea.Contains(x, y))
+            return -1;
+
+        var index = (x - this.upgradeArea.X) / UpgradeCell;
+        return index is >= 0 and < MachineRuntimeService.PoweredTransferUpgradeSlotCount ? index : -1;
     }
 
     private Rectangle GetFilterSlotBounds(int index)
@@ -396,15 +616,20 @@ internal sealed class PoweredTransferMenu : IClickableMenu
     {
         var column = index % this.backpackColumns;
         var row = index / this.backpackColumns;
-        return new Rectangle(this.inventoryArea.X + column * Cell, this.inventoryArea.Y + row * Cell, Cell - 4, Cell - 4);
+        return new Rectangle(this.inventoryArea.X + column * InventoryCell, this.inventoryArea.Y + row * InventoryCell, InventoryCell - 4, InventoryCell - 4);
     }
 
-    private void RunAction(Func<string?> action)
+    private Rectangle GetUpgradeSlotBounds(int index)
     {
-        var message = action();
-        if (!string.IsNullOrWhiteSpace(message))
-            Game1.addHUDMessage(new HUDMessage(message, HUDMessage.newQuest_type));
-        Game1.playSound("smallSelect");
+        return new Rectangle(this.upgradeArea.X + index * UpgradeCell, this.upgradeArea.Y, UpgradeCell - 4, UpgradeCell - 4);
+    }
+
+    private void RunAction(Func<(bool Success, string Message)> action)
+    {
+        var result = action();
+        if (!string.IsNullOrWhiteSpace(result.Message))
+            Game1.addHUDMessage(new HUDMessage(result.Message, result.Success ? HUDMessage.newQuest_type : HUDMessage.error_type));
+        Game1.playSound(result.Success ? "smallSelect" : "cancel");
     }
 
     private static void DrawPanel(SpriteBatch b, Rectangle panel)

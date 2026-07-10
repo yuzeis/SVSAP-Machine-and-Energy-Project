@@ -12,6 +12,7 @@ internal sealed class EnergyNetworkManager
     private readonly MachineStateRepository repository;
     private readonly MachineRegistryService registry;
     private readonly Func<ISvsapApi?> getSvsapApi;
+    private readonly EnergyTelemetryService telemetry;
     private readonly IMonitor monitor;
     private int linkedEnergyCellCacheScopeDepth;
     private Dictionary<Guid, List<MachineState>>? linkedEnergyCellCache;
@@ -20,11 +21,13 @@ internal sealed class EnergyNetworkManager
         MachineStateRepository repository,
         MachineRegistryService registry,
         Func<ISvsapApi?> getSvsapApi,
+        EnergyTelemetryService telemetry,
         IMonitor monitor)
     {
         this.repository = repository;
         this.registry = registry;
         this.getSvsapApi = getSvsapApi;
+        this.telemetry = telemetry;
         this.monitor = monitor;
     }
 
@@ -47,7 +50,7 @@ internal sealed class EnergyNetworkManager
         var cells = this.GetLinkedEnergyCells(svsapNetworkId).ToList();
         if (cells.Count == 0)
         {
-            code = SvsapmeEnergyErrorCode.NetworkUnknown;
+            code = SvsapmeEnergyErrorCode.NoEnergyCell;
             return false;
         }
 
@@ -72,17 +75,29 @@ internal sealed class EnergyNetworkManager
     {
         acceptedWh = 0;
         if (!this.IsHostAuthority)
-            return Fail(SvsapmeEnergyErrorCode.NotHost, "Energy writes are host-authoritative.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.NotHost, "Energy writes are host-authoritative.", out code, out message);
+            this.telemetry.RecordDeposit(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         if (amountWh <= 0)
-            return Fail(SvsapmeEnergyErrorCode.InternalError, "Deposit amount must be positive.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.InternalError, "Deposit amount must be positive.", out code, out message);
+            this.telemetry.RecordDeposit(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         var cells = this.GetLinkedEnergyCells(svsapNetworkId)
             .OrderBy(cell => cell.CapacityWh)
             .ThenBy(cell => cell.MachineGuid)
             .ToList();
         if (cells.Count == 0)
-            return Fail(SvsapmeEnergyErrorCode.NetworkUnknown, "No active SVSAPME energy cell is linked to this network.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.NoEnergyCell, "No active SVSAPME energy cell is linked to this network.", out code, out message);
+            this.telemetry.RecordDeposit(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         var remaining = amountWh;
         var touched = new List<Guid>();
@@ -103,13 +118,18 @@ internal sealed class EnergyNetworkManager
         }
 
         if (acceptedWh <= 0)
-            return Fail(SvsapmeEnergyErrorCode.StorageFull, "Network energy storage is full.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.StorageFull, "Network energy storage is full.", out code, out message);
+            this.telemetry.RecordDeposit(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         foreach (var machineGuid in touched)
             this.registry.SyncPlacedMachineState(machineGuid);
 
         code = SvsapmeEnergyErrorCode.None;
         message = $"Accepted {acceptedWh} Wh from {ownerModId}:{reason}.";
+        this.telemetry.RecordDeposit(svsapNetworkId, ownerModId, reason, amountWh, acceptedWh, code, message);
         return true;
     }
 
@@ -125,21 +145,37 @@ internal sealed class EnergyNetworkManager
     {
         consumedWh = 0;
         if (!this.IsHostAuthority)
-            return Fail(SvsapmeEnergyErrorCode.NotHost, "Energy writes are host-authoritative.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.NotHost, "Energy writes are host-authoritative.", out code, out message);
+            this.telemetry.RecordConsume(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         if (amountWh <= 0)
-            return Fail(SvsapmeEnergyErrorCode.InternalError, "Consume amount must be positive.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.InternalError, "Consume amount must be positive.", out code, out message);
+            this.telemetry.RecordConsume(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         var cells = this.GetLinkedEnergyCells(svsapNetworkId)
             .OrderByDescending(cell => cell.CapacityWh)
             .ThenBy(cell => cell.MachineGuid)
             .ToList();
         if (cells.Count == 0)
-            return Fail(SvsapmeEnergyErrorCode.NetworkUnknown, "No active SVSAPME energy cell is linked to this network.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.NoEnergyCell, "No active SVSAPME energy cell is linked to this network.", out code, out message);
+            this.telemetry.RecordConsume(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         var availableWh = cells.Sum(cell => Math.Clamp(cell.StoredWh, 0, Math.Max(0, cell.CapacityWh)));
         if (availableWh < amountWh && !allowPartial)
-            return Fail(SvsapmeEnergyErrorCode.InsufficientEnergy, $"Need {amountWh} Wh but only {availableWh} Wh is stored.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.InsufficientEnergy, $"Need {amountWh} Wh but only {availableWh} Wh is stored.", out code, out message);
+            this.telemetry.RecordConsume(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         var remaining = allowPartial ? Math.Min(amountWh, availableWh) : amountWh;
         var touched = new List<Guid>();
@@ -159,13 +195,18 @@ internal sealed class EnergyNetworkManager
         }
 
         if (consumedWh <= 0)
-            return Fail(SvsapmeEnergyErrorCode.InsufficientEnergy, "No stored energy is available.", out code, out message);
+        {
+            var result = Fail(SvsapmeEnergyErrorCode.InsufficientEnergy, "No stored energy is available.", out code, out message);
+            this.telemetry.RecordConsume(svsapNetworkId, ownerModId, reason, amountWh, 0, code, message);
+            return result;
+        }
 
         foreach (var machineGuid in touched)
             this.registry.SyncPlacedMachineState(machineGuid);
 
         code = SvsapmeEnergyErrorCode.None;
         message = $"Consumed {consumedWh} Wh for {ownerModId}:{reason}.";
+        this.telemetry.RecordConsume(svsapNetworkId, ownerModId, reason, amountWh, consumedWh, code, message);
         return true;
     }
 

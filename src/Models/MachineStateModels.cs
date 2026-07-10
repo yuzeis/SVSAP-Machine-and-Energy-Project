@@ -75,7 +75,7 @@ internal sealed class FarmMachineState
     public string FilterMode { get; set; } = MachineFilterModes.Whitelist;
     public List<string> SeedFilterQualifiedItemIds { get; set; } = new();
     public List<string> FertilizerFilterQualifiedItemIds { get; set; } = new();
-    public bool AutoPullFromNetwork { get; set; } = true;
+    public bool AutoPullFromNetwork { get; set; } = false;
     public bool AutoPushOutputToNetwork { get; set; } = true;
     public List<BufferedItemStack> InputBuffer { get; set; } = new();
     public int InternalSeedCount { get; set; }
@@ -92,10 +92,12 @@ internal sealed class FarmMachineState
     public long ChamberModuleWhPerPlot { get; set; }
     public List<string> InstalledModuleQualifiedItemIds { get; set; } = new();
     public List<FarmPlotState> Plots { get; set; } = new();
+    public Dictionary<int, string> PlotLocks { get; set; } = new();
 }
 
 internal sealed class FarmPlotState
 {
+    public int PlotIndex { get; set; }
     public string SeedQualifiedItemId { get; set; } = string.Empty;
     public string HarvestQualifiedItemId { get; set; } = string.Empty;
     public int PlacedByFarmingLevel { get; set; }
@@ -105,6 +107,8 @@ internal sealed class FarmPlotState
     public int ExtraHarvestChanceBasisPoints { get; set; }
     public int HarvestStackRollBasisPoints { get; set; }
     public int QualityRollBasisPoints { get; set; }
+    public bool IsLocked { get; set; }
+    public string LockedSeedQualifiedItemId { get; set; } = string.Empty;
 }
 
 internal sealed class SingleBlockProcessorMachineState

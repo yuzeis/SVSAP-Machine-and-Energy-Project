@@ -19,6 +19,7 @@ public sealed class ModEntry : Mod
 #endif
     private MachineStateRepository machineStateRepository = null!;
     private MachineRegistryService machineRegistryService = null!;
+    private EnergyTelemetryService energyTelemetryService = null!;
     private EnergyNetworkManager energyNetworkManager = null!;
     private EnergyProductionService energyProductionService = null!;
     private MachineRuntimeService machineRuntimeService = null!;
@@ -41,10 +42,12 @@ public sealed class ModEntry : Mod
 #endif
         this.machineStateRepository = new MachineStateRepository(helper, this.Monitor);
         this.machineRegistryService = new MachineRegistryService(this.machineStateRepository, this.Monitor);
+        this.energyTelemetryService = new EnergyTelemetryService();
         this.energyNetworkManager = new EnergyNetworkManager(
             this.machineStateRepository,
             this.machineRegistryService,
             () => this.svsapApi,
+            this.energyTelemetryService,
             this.Monitor);
         this.energyApi = new SvsapmeEnergyApi(this.energyNetworkManager);
         this.energyProductionService = new EnergyProductionService(
@@ -57,6 +60,7 @@ public sealed class ModEntry : Mod
             this.machineStateRepository,
             this.machineRegistryService,
             this.energyNetworkManager,
+            this.energyTelemetryService,
             () => this.svsapApi,
             () => this.config,
             helper.Input,
@@ -85,6 +89,7 @@ public sealed class ModEntry : Mod
             this.machineStateRepository,
             this.machineRegistryService,
             this.energyNetworkManager,
+            this.energyTelemetryService,
             this.machineRuntimeService,
             this.singleBlockFarmService,
             this.singleBlockProcessorService,
@@ -127,6 +132,7 @@ public sealed class ModEntry : Mod
         helper.Events.GameLoop.DayStarted += this.OnDayStarted;
         helper.Events.GameLoop.DayStarted += this.multiplayerService.OnDayStarted;
         helper.Events.GameLoop.UpdateTicked += this.machineRuntimeService.OnUpdateTicked;
+        helper.Events.GameLoop.UpdateTicked += this.multiplayerService.OnUpdateTicked;
         helper.Events.GameLoop.TimeChanged += this.singleBlockProcessorService.OnTimeChanged;
         helper.Events.GameLoop.Saving += this.OnSaving;
         helper.Events.Input.ButtonPressed += this.machineRuntimeService.OnButtonPressed;
@@ -151,7 +157,7 @@ public sealed class ModEntry : Mod
 #if DEBUG
         helper.ConsoleCommands.Add(
             "svsapme_selftest",
-            "Run implemented SVSAPME foundation selftests. Optional args include wh-roundtrip tier-table content-table api-shape config-surface cell-stack-guard machine-guid-reconcile orphan-reclaim claim-force-gate consumed-charged-retire disassembly-energy-policy missing-machine-reclaim multiplayer-protocol action-idempotent escrow-restore host-action-dispatch energy-production-rules synth-atomic farm-crop-set farm-power-freeze farm-daily-progress farm-single-crop-budget farm-module-economy farm-fertilizer-quality farm-locked-output single-block-processor-rules daily-order-storage-gate location-cache-full-enum building-demolish-reclaim powered-prescan-refund powered-degrade-parity powered-interface-range battery-discharge-gate electric-machine-rules gui-layout-bounds b10-parity no-arbitrage-audit.",
+            "Run implemented SVSAPME foundation selftests. Optional args include wh-roundtrip tier-table content-table api-shape config-surface cell-stack-guard machine-guid-reconcile orphan-reclaim claim-force-gate consumed-charged-retire disassembly-energy-policy missing-machine-reclaim multiplayer-protocol action-idempotent escrow-restore host-action-dispatch energy-production-rules synth-atomic farm-crop-set farm-power-freeze farm-daily-progress farm-mixed-lock-production farm-single-crop-budget farm-module-economy farm-fertilizer-quality farm-locked-output single-block-processor-rules daily-order-storage-gate location-cache-full-enum building-demolish-reclaim powered-prescan-refund powered-degrade-parity powered-interface-range battery-discharge-gate electric-machine-rules gui-layout-bounds single-block-real-state-text-fit machine-port-definition-contract energy-telemetry-contract b10-parity no-arbitrage-audit.",
             this.selfTestService.RunCommand);
 #endif
         helper.ConsoleCommands.Add(
@@ -271,7 +277,10 @@ public sealed class ModEntry : Mod
             SyncSvsapmeCraftingRecipeUnlocks(Game1.player, this.config);
 
         if (!Context.IsMainPlayer)
+        {
+            this.multiplayerService.OnSaveLoaded(sender, e);
             return;
+        }
 
         this.machineStateRepository.Load();
         this.multiplayerService.OnSaveLoaded(sender, e);
