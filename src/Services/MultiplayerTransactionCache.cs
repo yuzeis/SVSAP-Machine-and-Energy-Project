@@ -22,10 +22,7 @@ internal sealed class MultiplayerTransactionCache<TResponse>
     {
         var key = (playerId, transactionId);
         if (this.responses.ContainsKey(key))
-        {
-            this.responses[key] = response;
             return;
-        }
 
         this.responses[key] = response;
         this.order.Enqueue(key);

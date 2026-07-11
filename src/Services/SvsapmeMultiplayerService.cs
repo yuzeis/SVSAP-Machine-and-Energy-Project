@@ -18,6 +18,7 @@ internal sealed class SvsapmeMultiplayerService
     private const int PendingDeliveryRetentionDays = 7;
     private const int ClientActionResponseTimeoutTicks = 300;
     private const int ClientActionRetryLimit = 3;
+    private const int RemoteMenuOpenTimeoutTicks = 300;
     private const string ReconciledTransactionModDataKey = ModItemCatalog.UniqueId + "/ReconciledDeliveries";
     private const string DurableRemoteDeliveryModDataKey = ModItemCatalog.UniqueId + "/DurableRemoteDeliveries";
     private const string PersistentActionEscrowModDataKey = ModItemCatalog.UniqueId + "/PendingActionEscrows";
@@ -41,6 +42,9 @@ internal sealed class SvsapmeMultiplayerService
     private readonly Dictionary<Guid, PendingClientAction> pendingClientActionsByMachine = new();
     private readonly Dictionary<long, string> blockedPeerActionMessages = new();
     private string clientGameplayDisabledMessage = string.Empty;
+    private Guid pendingRemoteMenuOpenSession;
+    private int pendingRemoteMenuOpenAtTick;
+    private long remoteSnapshotRequestSequence;
 
     public SvsapmeMultiplayerService(
         IModHelper helper,
@@ -76,6 +80,38 @@ internal sealed class SvsapmeMultiplayerService
 
     public int PendingClientMachineActionCount => this.pendingClientActionsByMachine.Count;
 
+    private Guid BeginRemoteMenuOpen()
+    {
+        this.pendingRemoteMenuOpenSession = Guid.NewGuid();
+        this.pendingRemoteMenuOpenAtTick = Game1.ticks;
+        return this.pendingRemoteMenuOpenSession;
+    }
+
+    private long NextRemoteSnapshotRequestSequence()
+    {
+        if (this.remoteSnapshotRequestSequence == long.MaxValue)
+            this.remoteSnapshotRequestSequence = 0;
+
+        return ++this.remoteSnapshotRequestSequence;
+    }
+
+    private bool ConsumePendingRemoteMenuOpen(Guid menuSessionId)
+    {
+        if (!RemoteSnapshotSessionRules.Matches(this.pendingRemoteMenuOpenSession, menuSessionId))
+            return false;
+
+        if (RemoteSnapshotSessionRules.HasTimedOut(this.pendingRemoteMenuOpenAtTick, Game1.ticks, RemoteMenuOpenTimeoutTicks))
+        {
+            this.pendingRemoteMenuOpenSession = Guid.Empty;
+            this.pendingRemoteMenuOpenAtTick = 0;
+            return false;
+        }
+
+        this.pendingRemoteMenuOpenSession = Guid.Empty;
+        this.pendingRemoteMenuOpenAtTick = 0;
+        return true;
+    }
+
     internal bool IsMachineActionPending(Guid machineGuid)
     {
         return machineGuid != Guid.Empty && this.pendingClientActionsByMachine.ContainsKey(machineGuid);
@@ -92,10 +128,15 @@ internal sealed class SvsapmeMultiplayerService
 
     public bool TrySendMachineSnapshotRequest(Guid machineGuid)
     {
-        return this.TrySendMachineSnapshotRequest(machineGuid, offset: 0, limit: 64, notify: true);
+        var menuSessionId = this.BeginRemoteMenuOpen();
+        if (this.TrySendMachineSnapshotRequest(machineGuid, offset: 0, limit: 64, menuSessionId, notify: true))
+            return true;
+
+        this.ConsumePendingRemoteMenuOpen(menuSessionId);
+        return false;
     }
 
-    internal bool TrySendMachineSnapshotRequest(Guid machineGuid, int offset, int limit, bool notify)
+    internal bool TrySendMachineSnapshotRequest(Guid machineGuid, int offset, int limit, Guid menuSessionId, bool notify)
     {
         if (Context.IsMainPlayer || machineGuid == Guid.Empty)
             return false;
@@ -112,6 +153,8 @@ internal sealed class SvsapmeMultiplayerService
             this.helper.Multiplayer.SendMessage(
                 new SvsapmeMachineSnapshotRequest
                 {
+                    MenuSessionId = menuSessionId,
+                    RequestSequence = this.NextRemoteSnapshotRequestSequence(),
                     MachineGuid = machineGuid,
                     Offset = Math.Max(0, offset),
                     Limit = Math.Clamp(limit, 1, 64)
@@ -183,6 +226,8 @@ internal sealed class SvsapmeMultiplayerService
             return false;
         }
 
+        request.RequestSequence = this.NextRemoteSnapshotRequestSequence();
+
         if (!this.TryReservePendingClientAction(request, out var pendingMessage))
         {
             Game1.addHUDMessage(new HUDMessage(pendingMessage, HUDMessage.error_type));
@@ -224,6 +269,8 @@ internal sealed class SvsapmeMultiplayerService
         this.actionResponses.Clear();
         this.pendingActionEscrows.ClearWithoutRestore();
         this.pendingClientActionsByMachine.Clear();
+        this.pendingRemoteMenuOpenSession = Guid.Empty;
+        this.pendingRemoteMenuOpenAtTick = 0;
         if (!Context.IsMainPlayer)
             this.RehydrateDurableActionEscrows();
         this.RestoreDurableRemoteDeliveries();
@@ -293,6 +340,8 @@ internal sealed class SvsapmeMultiplayerService
         this.blockedPeerActionMessages.Remove(e.Peer.PlayerID);
         if (!Context.IsMainPlayer && e.Peer.IsHost)
         {
+            this.pendingRemoteMenuOpenSession = Guid.Empty;
+            this.pendingRemoteMenuOpenAtTick = 0;
             this.ClientGameplayEnabled = false;
             this.clientGameplayDisabledMessage = ModText.Get("hud.multiplayer.hostMissingSvsapme", "SVSAPME gameplay is disabled because the host is missing SVSAPME.");
             this.reconciledTransactions.Clear();
@@ -379,7 +428,24 @@ internal sealed class SvsapmeMultiplayerService
     private void HandleMachineSnapshotRequest(ModMessageReceivedEventArgs e)
     {
         var request = e.ReadAs<SvsapmeMachineSnapshotRequest>();
-        var response = this.CreateMachineSnapshotResponse(request.MachineGuid, request.Offset, request.Limit);
+        SvsapmeMachineSnapshotResponse response;
+        try
+        {
+            response = this.CreateMachineSnapshotResponse(request.MachineGuid, request.Offset, request.Limit);
+        }
+        catch (Exception ex)
+        {
+            this.monitor.Log($"Failed to create SVSAPME machine snapshot for {request.MachineGuid:N}: {ex.Message}", LogLevel.Warn);
+            response = new SvsapmeMachineSnapshotResponse
+            {
+                MachineGuid = request.MachineGuid,
+                Success = false,
+                Message = ModText.Get("hud.multiplayer.snapshotFailed", "SVSAPME machine status failed; please retry.")
+            };
+        }
+
+        response.MenuSessionId = request.MenuSessionId;
+        response.RequestSequence = request.RequestSequence;
         this.helper.Multiplayer.SendMessage(
             response,
             SvsapmeMultiplayerMessageTypes.MachineSnapshotResponse,
@@ -391,25 +457,40 @@ internal sealed class SvsapmeMultiplayerService
     {
         if (!response.Success)
         {
-            Game1.addHUDMessage(new HUDMessage(
-                string.IsNullOrWhiteSpace(response.Message)
-                    ? ModText.Get("hud.multiplayer.snapshotFailed", "SVSAPME machine status failed; please retry.")
-                    : response.Message,
-                HUDMessage.error_type));
+            if (Game1.activeClickableMenu is RemoteMachineControlMenu failedMenu && failedMenu.MatchesSnapshotContext(response))
+                failedMenu.MarkSnapshotRequestFailed(response.RequestSequence);
+            else if (this.ConsumePendingRemoteMenuOpen(response.MenuSessionId))
+            {
+                Game1.addHUDMessage(new HUDMessage(
+                    string.IsNullOrWhiteSpace(response.Message)
+                        ? ModText.Get("hud.multiplayer.snapshotFailed", "SVSAPME machine status failed; please retry.")
+                        : response.Message,
+                    HUDMessage.error_type));
+            }
+
             return;
         }
 
-        if (Game1.activeClickableMenu is IRemoteMachineMenu remoteMenu
-            && remoteMenu.MachineGuid == response.MachineGuid)
+        if (Game1.activeClickableMenu is RemoteMachineControlMenu remoteMenu
+            && remoteMenu.MatchesSnapshotContext(response))
         {
-            remoteMenu.ApplySnapshot(response);
+            remoteMenu.TryApplyRefreshSnapshot(response);
             return;
         }
+
+        var consumedPendingSession = this.ConsumePendingRemoteMenuOpen(response.MenuSessionId);
+        if (!RemoteSnapshotSessionRules.ShouldOpenMenu(consumedPendingSession, Game1.activeClickableMenu is not null))
+            return;
 
         Game1.activeClickableMenu = new RemoteMachineControlMenu(
             response,
             this.TrySendMachineActionRequest,
-            (machineGuid, offset, limit) => this.TrySendMachineSnapshotRequest(machineGuid, offset, limit, notify: false),
+            (machineGuid, offset, limit) => this.TrySendMachineSnapshotRequest(
+                machineGuid,
+                offset,
+                limit,
+                response.MenuSessionId,
+                notify: false),
             this.IsMachineActionPending);
     }
 
@@ -435,14 +516,25 @@ internal sealed class SvsapmeMultiplayerService
 
             if (this.TryGetPendingDeliveryResponse(e.FromPlayerID, request.TransactionId, out var pendingDeliveryResponse))
             {
+                pendingDeliveryResponse.MenuSessionId = request.MenuSessionId;
+                pendingDeliveryResponse.RequestSequence = request.RequestSequence;
                 this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, pendingDeliveryResponse);
                 this.SendMachineActionResponse(pendingDeliveryResponse, e.FromPlayerID);
+                return;
+            }
+
+            if (this.TryCreateExecutedActionReplay(e.FromPlayerID, request, out var executedReplay))
+            {
+                this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, executedReplay);
+                this.SendMachineActionResponse(executedReplay, e.FromPlayerID);
                 return;
             }
 
             var response = this.ExecuteMachineActionRequest(request, e.FromPlayerID);
             if (response.Success && response.ReturnedItems.Count > 0)
                 this.RememberPendingDelivery(e.FromPlayerID, request, response);
+            if (response.Success && response.ConsumeEscrowedItem)
+                this.RememberExecutedAction(e.FromPlayerID, request, response);
 
             this.actionResponses.Remember(e.FromPlayerID, request.TransactionId, response);
             this.SendMachineActionResponse(response, e.FromPlayerID);
@@ -501,11 +593,10 @@ internal sealed class SvsapmeMultiplayerService
             SvsapmeActionEscrowRules.ShouldRestoreOnResponse(response.Success, response.ConsumeEscrowedItem));
         this.ClearPendingClientAction(response);
 
-        if (response.Snapshot is not null
-            && Game1.activeClickableMenu is IRemoteMachineMenu remoteMenu
+        if (Game1.activeClickableMenu is RemoteMachineControlMenu remoteMenu
             && remoteMenu.MachineGuid == response.MachineGuid)
         {
-            remoteMenu.ApplySnapshot(response.Snapshot);
+            remoteMenu.TryApplyActionResponse(response);
         }
 
         Game1.addHUDMessage(new HUDMessage(
@@ -658,6 +749,12 @@ internal sealed class SvsapmeMultiplayerService
                 tile,
                 request.SlotIndex,
                 request.QualifiedItemId),
+            SvsapmeMachineActionKind.UprootFarmPlot => this.singleBlockFarm.TryUprootFarmPlot(
+                placedObject,
+                location,
+                tile,
+                request.SlotIndex),
+            SvsapmeMachineActionKind.ClearFarmPlots => this.singleBlockFarm.TryClearFarmPlots(placedObject, location, tile),
             SvsapmeMachineActionKind.CollectFarmOutput => this.singleBlockFarm.TryCollectFarmOutput(placedObject, location, tile),
             SvsapmeMachineActionKind.FuelCarbonGenerator => this.machineRuntime.TryFuelCarbonGenerator(
                 placedObject,
@@ -696,12 +793,24 @@ internal sealed class SvsapmeMultiplayerService
                 location,
                 tile,
                 request.SlotIndex >= 0 ? request.SlotIndex + 1 : Math.Max(0, request.Count)),
+            SvsapmeMachineActionKind.InstallProcessorUpgrade => this.singleBlockProcessor.TryInstallProcessorUpgrade(
+                placedObject,
+                location,
+                tile,
+                request.QualifiedItemId),
+            SvsapmeMachineActionKind.RemoveProcessorUpgrade => this.singleBlockProcessor.TryRemoveProcessorUpgrade(
+                placedObject,
+                location,
+                tile,
+                request.SlotIndex),
             _ => new SvsapmeMachineActionApplyResult(false, false, ModText.Get("hud.multiplayer.unsupportedAction", "Unsupported SVSAPME machine action."))
         };
 
         var response = new SvsapmeMachineActionResponse
         {
             TransactionId = request.TransactionId,
+            MenuSessionId = request.MenuSessionId,
+            RequestSequence = request.RequestSequence,
             MachineGuid = request.MachineGuid,
             Success = result.Success,
             ConsumeEscrowedItem = result.Success && result.ConsumeEscrowedItem,
@@ -710,7 +819,11 @@ internal sealed class SvsapmeMultiplayerService
         };
 
         if (result.Success)
+        {
             response.Snapshot = this.CreateMachineSnapshotResponse(request.MachineGuid, request.Offset, request.Limit);
+            response.Snapshot.MenuSessionId = request.MenuSessionId;
+            response.Snapshot.RequestSequence = request.RequestSequence;
+        }
 
         return response;
     }
@@ -825,6 +938,7 @@ internal sealed class SvsapmeMultiplayerService
                         ModText.Get("hud.multiplayer.actionReconcilePending", "SVSAPME is keeping the item safe while waiting to reconcile this action with the host."),
                         HUDMessage.error_type));
                 }
+
                 continue;
             }
 
@@ -836,12 +950,12 @@ internal sealed class SvsapmeMultiplayerService
                     modIDs: new[] { this.manifest.UniqueID },
                     playerIDs: new[] { host.PlayerID });
                 pending.LastSentTick = tick;
-                pending.RetryCount++;
+                pending.RetryCount = Math.Min(ClientActionRetryLimit, pending.RetryCount + 1);
             }
             catch (Exception ex)
             {
                 pending.LastSentTick = tick;
-                pending.RetryCount++;
+                pending.RetryCount = Math.Min(ClientActionRetryLimit, pending.RetryCount + 1);
                 this.monitor.Log($"Failed to retry SVSAPME action {pending.TransactionId:N}: {ex.Message}", LogLevel.Trace);
             }
         }
@@ -914,6 +1028,72 @@ internal sealed class SvsapmeMultiplayerService
             ReturnedItems = response.ReturnedItems
         });
         this.repository.Save();
+    }
+
+    private bool TryCreateExecutedActionReplay(
+        long playerId,
+        SvsapmeMachineActionRequest request,
+        out SvsapmeMachineActionResponse response)
+    {
+        if (!ExecutedMachineActionLedger.TryGet(
+                this.repository.Data.ExecutedRemoteActions,
+                playerId,
+                request.TransactionId,
+                out var executed))
+        {
+            response = null!;
+            return false;
+        }
+
+        if (executed.MachineGuid != request.MachineGuid
+            || !string.Equals(executed.ActionKind, request.ActionKind.ToString(), StringComparison.Ordinal))
+        {
+            response = CreateFailureActionResponse(
+                request,
+                ModText.Get("hud.multiplayer.transactionMismatch", "This transaction ID was already used for a different action."));
+            return true;
+        }
+
+        response = new SvsapmeMachineActionResponse
+        {
+            TransactionId = request.TransactionId,
+            MenuSessionId = request.MenuSessionId,
+            RequestSequence = request.RequestSequence,
+            MachineGuid = request.MachineGuid,
+            Success = true,
+            ConsumeEscrowedItem = executed.ConsumeEscrowedItem,
+            Message = executed.Message,
+            ReturnedItems = new List<BufferedItemStack>(),
+            Snapshot = this.CreateMachineSnapshotResponse(request.MachineGuid, request.Offset, request.Limit)
+        };
+        if (response.Snapshot is not null)
+        {
+            response.Snapshot.MenuSessionId = request.MenuSessionId;
+            response.Snapshot.RequestSequence = request.RequestSequence;
+        }
+
+        return true;
+    }
+
+    private void RememberExecutedAction(
+        long playerId,
+        SvsapmeMachineActionRequest request,
+        SvsapmeMachineActionResponse response)
+    {
+        var entry = new ExecutedMachineAction
+        {
+            PlayerId = playerId,
+            TransactionId = request.TransactionId,
+            MachineGuid = request.MachineGuid,
+            ActionKind = request.ActionKind.ToString(),
+            Message = response.Message,
+            ConsumeEscrowedItem = response.ConsumeEscrowedItem,
+            CreatedDay = Context.IsWorldReady ? Game1.Date.TotalDays : 0,
+            CreatedTick = Game1.ticks,
+            ReturnedItems = new List<BufferedItemStack>()
+        };
+        if (ExecutedMachineActionLedger.Remember(this.repository.Data.ExecutedRemoteActions, entry))
+            this.repository.Save();
     }
 
     private bool TryGetPendingDeliveryResponse(long playerId, Guid transactionId, out SvsapmeMachineActionResponse response)
@@ -1568,6 +1748,8 @@ internal sealed class SvsapmeMultiplayerService
         return new SvsapmeFarmMenuSnapshot
         {
             PlotCapacity = tier.Plots,
+            OccupiedPlots = dashboard.OccupiedPlots,
+            LockedPlots = dashboard.LockedPlots,
             Offset = safeOffset,
             AutoPullFromNetwork = dashboard.AutoPullFromNetwork,
             AutoPushOutputToNetwork = dashboard.AutoPushOutputToNetwork,
@@ -1618,6 +1800,11 @@ internal sealed class SvsapmeMultiplayerService
         {
             SlotCapacity = tier.Slots,
             Offset = safeOffset,
+            NetworkOnline = dashboard.NetworkOnline,
+            EnergyOnline = dashboard.EnergyOnline,
+            StoredWh = dashboard.StoredWh,
+            CapacityWh = dashboard.CapacityWh,
+            RequiredWhForNextStep = dashboard.RequiredWhForNextStep,
             AutoPullFromNetwork = dashboard.AutoPullFromNetwork,
             AutoPushOutputToNetwork = dashboard.AutoPushOutputToNetwork,
             InputMode = dashboard.InputMode,
@@ -1625,6 +1812,10 @@ internal sealed class SvsapmeMultiplayerService
             FilterQualifiedItemIds = state.Processor.FilterQualifiedItemIds.ToList(),
             InputBuffer = state.Processor.InputBuffer.Select(CloneBufferedStack).ToList(),
             OutputBuffer = state.Processor.OutputBuffer.Select(CloneBufferedStack).ToList(),
+            InstalledUpgradeQualifiedItemIds = dashboard.UpgradeQualifiedItemIds.ToList(),
+            UpgradeSlotCapacity = dashboard.UpgradeSlotCapacity,
+            SpeedPermille = dashboard.SpeedPermille,
+            OutputBufferCapacityItems = dashboard.OutputBufferCapacityItems,
             Slots = slots
                 .Skip(safeOffset)
                 .Take(limit)
@@ -1887,6 +2078,8 @@ internal sealed class SvsapmeMultiplayerService
         return new SvsapmeMachineActionResponse
         {
             TransactionId = request.TransactionId,
+            MenuSessionId = request.MenuSessionId,
+            RequestSequence = request.RequestSequence,
             MachineGuid = request.MachineGuid,
             Success = false,
             ConsumeEscrowedItem = false,

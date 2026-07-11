@@ -99,7 +99,12 @@ internal sealed class SingleBlockFarmService
         this.Suppress(e);
     }
 
-    internal bool TrySendClientAction(SObject placedObject, SvsapmeMachineActionKind actionKind, string qualifiedItemId, int farmingLevel)
+    internal bool TrySendClientAction(
+        SObject placedObject,
+        SvsapmeMachineActionKind actionKind,
+        string qualifiedItemId,
+        int farmingLevel,
+        int count = 1)
     {
         if (this.sendClientAction is null)
         {
@@ -119,7 +124,7 @@ internal sealed class SingleBlockFarmService
             MachineGuid = machineGuid,
             ActionKind = actionKind,
             QualifiedItemId = qualifiedItemId,
-            Count = 1,
+            Count = Math.Clamp(count, 1, 999),
             FarmingLevel = farmingLevel
         });
     }
@@ -201,7 +206,7 @@ internal sealed class SingleBlockFarmService
             || !TryReadMachineGuid(placedObject, out var machineGuid)
             || !this.repository.TryGet(machineGuid, out var state))
         {
-            return new FarmDashboardView(false, false, false, MachineInputModes.AllEligible, MachineFilterModes.Whitelist, 0, 0, 0, 0, 0, 0, 0, 0, Array.Empty<string>(), 0m, 0L);
+            return new FarmDashboardView(false, false, false, MachineInputModes.AllEligible, MachineFilterModes.Whitelist, 0, 0, 0, 0, 0, 0, 0, 0, 0, Array.Empty<string>(), 0m, 0L, null, null, null);
         }
 
         var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
@@ -214,16 +219,26 @@ internal sealed class SingleBlockFarmService
             state.Farm.InputMode,
             state.Farm.FilterMode,
             state.Farm.SeedFilterQualifiedItemIds.Count,
-            state.Farm.InputBuffer.Count,
+            CountBufferedItems(state.Farm.InputBuffer),
             state.Farm.InternalFertilizerCount,
             occupied,
             Math.Max(0, tier.Plots - occupied),
-            state.OutputBuffer.Count,
+            state.Farm.PlotLocks.Count,
+            CountBufferedItems(state.OutputBuffer),
             FarmModuleRules.GetUsedSlots(state.Farm),
             tier.ModuleSlots,
             moduleItems,
             EstimateFarmDailyValue(state.Farm),
-            CalculateFarmRequiredWh(occupied, SingleBlockFarmRules.GetModuleSnapshot(state.Farm), this.getConfig().FarmEnergyCostMultiplier));
+            CalculateFarmRequiredWh(occupied, SingleBlockFarmRules.GetModuleSnapshot(state.Farm), this.getConfig().FarmEnergyCostMultiplier),
+            state.Farm.InputBuffer.FirstOrDefault(),
+            state.Farm.InternalFertilizerCount > 0 && !string.IsNullOrWhiteSpace(state.Farm.BoundFertilizerQualifiedItemId)
+                ? new BufferedItemStack
+                {
+                    QualifiedItemId = state.Farm.BoundFertilizerQualifiedItemId,
+                    Stack = state.Farm.InternalFertilizerCount
+                }
+                : null,
+            state.OutputBuffer.FirstOrDefault());
     }
 
     internal SvsapmeMachineActionApplyResult ToggleFarmAutoPull(SObject placedObject, GameLocation location, Vector2 tile)
@@ -759,6 +774,48 @@ internal sealed class SingleBlockFarmService
         };
     }
 
+    internal SvsapmeMachineActionApplyResult TryUprootFarmPlot(SObject placedObject, GameLocation location, Vector2 tile, int plotIndex)
+    {
+        if (!this.TryGetFarmState(placedObject, location, tile, out var state, out var failure))
+            return new(false, false, failure);
+
+        var tier = SingleBlockFarmRules.GetFarmTier(placedObject.QualifiedItemId);
+        if (plotIndex < 0 || plotIndex >= tier.Plots)
+            return new(false, false, ModText.Get("hud.farm.invalidPlot", "That farm plot does not exist."));
+
+        SingleBlockFarmRules.NormalizePlotIndices(state.Farm, tier.Plots);
+        var plot = state.Farm.Plots.FirstOrDefault(candidate => candidate.PlotIndex == plotIndex);
+        if (plot is null)
+            return new(false, false, ModText.Get("hud.farm.plotEmpty", "That farm plot is empty."));
+
+        state.Farm.Plots.Remove(plot);
+        state.Farm.PlotLocks.Remove(plotIndex);
+        this.repository.Save();
+        return new(true, false, ModText.Get("hud.farm.plotUprooted", "The crop and fertilizer were removed without a refund."));
+    }
+
+    internal SvsapmeMachineActionApplyResult TryClearFarmPlots(SObject placedObject, GameLocation location, Vector2 tile)
+    {
+        if (!this.TryGetFarmState(placedObject, location, tile, out var state, out var failure))
+            return new(false, false, failure);
+
+        var removed = state.Farm.Plots.Count;
+        var locks = state.Farm.PlotLocks.Count;
+        if (removed == 0 && locks == 0)
+            return new(false, false, ModText.Get("hud.farm.noPlotsToClear", "There are no planted or locked plots to clear."));
+
+        state.Farm.Plots.Clear();
+        state.Farm.PlotLocks.Clear();
+        this.repository.Save();
+        return new(
+            true,
+            false,
+            ModText.Get(
+                "hud.farm.plotsCleared",
+                "Cleared {{count}} farm plot(s) and {{locks}} plot lock(s) without a refund.",
+                new { count = removed.ToString("N0"), locks = locks.ToString("N0") }));
+    }
+
     internal SvsapmeMachineActionApplyResult ToggleFarmPlotLock(SObject placedObject, GameLocation location, Vector2 tile, int plotIndex, string seedQualifiedItemId = "")
     {
         if (!this.TryGetFarmState(placedObject, location, tile, out var state, out var failure))
@@ -1241,6 +1298,12 @@ internal sealed class SingleBlockFarmService
                 .Sum(stack => Math.Max(0, stack.Stack));
     }
 
+    private static int CountBufferedItems(IEnumerable<BufferedItemStack> buffer)
+    {
+        var total = buffer.Aggregate(0L, (current, stack) => current + Math.Max(0, stack.Stack));
+        return (int)Math.Min(int.MaxValue, total);
+    }
+
     private void RefundFarmEnergy(Guid networkId, long wh)
     {
         if (wh <= 0)
@@ -1390,9 +1453,13 @@ internal readonly record struct FarmDashboardView(
     int FertilizerCount,
     int OccupiedPlots,
     int EmptyPlots,
+    int LockedPlots,
     int OutputBufferStacks,
     int ModuleSlotsUsed,
     int ModuleSlotsCapacity,
     IReadOnlyList<string> ModuleQualifiedItemIds,
     decimal EstimatedDailyValue,
-    long EstimatedDailyEnergyWh);
+    long EstimatedDailyEnergyWh,
+    BufferedItemStack? InputPreview,
+    BufferedItemStack? FertilizerPreview,
+    BufferedItemStack? OutputPreview);

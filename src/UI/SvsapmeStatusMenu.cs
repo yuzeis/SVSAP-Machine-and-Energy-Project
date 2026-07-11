@@ -7,7 +7,7 @@ namespace SVSAPME.UI;
 
 internal sealed class SvsapmeStatusMenu : IClickableMenu
 {
-    private const int Pad = 28;
+    private const int Pad = SvsapmeUiText.ContentPad;
     private const int LineHeight = 28;
     private static readonly Rectangle PanelSource = new(0, 256, 60, 60);
 
@@ -52,7 +52,7 @@ internal sealed class SvsapmeStatusMenu : IClickableMenu
             return;
 
         var buttonWidth = Math.Min(190, Math.Max(130, (this.width - Pad * 2 - (this.actions.Count - 1) * 12) / this.actions.Count));
-        var y = this.yPositionOnScreen + this.height - 70;
+        var y = this.yPositionOnScreen + this.height - Pad - 44;
         var x = this.xPositionOnScreen + Pad;
         foreach (var action in this.actions)
         {
@@ -105,11 +105,10 @@ internal sealed class SvsapmeStatusMenu : IClickableMenu
     {
         var panel = new Rectangle(this.xPositionOnScreen, this.yPositionOnScreen, this.width, this.height);
         SvsapmeUiText.DrawStardewAE2Frame(b, panel);
-        Utility.drawTextWithShadow(
+        SvsapmeUiText.DrawFittedTitle(
             b,
             this.title,
-            Game1.dialogueFont,
-            new Vector2(this.xPositionOnScreen + Pad + 12, this.yPositionOnScreen + 28),
+            new Rectangle(this.xPositionOnScreen + Pad + 12, this.yPositionOnScreen + 20, this.width - Pad * 2 - 70, 52),
             Game1.textColor);
 
         var content = this.ContentBounds;
@@ -175,12 +174,7 @@ internal sealed class SvsapmeStatusMenu : IClickableMenu
     {
         DrawInsetBox(b, button.bounds, enabled ? Color.White : Color.Gray * 0.7f);
         var color = enabled ? Game1.textColor : Color.DimGray;
-        var size = Game1.smallFont.MeasureString(button.label);
-        var maxWidth = Math.Max(1, button.bounds.Width - 18);
-        var scale = size.X > maxWidth ? Math.Max(0.62f, maxWidth / size.X) : 1f;
-        var x = button.bounds.X + (button.bounds.Width - size.X * scale) / 2f;
-        var y = button.bounds.Y + (button.bounds.Height - size.Y * scale) / 2f;
-        Utility.drawTextWithShadow(b, button.label, Game1.smallFont, new Vector2(x, y), color, scale);
+        SvsapmeUiText.DrawFittedLine(b, button.label, new Rectangle(button.bounds.X + 8, button.bounds.Y + 4, button.bounds.Width - 16, button.bounds.Height - 8), color);
     }
 }
 

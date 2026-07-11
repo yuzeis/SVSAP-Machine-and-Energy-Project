@@ -30,6 +30,7 @@ public sealed class ModEntry : Mod
 #if DEBUG
     private SvsapmeP0P1E2EService p0p1E2EService = null!;
     private SvsapmeFullMatrixE2EService fullMatrixE2EService = null!;
+    private GuiScreenshotE2EService guiScreenshotE2EService = null!;
 #endif
 
     public override void Entry(IModHelper helper)
@@ -116,6 +117,14 @@ public sealed class ModEntry : Mod
             this.energyProductionService,
             () => this.svsapApi,
             () => this.config);
+        this.guiScreenshotE2EService = new GuiScreenshotE2EService(
+            helper,
+            this.Monitor,
+            this.machineStateRepository,
+            this.machineRegistryService,
+            this.machineRuntimeService,
+            this.singleBlockFarmService,
+            this.singleBlockProcessorService);
 #endif
         this.machineRuntimeService.SetClientActionSender(this.multiplayerService.TrySendMachineActionRequest);
         this.singleBlockFarmService.SetClientActionSender(this.multiplayerService.TrySendMachineActionRequest);
@@ -176,6 +185,7 @@ public sealed class ModEntry : Mod
 #if DEBUG
         this.p0p1E2EService.Start();
         this.fullMatrixE2EService.Start();
+        this.guiScreenshotE2EService.Start();
 #endif
         this.Monitor.Log("SVSAPME foundation loaded. Energy constants, balance generator, and API bridge commands are active.", LogLevel.Info);
     }
@@ -191,7 +201,7 @@ public sealed class ModEntry : Mod
         this.svsapApi = this.Helper.ModRegistry.GetApi<ISvsapApi>("Koizumi.SVSAP");
         if (this.svsapApi is null)
         {
-            this.Monitor.Log("Koizumi.SVSAP API was not found. SVSAPME gameplay systems will stay disabled until SVSAP 1.4.0-alpha.1+ is loaded.", LogLevel.Error);
+            this.Monitor.Log("Koizumi.SVSAP API was not found. SVSAPME gameplay systems will stay disabled until SVSAP 1.4.1-rc1.0 or later is loaded.", LogLevel.Error);
             return;
         }
 
@@ -273,6 +283,8 @@ public sealed class ModEntry : Mod
 
     private void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
     {
+        ChestAccessHelper.Reset();
+
         if (Game1.player is not null)
             SyncSvsapmeCraftingRecipeUnlocks(Game1.player, this.config);
 

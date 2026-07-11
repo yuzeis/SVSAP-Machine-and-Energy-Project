@@ -12,11 +12,19 @@ namespace SVSAPME.UI;
 /// <summary>Structured farmhand UI for host-authoritative SVSAPME machines.</summary>
 internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineMenu
 {
-    private const int Pad = 20;
+    private const int Pad = SvsapmeUiText.ContentPad;
     private const int PageSize = 30;
     private const int CellSize = 50;
-    private const int InventoryCellSize = 52;
+    private const int InventoryCellSize = 48;
     private const int RefreshIntervalTicks = 30;
+    private const int SnapshotRequestTimeoutTicks = 180;
+    private const int ProcessorPortSlotWidth = 62;
+    private const int ProcessorPortSlotHeight = 34;
+    private const int ProcessorPortSlotGap = 4;
+    private const int ProcessorUpgradeSlotSize = 32;
+    private const int ProcessorUpgradeSlotGap = 4;
+    private const int NestedHeaderInset = 10;
+    private const int WorkHeaderHeight = 92;
     private static readonly Rectangle PanelSource = new(0, 256, 60, 60);
 
     private readonly Func<SvsapmeMachineActionRequest, bool> sendAction;
@@ -29,8 +37,14 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
     private int requestedOffset;
     private int selectedFilterSlot;
     private int selectedUpgradeSlot = -1;
+    private bool farmUprootMode;
     private int lastRefreshTick;
+    private bool snapshotRequestPending;
+    private int snapshotRequestAtTick;
     private string? hoverText;
+    private readonly Guid menuSessionId;
+    private long lastAppliedRequestSequence;
+    private readonly SvsapmeItemIconCache itemIconCache = new();
 
     public RemoteMachineControlMenu(
         SvsapmeMachineSnapshotResponse snapshot,
@@ -46,6 +60,8 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
     {
         this.snapshot = snapshot;
         this.appliedRevision = snapshot.Revision;
+        this.menuSessionId = snapshot.MenuSessionId;
+        this.lastAppliedRequestSequence = snapshot.RequestSequence;
         this.sendAction = sendAction;
         this.requestSnapshot = requestSnapshot;
         this.isPending = isPending;
@@ -75,6 +91,55 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
 
     public int SnapshotLimit => PageSize;
 
+    public bool MatchesSnapshotContext(SvsapmeMachineSnapshotResponse candidate)
+    {
+        return RemoteSnapshotSessionRules.Matches(this.menuSessionId, candidate.MenuSessionId)
+            && candidate.MachineGuid == this.MachineGuid;
+    }
+
+    public bool TryApplyRefreshSnapshot(SvsapmeMachineSnapshotResponse next)
+    {
+        if (!this.MatchesSnapshotContext(next))
+            return false;
+
+        if (!RemoteSnapshotSessionRules.IsNewer(this.lastAppliedRequestSequence, next.RequestSequence))
+            return false;
+
+        this.snapshotRequestPending = false;
+        this.lastAppliedRequestSequence = next.RequestSequence;
+        this.lastRefreshTick = Game1.ticks;
+        this.ApplySnapshot(next);
+        return true;
+    }
+
+    public void MarkSnapshotRequestFailed(long requestSequence)
+    {
+        if (!RemoteSnapshotSessionRules.IsNewer(this.lastAppliedRequestSequence, requestSequence))
+            return;
+
+        this.lastAppliedRequestSequence = requestSequence;
+        this.snapshotRequestPending = false;
+        this.lastRefreshTick = Game1.ticks;
+    }
+
+    public bool TryApplyActionResponse(SvsapmeMachineActionResponse response)
+    {
+        if (response.MachineGuid != this.MachineGuid
+            || !RemoteSnapshotSessionRules.Matches(this.menuSessionId, response.MenuSessionId)
+            || !RemoteSnapshotSessionRules.IsNewer(this.lastAppliedRequestSequence, response.RequestSequence))
+        {
+            return false;
+        }
+
+        this.lastAppliedRequestSequence = response.RequestSequence;
+        this.snapshotRequestPending = false;
+        this.lastRefreshTick = Game1.ticks;
+        if (response.Snapshot is not null && this.MatchesSnapshotContext(response.Snapshot))
+            this.ApplySnapshot(response.Snapshot);
+
+        return true;
+    }
+
     private Rectangle ContentBounds => new(
         this.xPositionOnScreen + Pad,
         this.yPositionOnScreen + 76,
@@ -85,8 +150,8 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
     {
         get
         {
-            const int columns = 12;
-            const int rows = 3;
+            var columns = this.InventoryColumns;
+            var rows = Math.Max(3, (int)Math.Ceiling(Game1.player.Items.Count / (double)columns));
             var width = columns * InventoryCellSize;
             return new Rectangle(
                 this.xPositionOnScreen + (this.width - width) / 2,
@@ -94,6 +159,30 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
                 width,
                 rows * InventoryCellSize);
         }
+    }
+
+    private int InventoryColumns => Math.Clamp((this.width - Pad * 2) / InventoryCellSize, 4, 12);
+
+    internal static bool ProcessorPortStripFits(int menuWidth)
+    {
+        var contentWidth = menuWidth - Pad * 2;
+        const int gap = 12;
+        var sideWidth = Math.Clamp((contentWidth - 6 * 36 - gap * 2) / 2, 136, 154);
+        var centerWidth = contentWidth - sideWidth * 2 - gap * 2;
+        var portWidth = 3 * ProcessorPortSlotWidth + 2 * ProcessorPortSlotGap;
+        var upgradeWidth = 5 * ProcessorUpgradeSlotSize + 4 * ProcessorUpgradeSlotGap;
+        return portWidth <= centerWidth - 16 && upgradeWidth <= centerWidth - 16;
+    }
+
+    internal static bool NestedWorkHeaderKeepsSafeGutter()
+    {
+        var visibleTopGutter = NestedHeaderInset - SvsapmeUiText.FrameBevelWidth;
+        var headerItemBottom = NestedHeaderInset
+            + ProcessorPortSlotHeight
+            + 6
+            + ProcessorUpgradeSlotSize;
+        return visibleTopGutter >= 8
+            && headerItemBottom + 8 <= WorkHeaderHeight;
     }
 
     public void ApplySnapshot(SvsapmeMachineSnapshotResponse next)
@@ -105,16 +194,28 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         this.appliedRevision = next.Revision;
         this.requestedOffset = ResolveOffset(next);
         this.lastRefreshTick = Game1.ticks;
+        this.snapshotRequestPending = false;
     }
 
     public override void update(GameTime time)
     {
         base.update(time);
-        if (Game1.ticks - this.lastRefreshTick < RefreshIntervalTicks || this.isPending(this.MachineGuid))
+        var tick = Game1.ticks;
+        if (this.isPending(this.MachineGuid))
             return;
 
-        this.lastRefreshTick = Game1.ticks;
-        this.requestSnapshot(this.MachineGuid, this.requestedOffset, PageSize);
+        if (this.snapshotRequestPending)
+        {
+            if (!RemoteSnapshotSessionRules.HasTimedOut(this.snapshotRequestAtTick, tick, SnapshotRequestTimeoutTicks))
+                return;
+
+            this.snapshotRequestPending = false;
+        }
+
+        if (tick >= this.lastRefreshTick && tick - this.lastRefreshTick < RefreshIntervalTicks)
+            return;
+
+        this.RequestSnapshot(this.requestedOffset);
     }
 
     public override void receiveLeftClick(int x, int y, bool playSound = true)
@@ -234,6 +335,31 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             }
         }
 
+        if (this.snapshot.MenuKind == SvsapmeMachineMenuKind.Processor)
+        {
+            var upgradeIndex = this.HitProcessorUpgrade(x, y);
+            var processor = this.snapshot.Processor;
+            if (processor is not null && upgradeIndex >= 0)
+            {
+                this.hoverText = upgradeIndex < processor.InstalledUpgradeQualifiedItemIds.Count
+                    ? ProcessorUpgradeRules.GetEffectDescription(
+                        SingleBlockProcessorRules.GetProcessorKind(this.snapshot.QualifiedItemId),
+                        processor.InstalledUpgradeQualifiedItemIds[upgradeIndex])
+                    : ModText.Get(
+                        "ui.processor.upgrade.empty",
+                        "Install a Speed or Capacity Card here; kegs also accept one Quality Card.");
+                return;
+            }
+
+            var portIndex = this.HitProcessorPort(x, y);
+            var ports = MachinePortCatalog.GetPorts(this.snapshot.QualifiedItemId);
+            if (portIndex >= 0 && portIndex < ports.Count)
+            {
+                this.hoverText = FormatPortTooltip(ports[portIndex], this.snapshot.Processor!);
+                return;
+            }
+        }
+
         if (this.snapshot.MenuKind == SvsapmeMachineMenuKind.EnergyMonitor)
         {
             var device = this.HitEnergyDevice(x, y);
@@ -287,26 +413,17 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
 
     public override void draw(SpriteBatch b)
     {
-        IClickableMenu.drawTextureBox(
+        SvsapmeUiText.DrawStardewAE2Frame(
             b,
-            Game1.menuTexture,
-            PanelSource,
-            this.xPositionOnScreen,
-            this.yPositionOnScreen,
-            this.width,
-            this.height,
-            Color.White,
-            1f,
-            true);
+            new Rectangle(this.xPositionOnScreen, this.yPositionOnScreen, this.width, this.height));
 
         var title = string.IsNullOrWhiteSpace(this.snapshot.DisplayName)
             ? ModText.Get("ui.machine.remoteTitle", "SVSAPME Machine")
             : this.snapshot.DisplayName;
-        Utility.drawTextWithShadow(
+        SvsapmeUiText.DrawFittedTitle(
             b,
             title,
-            Game1.dialogueFont,
-            new Vector2(this.xPositionOnScreen + Pad + 8, this.yPositionOnScreen + 22),
+            new Rectangle(this.xPositionOnScreen + Pad + 8, this.yPositionOnScreen + 14, this.width - Pad * 2 - 98, 52),
             Game1.textColor);
 
         var pending = this.isPending(this.MachineGuid);
@@ -372,7 +489,11 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         DrawSlot(b, fertilizerSlot, string.IsNullOrWhiteSpace(farm.FertilizerQualifiedItemId) ? null : new BufferedItemStack { QualifiedItemId = farm.FertilizerQualifiedItemId, Stack = farm.FertilizerCount }, farm.FertilizerCount > 0 ? PixelStatus.Ready : PixelStatus.Idle);
 
         foreach (var button in this.GetFarmButtons())
-            DrawButton(b, button.Component, button.Enabled);
+            DrawButton(
+                b,
+                button.Component,
+                button.Enabled,
+                button.ActionKind == SvsapmeMachineActionKind.UprootFarmPlot && this.farmUprootMode ? Color.LightGreen : null);
 
         var output = new Rectangle(right.X + (right.Width - 56) / 2, right.Y + 38, 56, 56);
         DrawSlot(b, output, farm.OutputBuffer.FirstOrDefault(), farm.OutputBuffer.Count > 0 ? PixelStatus.Ready : PixelStatus.Idle);
@@ -397,10 +518,12 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
 
         var page = this.requestedOffset / PageSize + 1;
         var pages = Math.Max(1, (int)Math.Ceiling(farm.PlotCapacity / (double)PageSize));
+        var moduleCapacity = Math.Max(farm.ModuleSlotCapacity, farm.InstalledModuleQualifiedItemIds.Count);
+        var moduleHeaderWidth = moduleCapacity > 0 ? moduleCapacity * 38 + 8 : 0;
         SvsapmeUiText.DrawFittedLine(
             b,
             ModText.Get("ui.common.page", "Page {{page}}/{{pages}}", new { page, pages }),
-            new Rectangle(center.X + 8, center.Y + 6, center.Width - 16, 24),
+            new Rectangle(center.X + NestedHeaderInset + 2, center.Y + NestedHeaderInset, Math.Max(24, center.Width - 24 - moduleHeaderWidth), 24),
             Game1.textColor);
 
         SvsapmeUiText.DrawFittedLines(
@@ -462,16 +585,36 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
 
         var page = this.requestedOffset / PageSize + 1;
         var pages = Math.Max(1, (int)Math.Ceiling(processor.SlotCapacity / (double)PageSize));
-        SvsapmeUiText.DrawFittedLine(
-            b,
-            ModText.Get("ui.common.page", "Page {{page}}/{{pages}}", new { page, pages }),
-            new Rectangle(center.X + 8, center.Y + 6, center.Width - 16, 24),
-            Game1.textColor);
+        var ports = MachinePortCatalog.GetPorts(this.snapshot.QualifiedItemId);
+        var portStripWidth = ports.Count * ProcessorPortSlotWidth + Math.Max(0, ports.Count - 1) * ProcessorPortSlotGap;
+        var pageWidth = center.Width - NestedHeaderInset * 2 - portStripWidth - 6;
+        if (pageWidth >= 24)
+        {
+            SvsapmeUiText.DrawFittedLine(
+                b,
+                ModText.Get("ui.common.page", "Page {{page}}/{{pages}}", new { page, pages }),
+                new Rectangle(center.X + NestedHeaderInset, center.Y + NestedHeaderInset + 4, pageWidth, 24),
+                Game1.textColor);
+        }
+        this.DrawProcessorPorts(b, processor, center);
+        this.DrawProcessorUpgrades(b, processor, center);
 
         SvsapmeUiText.DrawFittedLine(
             b,
             ModText.Get("ui.singleBlock.dayValue", "{{value}}g/day", new { value = processor.EstimatedDailyValue.ToString("0") }),
-            new Rectangle(right.X + 10, right.Bottom - 36, right.Width - 20, 24),
+            new Rectangle(right.X + 10, right.Bottom - 54, right.Width - 20, 22),
+            Game1.textColor);
+        SvsapmeUiText.DrawFittedLine(
+            b,
+            ModText.Get(
+                "ui.processor.upgrade.remoteStatus",
+                "Speed {{percent}}% / buffer {{buffer}}",
+                new
+                {
+                    percent = (processor.SpeedPermille / 10).ToString("N0"),
+                    buffer = processor.OutputBufferCapacityItems.ToString("N0")
+                }),
+            new Rectangle(right.X + 10, right.Bottom - 30, right.Width - 20, 20),
             Game1.textColor);
     }
 
@@ -487,6 +630,7 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         var content = this.ContentBounds;
         var filterPanel = new Rectangle(content.X, content.Y, 230, content.Height);
         var statusPanel = new Rectangle(filterPanel.Right + 16, content.Y, content.Width - filterPanel.Width - 16, content.Height);
+        var compact = statusPanel.Height < 300;
         DrawPanel(b, filterPanel);
         DrawPanel(b, statusPanel);
         DrawSectionTitle(b, filterPanel, ModText.Get("ui.powered.filter.title", "Filters"));
@@ -508,14 +652,15 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         var networkStatus = powered.NetworkOnline
             ? ModText.Get("ui.powered.networkStatus", "Power online: {{stored}} / {{capacity}}", new { stored = FormatWh(powered.StoredWh), capacity = FormatWh(powered.CapacityWh) })
             : ModText.Get("ui.powered.network.offline", "Power offline or no energy cell");
-        SvsapmeUiText.DrawPixelStatusLight(b, statusPanel.X + 16, statusPanel.Y + 45, powered.NetworkOnline ? PixelStatus.Ready : PixelStatus.Offline);
+        var statusLine = new Rectangle(statusPanel.X + 34, statusPanel.Y + (compact ? 34 : 36), statusPanel.Width - 50, compact ? 22 : 26);
+        SvsapmeUiText.DrawPixelStatusLight(b, statusPanel.X + 16, statusPanel.Y + (compact ? 41 : 45), powered.NetworkOnline ? PixelStatus.Ready : PixelStatus.Offline);
         SvsapmeUiText.DrawFittedLine(
             b,
             networkStatus,
-            new Rectangle(statusPanel.X + 34, statusPanel.Y + 36, statusPanel.Width - 50, 26),
+            statusLine,
             powered.NetworkOnline ? Game1.textColor : Color.Crimson);
 
-        var meter = new Rectangle(statusPanel.X + 16, statusPanel.Y + 66, statusPanel.Width - 32, 18);
+        var meter = new Rectangle(statusPanel.X + 16, statusPanel.Y + (compact ? 58 : 66), statusPanel.Width - 32, compact ? 14 : 18);
         b.Draw(Game1.staminaRect, meter, Color.Black * 0.42f);
         var powerRatio = powered.CapacityWh <= 0 ? 0m : Math.Clamp(powered.StoredWh / (decimal)powered.CapacityWh, 0m, 1m);
         var powerFillWidth = (int)((meter.Width - 4) * powerRatio);
@@ -528,16 +673,29 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             ModText.Get("ui.powered.energy", "Energy: {{wh}} Wh/action", new { wh = powered.EnergyPerActionWh.ToString("0.0#") }),
             ModText.Get("ui.powered.direction", "Direction: {{direction}}", new { direction = FormatDirection(powered.FacingDirection) })
         };
-        SvsapmeUiText.DrawFittedLines(
-            b,
-            lines,
-            new Rectangle(statusPanel.X + 16, statusPanel.Y + 92, statusPanel.Width - 32, 54),
-            Game1.textColor);
+        if (compact)
+        {
+            for (var i = 0; i < lines.Length; i++)
+            {
+                SvsapmeUiText.DrawFittedLine(
+                    b,
+                    lines[i],
+                    new Rectangle(statusPanel.X + 16, statusPanel.Y + 76 + i * 18, statusPanel.Width - 32, 18),
+                    Game1.textColor);
+            }
+        }
+        else
+        {
+            SvsapmeUiText.DrawFittedLines(
+                b,
+                lines,
+                new Rectangle(statusPanel.X + 16, statusPanel.Y + 92, statusPanel.Width - 32, 54),
+                Game1.textColor);
+        }
 
-        var upgradesY = statusPanel.Y + 154;
         for (var i = 0; i < powered.UpgradeSlotCapacity; i++)
         {
-            var cell = new Rectangle(statusPanel.X + 18 + i * 58, upgradesY, 52, 52);
+            var cell = GetPoweredUpgradeCell(statusPanel, i);
             var qualifiedItemId = i < powered.InstalledUpgradeQualifiedItemIds.Count
                 ? powered.InstalledUpgradeQualifiedItemIds[i]
                 : string.Empty;
@@ -545,7 +703,7 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             if (string.IsNullOrWhiteSpace(qualifiedItemId))
                 SvsapmeUiText.DrawGhostUpgradeSlot(b, cell);
             else
-                DrawQualifiedItem(b, qualifiedItemId, cell, 0.68f);
+                DrawQualifiedItem(b, qualifiedItemId, cell, compact ? 0.58f : 0.68f);
             if (i == this.selectedUpgradeSlot)
                 DrawSelection(b, cell);
         }
@@ -563,14 +721,17 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         var content = this.ContentBounds;
         DrawPanel(b, content);
         var status = energy.Online
-            ? string.IsNullOrWhiteSpace(energy.StatusText) ? ModText.Get("ui.machine.network.online", "Network online") : energy.StatusText
+            ? !string.IsNullOrWhiteSpace(energy.LastWarning)
+                ? energy.LastWarning
+                : string.IsNullOrWhiteSpace(energy.StatusText) ? ModText.Get("ui.machine.network.online", "Network online") : energy.StatusText
             : string.IsNullOrWhiteSpace(energy.StatusText) ? ModText.Get("ui.powered.network.offline", "Power offline or no energy cell") : energy.StatusText;
-        SvsapmeUiText.DrawPixelStatusLight(b, content.X + 22, content.Y + 17, energy.Online ? PixelStatus.Ready : PixelStatus.Offline);
+        var energyStatus = ResolveEnergyStatus(energy.Online, energy.LastWarning, energy.StoredWh, energy.CapacityWh);
+        SvsapmeUiText.DrawPixelStatusLight(b, content.X + 22, content.Y + 17, energyStatus);
         SvsapmeUiText.DrawFittedLine(
             b,
             status,
             new Rectangle(content.X + 40, content.Y + 8, content.Width - 62, 26),
-            energy.Online ? Game1.textColor : Color.Crimson);
+            energyStatus == PixelStatus.Offline ? Color.Crimson : energyStatus == PixelStatus.Warning ? Color.DarkOrange : Game1.textColor);
 
         var meter = new Rectangle(content.X + 22, content.Y + 42, content.Width - 44, 34);
         b.Draw(Game1.staminaRect, meter, Color.Black * 0.45f);
@@ -580,7 +741,15 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             b.Draw(Game1.staminaRect, new Rectangle(meter.X + 3, meter.Y + 3, fillWidth, meter.Height - 6), ratio < 0.15m ? Color.Crimson : ratio < 0.4m ? Color.Orange : Color.LimeGreen);
         SvsapmeUiText.DrawFittedLine(
             b,
-            ModText.Get("ui.energyMeter.capacity", "{{stored}} / {{capacity}} kWh", new { stored = (energy.StoredWh / 1000m).ToString("0.00"), capacity = (energy.CapacityWh / 1000m).ToString("0.00") }),
+            ModText.Get(
+                "ui.energyMeter.capacity",
+                "{{stored}} / {{capacity}} kWh ({{percent}})",
+                new
+                {
+                    stored = (energy.StoredWh / 1000m).ToString("0.00"),
+                    capacity = (energy.CapacityWh / 1000m).ToString("0.00"),
+                    percent = ratio.ToString("P0")
+                }),
             meter,
             Color.White);
 
@@ -613,11 +782,12 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
     private void DrawInventory(SpriteBatch b)
     {
         var inventory = this.InventoryBounds;
-        for (var i = 0; i < Math.Min(36, Game1.player.Items.Count); i++)
+        for (var i = 0; i < Game1.player.Items.Count; i++)
         {
             var bounds = this.GetInventorySlotBounds(i);
             IClickableMenu.drawTextureBox(b, Game1.menuTexture, PanelSource, bounds.X, bounds.Y, bounds.Width, bounds.Height, Color.White * 0.82f, 1f, false);
-            Game1.player.Items[i]?.drawInMenu(b, new Vector2(bounds.X + 4, bounds.Y + 4), 0.72f, 1f, 0.86f, StackDrawType.Draw, Color.White, true);
+            var item = Game1.player.Items[i];
+            SvsapmeUiText.DrawItemWithAdaptiveCount(b, item, bounds, item?.Stack ?? 0, 0.64f);
         }
 
         b.Draw(Game1.staminaRect, new Rectangle(inventory.X, inventory.Y - 10, inventory.Width, 2), Color.SaddleBrown * 0.55f);
@@ -639,7 +809,7 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
     {
         DrawPanel(b, bounds);
         DrawSectionTitle(b, bounds, title);
-        var lines = devices.Take(7).Select(device => ModText.Get("ui.energyMeter.deviceLine", "{{name}}: {{value}}", new { name = device.DisplayName, value = FormatWh(device.TotalWh) }));
+        var lines = devices.Take(GetVisibleEnergyRowCount(bounds, devices.Count)).Select(device => ModText.Get("ui.energyMeter.deviceLine", "{{name}}: {{value}}", new { name = device.DisplayName, value = FormatWh(device.TotalWh) }));
         SvsapmeUiText.DrawFittedLines(b, lines, new Rectangle(bounds.X + 12, bounds.Y + 36, bounds.Width - 24, bounds.Height - 46), Game1.textColor);
     }
 
@@ -664,7 +834,7 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         int x,
         int y)
     {
-        for (var index = 0; index < Math.Min(7, devices.Count); index++)
+        for (var index = 0; index < GetVisibleEnergyRowCount(bounds, devices.Count); index++)
         {
             var row = new Rectangle(bounds.X + 10, bounds.Y + 36 + index * SvsapmeUiText.SmallLineHeight, bounds.Width - 20, SvsapmeUiText.SmallLineHeight);
             if (row.Contains(x, y))
@@ -692,6 +862,19 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             if (!button.Enabled)
             {
                 Game1.playSound("cancel");
+                return true;
+            }
+
+            if (button.ActionKind == SvsapmeMachineActionKind.UprootFarmPlot)
+            {
+                this.farmUprootMode = !this.farmUprootMode;
+                Game1.playSound("shwip");
+                return true;
+            }
+
+            if (button.ActionKind == SvsapmeMachineActionKind.ClearFarmPlots)
+            {
+                this.OpenRemoteClearAllConfirmation();
                 return true;
             }
 
@@ -754,6 +937,13 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
                 this.Send(SvsapmeMachineActionKind.CollectProcessorOutput);
                 return true;
             }
+
+            var upgradeIndex = this.HitProcessorUpgrade(x, y);
+            if (upgradeIndex >= 0 && upgradeIndex < processor.InstalledUpgradeQualifiedItemIds.Count)
+            {
+                this.Send(SvsapmeMachineActionKind.RemoveProcessorUpgrade, upgradeIndex);
+                return true;
+            }
         }
 
         return false;
@@ -783,7 +973,11 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
                     action = SvsapmeMachineActionKind.AddFarmFilter;
                 break;
             case SvsapmeMachineMenuKind.Processor:
-                action = SvsapmeMachineActionKind.LoadProcessorInput;
+                action = ProcessorUpgradeRules.IsProcessorUpgradeCard(item.QualifiedItemId)
+                    ? SvsapmeMachineActionKind.InstallProcessorUpgrade
+                    : SvsapmeMachineActionKind.LoadProcessorInput;
+                if (action == SvsapmeMachineActionKind.InstallProcessorUpgrade)
+                    count = 1;
                 break;
             case SvsapmeMachineMenuKind.PoweredTransfer:
                 action = this.selectedUpgradeSlot >= 0
@@ -811,8 +1005,7 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         Game1.player.CurrentToolIndex = inventoryIndex;
         try
         {
-            if (this.sendAction(request))
-                Game1.playSound("Ship");
+            this.SendActionRequest(request, "Ship");
         }
         finally
         {
@@ -827,6 +1020,20 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             return;
 
         var plot = this.snapshot.Farm!.Plots[cellIndex];
+        if (this.farmUprootMode)
+        {
+            if (string.IsNullOrWhiteSpace(plot.SeedQualifiedItemId))
+            {
+                Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.farm.plotEmpty", "That farm plot is empty."), HUDMessage.error_type));
+                Game1.playSound("cancel");
+            }
+            else
+            {
+                this.OpenRemoteUprootConfirmation(plot);
+            }
+            return;
+        }
+
         if (plot.Ready)
         {
             this.Send(SvsapmeMachineActionKind.HarvestFarmPlot, plot.PlotIndex);
@@ -846,7 +1053,7 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             Game1.player.FarmingLevel,
             this.requestedOffset,
             PageSize);
-        this.sendAction(request);
+        this.SendActionRequest(request, "Ship");
     }
 
     private void HandleProcessorCell(int x, int y)
@@ -905,13 +1112,74 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         var (left, _, right) = this.GetThreeColumns();
         return new[]
         {
-            MakeButton(left, 104, ModText.Get("ui.processor.autoIn", "Auto In") + ": " + SvsapmeUiText.FormatAuto(farm.AutoPullFromNetwork), SvsapmeMachineActionKind.ToggleFarmAutoPull),
-            MakeButton(left, 144, ModText.Get("ui.processor.inputMode", "Input Mode") + ": " + SvsapmeUiText.FormatInputMode(farm.InputMode), SvsapmeMachineActionKind.ToggleFarmInputMode),
-            MakeButton(left, 184, ModText.Get("ui.processor.filterMode", "W/B") + ": " + SvsapmeUiText.FormatFilterMode(farm.FilterMode), SvsapmeMachineActionKind.ToggleFarmFilterMode),
-            MakeButton(left, 224, ModText.Get("ui.processor.clearFilter", "Clear Filter"), SvsapmeMachineActionKind.ClearFarmFilter),
-            MakeButton(right, 104, ModText.Get("ui.processor.autoOut", "Auto Out") + ": " + SvsapmeUiText.FormatAuto(farm.AutoPushOutputToNetwork), SvsapmeMachineActionKind.ToggleFarmAutoPush),
-            MakeButton(right, 144, ModText.Get("ui.processor.collectAll", "Collect All"), SvsapmeMachineActionKind.CollectFarmOutput, farm.OutputBuffer.Count > 0)
+            MakeButton(left, 96, ModText.Get("ui.processor.autoIn", "Auto In") + ": " + SvsapmeUiText.FormatAuto(farm.AutoPullFromNetwork), SvsapmeMachineActionKind.ToggleFarmAutoPull),
+            MakeButton(left, 132, ModText.Get("ui.processor.inputMode", "Input Mode") + ": " + SvsapmeUiText.FormatInputMode(farm.InputMode), SvsapmeMachineActionKind.ToggleFarmInputMode),
+            MakeButton(left, 168, ModText.Get("ui.processor.filterMode", "W/B") + ": " + SvsapmeUiText.FormatFilterMode(farm.FilterMode), SvsapmeMachineActionKind.ToggleFarmFilterMode),
+            MakeButton(left, 204, ModText.Get("ui.processor.clearFilter", "Clear Filter"), SvsapmeMachineActionKind.ClearFarmFilter),
+            MakeButton(right, 96, ModText.Get("ui.processor.autoOut", "Auto Out") + ": " + SvsapmeUiText.FormatAuto(farm.AutoPushOutputToNetwork), SvsapmeMachineActionKind.ToggleFarmAutoPush),
+            MakeButton(right, 132, ModText.Get("ui.processor.collectAll", "Collect All"), SvsapmeMachineActionKind.CollectFarmOutput, farm.OutputBuffer.Count > 0),
+            MakeButton(right, 168, ModText.Get("ui.farm.uprootMode", "Uproot"), SvsapmeMachineActionKind.UprootFarmPlot, farm.OccupiedPlots > 0),
+            MakeButton(right, 204, ModText.Get("ui.farm.clearAll", "Clear All"), SvsapmeMachineActionKind.ClearFarmPlots, farm.OccupiedPlots > 0 || farm.LockedPlots > 0)
         };
+    }
+
+    private void OpenRemoteUprootConfirmation(SvsapmeFarmPlotSnapshot plot)
+    {
+        var lines = new List<string>
+        {
+            ModText.Get(
+                "ui.farm.uproot.confirmBody",
+                "Remove plot {{plot}} and its {{crop}} crop?",
+                new
+                {
+                    plot = (plot.PlotIndex + 1).ToString("N0"),
+                    crop = FormatItem(plot.HarvestQualifiedItemId, plot.SeedQualifiedItemId)
+                }),
+            ModText.Get("ui.farm.destructive.noRefund", "The crop, fertilizer, progress, and plot lock will not be returned.")
+        };
+        if (this.snapshot.Farm?.AutoPullFromNetwork == true)
+            lines.Add(ModText.Get("ui.farm.destructive.autoPullWarning", "Automatic input is enabled, so this plot may be planted again during the next farm cycle."));
+
+        Game1.activeClickableMenu = new SvsapmeConfirmationMenu(
+            this,
+            ModText.Get("ui.farm.uproot.confirmTitle", "Confirm Uproot"),
+            lines,
+            () => this.Send(SvsapmeMachineActionKind.UprootFarmPlot, plot.PlotIndex));
+    }
+
+    private void OpenRemoteClearAllConfirmation()
+    {
+        var farm = this.snapshot.Farm;
+        if (farm is null || farm.OccupiedPlots <= 0 && farm.LockedPlots <= 0)
+        {
+            Game1.addHUDMessage(new HUDMessage(ModText.Get("hud.farm.noPlotsToClear", "There are no planted or locked plots to clear."), HUDMessage.error_type));
+            Game1.playSound("cancel");
+            return;
+        }
+
+        var lines = new List<string>
+        {
+            ModText.Get(
+                "ui.farm.clearAll.confirmBody",
+                "Clear all {{count}} planted farm plots?",
+                new { count = farm.OccupiedPlots.ToString("N0") }),
+            ModText.Get("ui.farm.destructive.noRefund", "The crop, fertilizer, progress, and plot lock will not be returned.")
+        };
+        if (farm.LockedPlots > 0)
+        {
+            lines.Add(ModText.Get(
+                "ui.farm.clearAll.lockCount",
+                "Plot locks to clear: {{count}}.",
+                new { count = farm.LockedPlots.ToString("N0") }));
+        }
+        if (farm.AutoPullFromNetwork)
+            lines.Add(ModText.Get("ui.farm.destructive.autoPullWarning", "Automatic input is enabled, so empty plots may be planted again during the next farm cycle."));
+
+        Game1.activeClickableMenu = new SvsapmeConfirmationMenu(
+            this,
+            ModText.Get("ui.farm.clearAll.confirmTitle", "Confirm Clear All"),
+            lines,
+            () => this.Send(SvsapmeMachineActionKind.ClearFarmPlots));
     }
 
     private IReadOnlyList<RemoteActionButton> GetProcessorButtons()
@@ -923,13 +1191,13 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         var (left, _, right) = this.GetThreeColumns();
         return new[]
         {
-            MakeButton(left, 106, ModText.Get("ui.processor.autoIn", "Auto In") + ": " + SvsapmeUiText.FormatAuto(processor.AutoPullFromNetwork), SvsapmeMachineActionKind.ToggleProcessorAutoPull),
-            MakeButton(left, 146, ModText.Get("ui.processor.inputMode", "Input Mode") + ": " + SvsapmeUiText.FormatInputMode(processor.InputMode), SvsapmeMachineActionKind.ToggleProcessorInputMode),
-            MakeButton(left, 186, ModText.Get("ui.processor.filterMode", "W/B") + ": " + SvsapmeUiText.FormatFilterMode(processor.FilterMode), SvsapmeMachineActionKind.ToggleProcessorFilterMode),
-            MakeButton(left, 226, ModText.Get("ui.processor.clearFilter", "Clear Filter"), SvsapmeMachineActionKind.ClearProcessorFilter),
-            MakeButton(left, 266, ModText.Get("ui.processor.extractInput", "Take Input"), SvsapmeMachineActionKind.ExtractProcessorInput, processor.InputBuffer.Count > 0),
-            MakeButton(right, 106, ModText.Get("ui.processor.autoOut", "Auto Out") + ": " + SvsapmeUiText.FormatAuto(processor.AutoPushOutputToNetwork), SvsapmeMachineActionKind.ToggleProcessorAutoPush),
-            MakeButton(right, 146, ModText.Get("ui.processor.collectAll", "Collect All"), SvsapmeMachineActionKind.CollectProcessorOutput, processor.OutputBuffer.Count > 0 || processor.Slots.Any(slot => slot.CanCollect))
+            MakeButton(left, 96, ModText.Get("ui.processor.autoIn", "Auto In") + ": " + SvsapmeUiText.FormatAuto(processor.AutoPullFromNetwork), SvsapmeMachineActionKind.ToggleProcessorAutoPull),
+            MakeButton(left, 132, ModText.Get("ui.processor.inputMode", "Input Mode") + ": " + SvsapmeUiText.FormatInputMode(processor.InputMode), SvsapmeMachineActionKind.ToggleProcessorInputMode),
+            MakeButton(left, 168, ModText.Get("ui.processor.filterMode", "W/B") + ": " + SvsapmeUiText.FormatFilterMode(processor.FilterMode), SvsapmeMachineActionKind.ToggleProcessorFilterMode),
+            MakeButton(left, 204, ModText.Get("ui.processor.clearFilter", "Clear Filter"), SvsapmeMachineActionKind.ClearProcessorFilter),
+            MakeButton(left, 240, ModText.Get("ui.processor.extractInput", "Take Input"), SvsapmeMachineActionKind.ExtractProcessorInput, processor.InputBuffer.Count > 0),
+            MakeButton(right, 96, ModText.Get("ui.processor.autoOut", "Auto Out") + ": " + SvsapmeUiText.FormatAuto(processor.AutoPushOutputToNetwork), SvsapmeMachineActionKind.ToggleProcessorAutoPush),
+            MakeButton(right, 132, ModText.Get("ui.processor.collectAll", "Collect All"), SvsapmeMachineActionKind.CollectProcessorOutput, processor.OutputBuffer.Count > 0 || processor.Slots.Any(slot => slot.CanCollect))
         };
     }
 
@@ -948,22 +1216,29 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             (Label: powered.IsBlacklist ? ModText.Get("ui.powered.mode.blacklist", "Blacklist") : ModText.Get("ui.powered.mode.whitelist", "Whitelist"), Action: SvsapmeMachineActionKind.TogglePoweredFilterMode, Enabled: true, Direction: -1),
             (Label: ModText.Get("ui.powered.oreDictionary", "Ore dictionary") + ": " + SvsapmeUiText.FormatAuto(powered.OreDictionaryEnabled), Action: SvsapmeMachineActionKind.TogglePoweredOreDictionaryMode, Enabled: hasOreCard, Direction: -1),
             (Label: ModText.Get("ui.powered.quality", "Quality") + ": " + powered.QualityStrategy, Action: SvsapmeMachineActionKind.CyclePoweredQualityStrategy, Enabled: hasQualityCard, Direction: -1),
-            (Label: ModText.Get("ui.powered.rotate", "Rotate"), Action: SvsapmeMachineActionKind.SetPoweredFacingDirection, Enabled: true, Direction: (powered.FacingDirection + 1) % 4),
+            (Label: ModText.Get("ui.powered.rotate", "Rotate"), Action: SvsapmeMachineActionKind.SetPoweredFacingDirection, Enabled: true, Direction: GetNextFacingDirection(powered.FacingDirection)),
             (Label: ModText.Get("ui.processor.clearFilter", "Clear Filter"), Action: SvsapmeMachineActionKind.ClearPoweredFilters, Enabled: true, Direction: -1)
         };
 
-        const int columns = 2;
+        var compact = statusPanel.Height < 300;
+        var columns = statusPanel.Width >= (compact ? 218 : 276) ? 3 : 2;
         const int gap = 8;
-        var width = Math.Max(80, (statusPanel.Width - 20 - gap) / columns);
+        var width = Math.Max(compact ? 60 : 80, (statusPanel.Width - 20 - gap * (columns - 1)) / columns);
+        var rows = (int)Math.Ceiling(definitions.Length / (double)columns);
+        var buttonHeight = compact ? 28 : 30;
+        var rowStride = compact ? 32 : 36;
+        var totalHeight = (rows - 1) * rowStride + buttonHeight;
+        var preferredStartY = GetPoweredUpgradeCell(statusPanel, 0).Bottom + 4;
+        var buttonStartY = Math.Min(preferredStartY, statusPanel.Bottom - totalHeight - 4);
         var result = new List<RemoteActionButton>(definitions.Length);
         for (var i = 0; i < definitions.Length; i++)
         {
             var definition = definitions[i];
             var bounds = new Rectangle(
                 statusPanel.X + 10 + i % columns * (width + gap),
-                statusPanel.Y + 218 + i / columns * 40,
+                buttonStartY + i / columns * rowStride,
                 width,
-                34);
+                buttonHeight);
             result.Add(new RemoteActionButton(
                 new ClickableComponent(bounds, definition.Action.ToString(), definition.Label),
                 definition.Action,
@@ -978,27 +1253,60 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
     {
         var request = SvsapmeMachineActionRequestFactory.Create(this.MachineGuid, kind, slotIndex, this.requestedOffset, PageSize);
         request.Direction = direction;
-        if (this.sendAction(request))
-            Game1.playSound("shwip");
+        this.SendActionRequest(request, "shwip");
     }
 
     private void RequestPage(int offset)
     {
         offset = Math.Clamp(offset, 0, this.GetLastPageOffset());
-        if (offset == this.requestedOffset && Game1.ticks - this.lastRefreshTick < RefreshIntervalTicks)
+        var tick = Game1.ticks;
+        if (offset == this.requestedOffset
+            && tick >= this.lastRefreshTick
+            && tick - this.lastRefreshTick < RefreshIntervalTicks)
             return;
 
         this.requestedOffset = offset;
-        this.lastRefreshTick = Game1.ticks;
-        if (this.requestSnapshot(this.MachineGuid, offset, PageSize))
+        if (this.RequestSnapshot(offset))
             Game1.playSound("shwip");
+    }
+
+    private bool SendActionRequest(SvsapmeMachineActionRequest request, string successSound)
+    {
+        if (this.snapshotRequestPending)
+        {
+            Game1.playSound("cancel");
+            return false;
+        }
+
+        request.MenuSessionId = this.menuSessionId;
+        var sent = this.sendAction(request);
+        Game1.playSound(sent ? successSound : "cancel");
+        return sent;
+    }
+
+    private bool RequestSnapshot(int offset)
+    {
+        if (this.isPending(this.MachineGuid))
+            return false;
+
+        var tick = Game1.ticks;
+        if (this.snapshotRequestPending
+            && !RemoteSnapshotSessionRules.HasTimedOut(this.snapshotRequestAtTick, tick, SnapshotRequestTimeoutTicks))
+        {
+            return false;
+        }
+
+        this.lastRefreshTick = tick;
+        this.snapshotRequestAtTick = tick;
+        this.snapshotRequestPending = this.requestSnapshot(this.MachineGuid, offset, PageSize);
+        return this.snapshotRequestPending;
     }
 
     private (Rectangle Left, Rectangle Center, Rectangle Right) GetThreeColumns()
     {
         var content = this.ContentBounds;
-        const int sideWidth = 154;
         const int gap = 12;
+        var sideWidth = Math.Clamp((content.Width - 6 * 36 - gap * 2) / 2, 136, 154);
         var centerWidth = content.Width - sideWidth * 2 - gap * 2;
         return (
             new Rectangle(content.X, content.Y, sideWidth, content.Height),
@@ -1013,11 +1321,17 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             var (_, center, _) = this.GetThreeColumns();
             const int columns = 6;
             const int rows = 5;
+            var cellSize = Math.Clamp(
+                Math.Min(
+                    Math.Max(1, (center.Width - 8) / columns),
+                    Math.Max(1, (center.Height - WorkHeaderHeight - 4) / rows)),
+                32,
+                CellSize);
             return new Rectangle(
-                center.X + (center.Width - columns * CellSize) / 2,
-                center.Y + 34,
-                columns * CellSize,
-                rows * CellSize);
+                center.X + (center.Width - columns * cellSize) / 2,
+                center.Y + WorkHeaderHeight,
+                columns * cellSize,
+                rows * cellSize);
         }
     }
 
@@ -1027,8 +1341,9 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         if (!grid.Contains(x, y))
             return -1;
 
-        var column = (x - grid.X) / CellSize;
-        var row = (y - grid.Y) / CellSize;
+        var cellSize = Math.Max(1, grid.Width / 6);
+        var column = (x - grid.X) / cellSize;
+        var row = (y - grid.Y) / cellSize;
         var index = row * 6 + column;
         return index is >= 0 and < PageSize ? index : -1;
     }
@@ -1070,10 +1385,43 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
 
         var content = this.ContentBounds;
         var statusPanel = new Rectangle(content.X + 246, content.Y, content.Width - 246, content.Height);
-        var yPosition = statusPanel.Y + 154;
         for (var i = 0; i < powered.UpgradeSlotCapacity; i++)
         {
-            if (new Rectangle(statusPanel.X + 18 + i * 58, yPosition, 52, 52).Contains(x, y))
+            if (GetPoweredUpgradeCell(statusPanel, i).Contains(x, y))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private int HitProcessorPort(int x, int y)
+    {
+        if (this.snapshot.MenuKind != SvsapmeMachineMenuKind.Processor)
+            return -1;
+
+        var (_, center, _) = this.GetThreeColumns();
+        var ports = MachinePortCatalog.GetPorts(this.snapshot.QualifiedItemId);
+        for (var i = 0; i < ports.Count; i++)
+        {
+            if (GetProcessorPortCell(center, ports.Count, i).Contains(x, y))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private int HitProcessorUpgrade(int x, int y)
+    {
+        if (this.snapshot.MenuKind != SvsapmeMachineMenuKind.Processor
+            || this.snapshot.Processor is not { } processor)
+        {
+            return -1;
+        }
+
+        var (_, center, _) = this.GetThreeColumns();
+        for (var i = 0; i < processor.UpgradeSlotCapacity; i++)
+        {
+            if (GetProcessorUpgradeCell(center, processor.UpgradeSlotCapacity, i).Contains(x, y))
                 return i;
         }
 
@@ -1082,10 +1430,10 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
 
     private Rectangle GetInventorySlotBounds(int index)
     {
-        const int columns = 12;
+        var columns = this.InventoryColumns;
         var column = index % columns;
         var row = index / columns;
-        return new Rectangle(this.InventoryBounds.X + column * InventoryCellSize, this.InventoryBounds.Y + row * InventoryCellSize, 48, 48);
+        return new Rectangle(this.InventoryBounds.X + column * InventoryCellSize, this.InventoryBounds.Y + row * InventoryCellSize, InventoryCellSize - 4, InventoryCellSize - 4);
     }
 
     private int HitInventorySlot(int x, int y)
@@ -1095,8 +1443,8 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
 
         var column = (x - this.InventoryBounds.X) / InventoryCellSize;
         var row = (y - this.InventoryBounds.Y) / InventoryCellSize;
-        var index = row * 12 + column;
-        return index >= 0 && index < Math.Min(36, Game1.player.Items.Count) ? index : -1;
+        var index = row * this.InventoryColumns + column;
+        return index >= 0 && index < Game1.player.Items.Count ? index : -1;
     }
 
     private int GetCapacity()
@@ -1136,7 +1484,8 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
 
     private static Rectangle GetGridCell(Rectangle grid, int index)
     {
-        return new Rectangle(grid.X + index % 6 * CellSize, grid.Y + index / 6 * CellSize, CellSize - 4, CellSize - 4);
+        var cellSize = Math.Max(1, grid.Width / 6);
+        return new Rectangle(grid.X + index % 6 * cellSize, grid.Y + index / 6 * cellSize, cellSize - 4, cellSize - 4);
     }
 
     private static Rectangle GetFilterCell(Rectangle panel, int index)
@@ -1144,19 +1493,165 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         return new Rectangle(panel.X + 28 + index % 3 * 58, panel.Y + 46 + index / 3 * 58, 52, 52);
     }
 
+    private static Rectangle GetPoweredUpgradeCell(Rectangle statusPanel, int index)
+    {
+        var compact = statusPanel.Height < 300;
+        var size = compact ? 44 : 52;
+        var stride = compact ? 48 : 58;
+        return new Rectangle(statusPanel.X + 18 + index * stride, statusPanel.Y + (compact ? 134 : 154), size, size);
+    }
+
     private static Rectangle GetFarmModuleCell(Rectangle center, int capacity, int index)
     {
-        return new Rectangle(center.Right - 8 - capacity * 42 + index * 42, center.Y - 44, 38, 38);
+        return new Rectangle(center.Right - NestedHeaderInset - capacity * 38 + index * 38, center.Y + NestedHeaderInset, 34, 34);
+    }
+
+    private static Rectangle GetProcessorPortCell(Rectangle center, int count, int index)
+    {
+        var totalWidth = count * ProcessorPortSlotWidth + Math.Max(0, count - 1) * ProcessorPortSlotGap;
+        return new Rectangle(
+            center.Right - NestedHeaderInset - totalWidth + index * (ProcessorPortSlotWidth + ProcessorPortSlotGap),
+            center.Y + NestedHeaderInset,
+            ProcessorPortSlotWidth,
+            ProcessorPortSlotHeight);
+    }
+
+    private static Rectangle GetProcessorUpgradeCell(Rectangle center, int count, int index)
+    {
+        var totalWidth = count * ProcessorUpgradeSlotSize + Math.Max(0, count - 1) * ProcessorUpgradeSlotGap;
+        return new Rectangle(
+            center.X + (center.Width - totalWidth) / 2 + index * (ProcessorUpgradeSlotSize + ProcessorUpgradeSlotGap),
+            center.Y + NestedHeaderInset + ProcessorPortSlotHeight + 6,
+            ProcessorUpgradeSlotSize,
+            ProcessorUpgradeSlotSize);
+    }
+
+    private void DrawProcessorPorts(SpriteBatch b, SvsapmeProcessorMenuSnapshot processor, Rectangle center)
+    {
+        var ports = MachinePortCatalog.GetPorts(this.snapshot.QualifiedItemId);
+        for (var i = 0; i < ports.Count; i++)
+        {
+            var bounds = GetProcessorPortCell(center, ports.Count, i);
+            var status = GetPortStatus(ports[i], processor);
+            DrawWorkCell(b, bounds, status);
+            SvsapmeUiText.DrawPixelStatusLight(b, bounds.X + 5, bounds.Y + 12, status);
+            SvsapmeUiText.DrawFittedLine(
+                b,
+                GetPortShortLabel(ports[i]),
+                new Rectangle(bounds.X + 20, bounds.Y + 5, bounds.Width - 24, bounds.Height - 10),
+                Game1.textColor,
+                0.56f);
+        }
+    }
+
+    private void DrawProcessorUpgrades(SpriteBatch b, SvsapmeProcessorMenuSnapshot processor, Rectangle center)
+    {
+        for (var i = 0; i < processor.UpgradeSlotCapacity; i++)
+        {
+            var bounds = GetProcessorUpgradeCell(center, processor.UpgradeSlotCapacity, i);
+            var installed = i < processor.InstalledUpgradeQualifiedItemIds.Count;
+            DrawWorkCell(b, bounds, installed ? PixelStatus.Ready : PixelStatus.Idle);
+            if (installed)
+            {
+                DrawQualifiedItem(b, processor.InstalledUpgradeQualifiedItemIds[i], bounds, 0.4f);
+            }
+            else
+            {
+                SvsapmeUiText.DrawGhostUpgradeSlot(b, bounds);
+            }
+        }
+    }
+
+    private static PixelStatus GetPortStatus(MachinePortDefinition port, SvsapmeProcessorMenuSnapshot processor)
+    {
+        var active = processor.Slots.Count(slot => !slot.Ready && (slot.Input is not null || slot.Output is not null));
+        var ready = processor.Slots.Count(slot => slot.Ready);
+        return port.RoleKey switch
+        {
+            "ui.machine.port.itemIn" => processor.InputBuffer.Count > 0
+                ? PixelStatus.Ready
+                : processor.AutoPullFromNetwork
+                    ? processor.NetworkOnline ? PixelStatus.Processing : PixelStatus.Offline
+                    : PixelStatus.Idle,
+            "ui.machine.port.itemOut" => ready > 0 || processor.OutputBuffer.Count > 0
+                ? PixelStatus.Ready
+                : active > 0
+                    ? PixelStatus.Processing
+                    : PixelStatus.Idle,
+            "ui.machine.port.energyIn" => GetEnergyPortStatus(processor, active),
+            _ => PixelStatus.Idle
+        };
+    }
+
+    private static PixelStatus GetEnergyPortStatus(SvsapmeProcessorMenuSnapshot processor, int active)
+    {
+        if (active <= 0)
+            return PixelStatus.Idle;
+        if (!processor.NetworkOnline)
+            return PixelStatus.Offline;
+        if (!processor.EnergyOnline)
+            return PixelStatus.Error;
+        return processor.StoredWh < processor.RequiredWhForNextStep
+            ? PixelStatus.Warning
+            : PixelStatus.Processing;
+    }
+
+    private static string GetPortShortLabel(MachinePortDefinition port)
+    {
+        return port.RoleKey switch
+        {
+            "ui.machine.port.itemIn" => ModText.Get("ui.machine.port.short.itemIn", "Input"),
+            "ui.machine.port.itemOut" => ModText.Get("ui.machine.port.short.itemOut", "Output"),
+            "ui.machine.port.energyIn" => ModText.Get("ui.machine.port.short.energyIn", "Power"),
+            _ => ModText.Get(port.RoleKey, port.RoleKey)
+        };
+    }
+
+    private static string FormatPortTooltip(MachinePortDefinition port, SvsapmeProcessorMenuSnapshot processor)
+    {
+        var status = GetPortStatus(port, processor);
+        var tooltip = ModText.Get(
+            "ui.machine.port.tooltip",
+            "{{role}}\nSide: {{side}}\n{{description}}",
+            new
+            {
+                role = ModText.Get(port.RoleKey, port.RoleKey),
+                side = ModText.Get(port.SideKey, port.SideKey),
+                description = ModText.Get(port.DescriptionKey, port.DescriptionKey)
+            });
+        var runtime = port.RoleKey == "ui.machine.port.energyIn" && status == PixelStatus.Warning
+            ? ModText.Get(
+                "ui.machine.port.runtime.energyLow",
+                "Insufficient energy: {{stored}} / {{required}} Wh required for the next step",
+                new { stored = processor.StoredWh.ToString("N0"), required = processor.RequiredWhForNextStep.ToString("N0") })
+            : ModText.Get(
+                "ui.machine.port.runtime",
+                "Runtime: {{status}}",
+                new { status = GetStatusText(status) });
+        return tooltip + Environment.NewLine + runtime;
+    }
+
+    private static string GetStatusText(PixelStatus status)
+    {
+        return status switch
+        {
+            PixelStatus.Ready => ModText.Get("ui.machine.port.status.ready", "Ready"),
+            PixelStatus.Processing => ModText.Get("ui.machine.port.status.processing", "Processing"),
+            PixelStatus.Warning => ModText.Get("ui.machine.port.status.warning", "Warning"),
+            PixelStatus.Error => ModText.Get("ui.machine.port.status.error", "No energy storage"),
+            PixelStatus.Offline => ModText.Get("ui.machine.port.status.offline", "Network offline"),
+            _ => ModText.Get("ui.machine.port.status.idle", "Idle")
+        };
     }
 
     private static void DrawPanel(SpriteBatch b, Rectangle bounds)
     {
-        IClickableMenu.drawTextureBox(b, Game1.menuTexture, PanelSource, bounds.X, bounds.Y, bounds.Width, bounds.Height, Color.White * 0.9f, 1f, false);
+        SvsapmeUiText.DrawWorkspacePanel(b, bounds, Color.White * 0.9f);
     }
 
     private static void DrawSectionTitle(SpriteBatch b, Rectangle panel, string text)
     {
-        SvsapmeUiText.DrawFittedLine(b, text, new Rectangle(panel.X + 10, panel.Y + 8, panel.Width - 20, 24), Game1.textColor);
+        SvsapmeUiText.DrawFittedLine(b, text, new Rectangle(panel.X + 12, panel.Y + 10, panel.Width - 24, 24), Game1.textColor);
     }
 
     private static void DrawWorkCell(SpriteBatch b, Rectangle bounds, PixelStatus status)
@@ -1165,49 +1660,26 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         SvsapmeUiText.DrawSlotStatusLine(b, bounds, status);
     }
 
-    private static void DrawSlot(SpriteBatch b, Rectangle bounds, BufferedItemStack? stack, PixelStatus status)
+    private void DrawSlot(SpriteBatch b, Rectangle bounds, BufferedItemStack? stack, PixelStatus status)
     {
         DrawWorkCell(b, bounds, status);
         DrawBufferedItem(b, stack, bounds, 0.7f);
     }
 
-    private static void DrawBufferedItem(SpriteBatch b, BufferedItemStack? stack, Rectangle bounds, float scale)
+    private void DrawBufferedItem(SpriteBatch b, BufferedItemStack? stack, Rectangle bounds, float scale)
     {
         if (stack is null || string.IsNullOrWhiteSpace(stack.QualifiedItemId) || stack.Stack <= 0)
             return;
 
-        try
-        {
-            var item = BufferedItemCodec.CreateItem(stack);
-            item.drawInMenu(b, new Vector2(bounds.X + 5, bounds.Y + 4), scale, 1f, 0.88f, StackDrawType.Draw, Color.White, true);
-        }
-        catch
-        {
-            // A missing content pack item should not make the remote control unusable.
-        }
+        SvsapmeUiText.DrawItemWithAdaptiveCount(b, this.itemIconCache.GetOrCreate(stack), bounds, stack.Stack, scale);
     }
 
-    private static void DrawQualifiedItem(SpriteBatch b, string qualifiedItemId, Rectangle bounds, float scale, Color? tint = null)
+    private void DrawQualifiedItem(SpriteBatch b, string qualifiedItemId, Rectangle bounds, float scale, Color? tint = null)
     {
         if (string.IsNullOrWhiteSpace(qualifiedItemId))
             return;
 
-        try
-        {
-            ItemRegistry.Create(qualifiedItemId).drawInMenu(
-                b,
-                new Vector2(bounds.X + 5, bounds.Y + 4),
-                scale,
-                1f,
-                0.86f,
-                StackDrawType.Hide,
-                tint ?? Color.White,
-                true);
-        }
-        catch
-        {
-            // A missing content pack item should not make the remote control unusable.
-        }
+        SvsapmeUiText.DrawItemWithAdaptiveCount(b, this.itemIconCache.GetOrCreate(qualifiedItemId), bounds, 1, scale, tint);
     }
 
     private static void DrawProgress(SpriteBatch b, Rectangle bounds, long progress, long required)
@@ -1227,9 +1699,9 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
         b.Draw(Game1.staminaRect, new Rectangle(bounds.Right - 2, bounds.Y, 2, bounds.Height), Color.Gold);
     }
 
-    private static void DrawButton(SpriteBatch b, ClickableComponent button, bool enabled)
+    private static void DrawButton(SpriteBatch b, ClickableComponent button, bool enabled, Color? tint = null)
     {
-        IClickableMenu.drawTextureBox(b, Game1.menuTexture, PanelSource, button.bounds.X, button.bounds.Y, button.bounds.Width, button.bounds.Height, enabled ? Color.White : Color.Gray * 0.7f, 1f, false);
+        IClickableMenu.drawTextureBox(b, Game1.menuTexture, PanelSource, button.bounds.X, button.bounds.Y, button.bounds.Width, button.bounds.Height, enabled ? tint ?? Color.White : Color.Gray * 0.7f, 1f, false);
         SvsapmeUiText.DrawFittedLine(b, button.label, new Rectangle(button.bounds.X + 8, button.bounds.Y + 4, button.bounds.Width - 16, button.bounds.Height - 8), enabled ? Game1.textColor : Color.Gray);
     }
 
@@ -1269,8 +1741,29 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
             1 => ModText.Get("ui.powered.direction.right", "Right"),
             2 => ModText.Get("ui.powered.direction.down", "Down"),
             3 => ModText.Get("ui.powered.direction.left", "Left"),
-            _ => ModText.Get("ui.powered.direction.none", "Not set")
+            _ => ModText.Get("ui.machine.powered.direction.all", "All")
         };
+    }
+
+    internal static int GetNextFacingDirection(int current)
+    {
+        return current is >= -1 and < 3 ? current + 1 : -1;
+    }
+
+    internal static PixelStatus ResolveEnergyStatus(bool online, string? warning, long storedWh, long capacityWh)
+    {
+        if (!online)
+            return PixelStatus.Offline;
+        if (!string.IsNullOrWhiteSpace(warning)
+            || capacityWh > 0 && storedWh / (decimal)capacityWh < 0.1m)
+            return PixelStatus.Warning;
+        return PixelStatus.Ready;
+    }
+
+    internal static int GetVisibleEnergyRowCount(Rectangle bounds, int availableCount)
+    {
+        var availableHeight = Math.Max(0, bounds.Height - 46);
+        return Math.Min(Math.Max(0, availableCount), availableHeight / Math.Max(1, SvsapmeUiText.SmallLineHeight));
     }
 
     private static string FormatWh(long value)
@@ -1287,16 +1780,27 @@ internal sealed class RemoteMachineControlMenu : IClickableMenu, IRemoteMachineM
     {
         var contentWidth = menuWidth - Pad * 2;
         var statusWidth = contentWidth - 246;
-        var upgradeRight = 18 + (MachineRuntimeService.PoweredTransferUpgradeSlotCount - 1) * 58 + 52;
-        const int buttonBottom = 218 + 2 * 40 + 34;
+        var statusPanel = new Rectangle(0, 0, statusWidth, contentHeight);
+        var compact = contentHeight < 300;
+        var lastUpgrade = GetPoweredUpgradeCell(statusPanel, MachineRuntimeService.PoweredTransferUpgradeSlotCount - 1);
+        var buttonColumns = statusWidth >= (compact ? 218 : 276) ? 3 : 2;
+        var buttonRows = (int)Math.Ceiling(5d / buttonColumns);
+        var buttonHeight = compact ? 28 : 30;
+        var rowStride = compact ? 32 : 36;
+        var totalButtonHeight = (buttonRows - 1) * rowStride + buttonHeight;
+        var buttonStart = Math.Min(lastUpgrade.Bottom + 4, contentHeight - totalButtonHeight - 4);
+        var buttonBottom = buttonStart + totalButtonHeight;
+        var lastFilter = GetFilterCell(new Rectangle(0, 0, 230, contentHeight), 8);
         return statusWidth >= 188
-            && upgradeRight <= statusWidth
-            && buttonBottom <= contentHeight;
+            && lastFilter.Bottom <= contentHeight
+            && lastUpgrade.Right <= statusWidth
+            && buttonStart >= lastUpgrade.Bottom + 4
+            && buttonBottom <= contentHeight - 4;
     }
 
-    private static int GetMenuWidth() => Math.Min(980, Math.Max(640, Game1.uiViewport.Width - 48));
+    private static int GetMenuWidth() => Math.Max(1, Math.Min(980, Game1.uiViewport.Width - 32));
 
-    private static int GetMenuHeight() => Math.Min(700, Math.Max(600, Game1.uiViewport.Height - 48));
+    private static int GetMenuHeight() => Math.Max(1, Math.Min(700, Game1.uiViewport.Height - 32));
 
     private sealed record RemoteActionButton(
         ClickableComponent Component,

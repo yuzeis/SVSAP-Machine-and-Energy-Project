@@ -6,6 +6,20 @@ internal sealed class MachineSaveData
     public Dictionary<Guid, MachineState> Machines { get; set; } = new();
     public List<PendingReclaimCrate> PendingReclaims { get; set; } = new();
     public List<PendingRemoteDelivery> PendingRemoteDeliveries { get; set; } = new();
+    public List<ExecutedMachineAction> ExecutedRemoteActions { get; set; } = new();
+}
+
+internal sealed class ExecutedMachineAction
+{
+    public long PlayerId { get; set; }
+    public Guid TransactionId { get; set; }
+    public Guid MachineGuid { get; set; }
+    public string ActionKind { get; set; } = string.Empty;
+    public string Message { get; set; } = string.Empty;
+    public bool ConsumeEscrowedItem { get; set; }
+    public int CreatedDay { get; set; }
+    public int CreatedTick { get; set; }
+    public List<BufferedItemStack> ReturnedItems { get; set; } = new();
 }
 
 internal sealed class MachineState
@@ -116,12 +130,15 @@ internal sealed class SingleBlockProcessorMachineState
     public List<SingleBlockProcessorSlotState> Slots { get; set; } = new();
     public List<BufferedItemStack> InputBuffer { get; set; } = new();
     public List<BufferedItemStack> OutputBuffer { get; set; } = new();
+    public List<string> InstalledUpgradeQualifiedItemIds { get; set; } = new();
     public string InputMode { get; set; } = MachineInputModes.AllEligible;
     public string FilterMode { get; set; } = MachineFilterModes.Whitelist;
     public List<string> FilterQualifiedItemIds { get; set; } = new();
     public bool AutoPullFromNetwork { get; set; }
     public bool AutoPushOutputToNetwork { get; set; } = true;
     public int LastKegUpdateTime { get; set; } = 600;
+    public int KegSpeedRemainderPermille { get; set; }
+    public int CaskSpeedRemainderPermille { get; set; }
 }
 
 internal sealed class SingleBlockProcessorSlotState

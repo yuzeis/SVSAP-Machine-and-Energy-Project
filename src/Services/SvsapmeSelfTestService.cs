@@ -65,6 +65,7 @@ internal sealed class SvsapmeSelfTestService
             "missing-machine-reclaim" => TestMissingMachineReclaim(),
             "multiplayer-protocol" => TestMultiplayerProtocol(),
             "action-idempotent" => TestActionIdempotent(),
+            "durable-action-ledger" => TestDurableActionLedger(),
             "escrow-restore" => TestEscrowRestore(),
             "host-action-dispatch" => TestHostActionDispatch(),
             "energy-production-rules" => TestEnergyProductionRules(),
@@ -78,6 +79,7 @@ internal sealed class SvsapmeSelfTestService
             "farm-fertilizer-quality" => TestFarmFertilizerQuality(),
             "farm-locked-output" => TestFarmLockedOutput(),
             "single-block-processor-rules" => TestSingleBlockProcessorRules(),
+            "malformed-buffer-normalization" => TestMalformedBufferNormalization(),
             "daily-order-storage-gate" => TestDailyOrderStorageGate(),
             "location-cache-full-enum" => TestLocationCacheFullEnum(),
             "building-demolish-reclaim" => TestBuildingDemolishReclaim(),
@@ -100,18 +102,43 @@ internal sealed class SvsapmeSelfTestService
     {
         var failures = new List<string>();
 
+        var frame = new Rectangle(0, 0, 720, 640);
+        var safeContent = SvsapmeUiText.GetFrameContentBounds(frame);
+        if (safeContent != new Rectangle(36, 76, 648, 528))
+            failures.Add("SVSAPME GUI content must use the shared frame-safe rectangle");
+        if (SvsapmeUiText.VisualContentGutter < 8)
+            failures.Add("SVSAPME GUI controls must keep at least 8 visible pixels clear of the metal bevel");
+
         if (!SingleBlockProcessorMenu.LayoutFits(menuWidth: 980, menuHeight: 700)
-            || !SingleBlockProcessorMenu.LayoutFits(menuWidth: 752, menuHeight: 672))
+            || !SingleBlockProcessorMenu.LayoutFits(menuWidth: 752, menuHeight: 672)
+            || !SingleBlockProcessorMenu.LayoutFits(menuWidth: 752, menuHeight: 672, inventorySlotCount: 48)
+            || !SingleBlockProcessorMenu.LayoutFits(menuWidth: 752, menuHeight: 672, inventorySlotCount: 60))
         {
             failures.Add("single-block processor menu must keep input panel, work grid, output panel, and page buttons inside 1280x720 and 800x720 UI bounds");
+        }
+
+        if (!SingleBlockProcessorMenu.PortStripFits(menuWidth: 980)
+            || !SingleBlockProcessorMenu.PortStripFits(menuWidth: 752)
+            || !SingleBlockProcessorMenu.PortStripFits(menuWidth: 592)
+            || !RemoteMachineControlMenu.ProcessorPortStripFits(menuWidth: 980)
+            || !RemoteMachineControlMenu.ProcessorPortStripFits(menuWidth: 608)
+            || !RemoteMachineControlMenu.NestedWorkHeaderKeepsSafeGutter())
+        {
+            failures.Add("local and remote single-block processor ports and modules must fit their header strip with a visible nested-panel gutter");
         }
 
         var processorCompact = SingleBlockProcessorMenu.CalculateLayoutShape(menuWidth: 752, menuHeight: 672);
         if (processorCompact.Columns < 5 || processorCompact.Rows < 4 || processorCompact.PageSize != processorCompact.Columns * processorCompact.Rows)
             failures.Add("single-block processor compact layout must preserve a useful paged work-grid above the 12x3 backpack");
 
+        var processorExtended = SingleBlockProcessorMenu.CalculateLayoutShape(menuWidth: 752, menuHeight: 672, inventorySlotCount: 60);
+        if (processorExtended.Columns < 5 || processorExtended.Rows < 2 || processorExtended.PageSize != processorExtended.Columns * processorExtended.Rows)
+            failures.Add("single-block processor compact layout must remain usable with a 60-slot extended backpack");
+
         if (!SingleBlockFarmMenu.LayoutFits(menuWidth: 930, menuHeight: 660)
-            || !SingleBlockFarmMenu.LayoutFits(menuWidth: 752, menuHeight: 660))
+            || !SingleBlockFarmMenu.LayoutFits(menuWidth: 752, menuHeight: 660)
+            || !SingleBlockFarmMenu.LayoutFits(menuWidth: 752, menuHeight: 660, inventorySlotCount: 48)
+            || !SingleBlockFarmMenu.LayoutFits(menuWidth: 752, menuHeight: 660, inventorySlotCount: 60))
         {
             failures.Add("single-block farm menu must keep input panel, plot grid, output panel, and page buttons inside 1280x720 and 800x720 UI bounds");
         }
@@ -120,11 +147,43 @@ internal sealed class SvsapmeSelfTestService
         if (farmCompact.Columns < 6 || farmCompact.Rows < 5 || farmCompact.PageSize != farmCompact.Columns * farmCompact.Rows)
             failures.Add("single-block farm compact layout must preserve a useful paged plot-grid above the 12x3 backpack");
 
-        if (!PoweredTransferMenu.LayoutFits(menuWidth: 1040) || !PoweredTransferMenu.LayoutFits(menuWidth: 720))
+        var farmExtended = SingleBlockFarmMenu.CalculateLayoutShape(menuWidth: 752, menuHeight: 660, inventorySlotCount: 60);
+        if (farmExtended.Columns < 6 || farmExtended.Rows < 3 || farmExtended.PageSize != farmExtended.Columns * farmExtended.Rows)
+            failures.Add("single-block farm compact layout must remain usable with a 60-slot extended backpack");
+
+        if (!PoweredTransferMenu.LayoutFits(menuWidth: 1040)
+            || !PoweredTransferMenu.LayoutFits(menuWidth: 720)
+            || !PoweredTransferMenu.LayoutFits(menuWidth: 720, menuHeight: 640, inventorySlotCount: 60)
+            || !PoweredTransferMenu.LayoutFits(menuWidth: 592, menuHeight: 672, inventorySlotCount: 60))
             failures.Add("powered importer/exporter menu controls must wrap instead of overflowing compact UI widths");
 
-        if (!RemoteMachineControlMenu.PoweredLayoutFits(menuWidth: 720, contentHeight: 374))
-            failures.Add("remote powered-transfer upgrades and two-column controls must stay above the compact 800x720 backpack area");
+        if (!RemoteMachineControlMenu.PoweredLayoutFits(menuWidth: 720, contentHeight: 374)
+            || !RemoteMachineControlMenu.PoweredLayoutFits(menuWidth: 608, contentHeight: 250))
+            failures.Add("remote powered-transfer upgrades and controls must stay separated at 800x720 and 640x720 with a 60-slot backpack");
+
+        var compactControls = SvsapmeUiText.CalculateControlButtonBounds(new Rectangle(0, 0, 152, 180), topOffset: 92, count: 5);
+        if (compactControls.Any(control => control.X < 0 || control.Y < 0 || control.Right > 152 || control.Bottom > 180)
+            || compactControls.SelectMany((left, index) => compactControls.Skip(index + 1).Select(right => left.Intersects(right))).Any(intersects => intersects))
+        {
+            failures.Add("single-block side-panel controls must reflow without overlap when a 60-slot backpack shortens the work area");
+        }
+
+        if (RemoteMachineControlMenu.GetNextFacingDirection(-1) != 0
+            || RemoteMachineControlMenu.GetNextFacingDirection(0) != 1
+            || RemoteMachineControlMenu.GetNextFacingDirection(1) != 2
+            || RemoteMachineControlMenu.GetNextFacingDirection(2) != 3
+            || RemoteMachineControlMenu.GetNextFacingDirection(3) != -1)
+        {
+            failures.Add("remote powered-transfer direction cycling must include the all-sides state");
+        }
+
+        if (RemoteMachineControlMenu.ResolveEnergyStatus(false, string.Empty, 0, 0) != PixelStatus.Offline
+            || RemoteMachineControlMenu.ResolveEnergyStatus(true, "warning", 1000, 1000) != PixelStatus.Warning
+            || RemoteMachineControlMenu.ResolveEnergyStatus(true, string.Empty, 50, 1000) != PixelStatus.Warning
+            || RemoteMachineControlMenu.ResolveEnergyStatus(true, string.Empty, 500, 1000) != PixelStatus.Ready)
+        {
+            failures.Add("energy status lights must prioritize offline and telemetry warnings over the generic online state");
+        }
 
         return failures;
     }
@@ -147,6 +206,14 @@ internal sealed class SvsapmeSelfTestService
 
         if (SvsapmeUiText.FormatDayValue(123456m).Contains("Day ", StringComparison.Ordinal))
             failures.Add("single-block daily value label must use compact localized text instead of the old Day prefix");
+
+        if (SvsapmeUiText.FormatItemCount(999) != "999"
+            || SvsapmeUiText.FormatItemCount(1000) != "1K"
+            || SvsapmeUiText.FormatItemCount(999_999) != "1M"
+            || SvsapmeUiText.FormatItemCount(1_000_000) != "1M")
+        {
+            failures.Add("machine item badges must keep vanilla counts below 1000 and use only K/M abbreviations for large values");
+        }
 
         return failures;
     }
@@ -188,6 +255,15 @@ internal sealed class SvsapmeSelfTestService
             || !carbonPorts.Any(port => port.RoleKey == "ui.machine.port.energyOut"))
         {
             failures.Add("Carbon Generator must expose fuel input and energy output ports");
+        }
+
+        var processorPorts = MachinePortCatalog.GetPorts("(BC)" + ModItemCatalog.IridiumKeg);
+        if (processorPorts.Count != 3
+            || !processorPorts.Any(port => port.RoleKey == "ui.machine.port.itemIn")
+            || !processorPorts.Any(port => port.RoleKey == "ui.machine.port.itemOut")
+            || !processorPorts.Any(port => port.RoleKey == "ui.machine.port.energyIn"))
+        {
+            failures.Add("single-block processors must expose visible item input, item output, and energy input slots");
         }
 
         return failures;
@@ -348,6 +424,39 @@ internal sealed class SvsapmeSelfTestService
             failures.Add("machine snapshot responses must carry host-authored display text for farmhand status menus");
         }
 
+        var sessionId = Guid.Parse("11111111-2222-3333-4444-555555555555");
+        if (!RemoteSnapshotSessionRules.Matches(sessionId, sessionId)
+            || RemoteSnapshotSessionRules.Matches(Guid.Empty, Guid.Empty)
+            || RemoteSnapshotSessionRules.Matches(sessionId, Guid.NewGuid())
+            || !RemoteSnapshotSessionRules.IsNewer(7, 8)
+            || RemoteSnapshotSessionRules.IsNewer(8, 8)
+            || RemoteSnapshotSessionRules.IsNewer(9, 8)
+            || RemoteSnapshotSessionRules.HasTimedOut(10, 19, 10)
+            || !RemoteSnapshotSessionRules.HasTimedOut(10, 20, 10)
+            || !RemoteSnapshotSessionRules.HasTimedOut(20, 10, 10)
+            || !RemoteSnapshotSessionRules.ShouldOpenMenu(consumedPendingSession: true, hasActiveMenu: false)
+            || RemoteSnapshotSessionRules.ShouldOpenMenu(consumedPendingSession: true, hasActiveMenu: true)
+            || RemoteSnapshotSessionRules.ShouldOpenMenu(consumedPendingSession: false, hasActiveMenu: false))
+        {
+            failures.Add("machine snapshots must reject empty, duplicate, stale, mismatched, and already-consumed menu sessions");
+        }
+
+        if (typeof(SvsapmeMachineSnapshotRequest).GetProperty(nameof(SvsapmeMachineSnapshotRequest.MenuSessionId))?.PropertyType != typeof(Guid)
+            || typeof(SvsapmeMachineSnapshotRequest).GetProperty(nameof(SvsapmeMachineSnapshotRequest.RequestSequence))?.PropertyType != typeof(long)
+            || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.MenuSessionId))?.PropertyType != typeof(Guid)
+            || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.RequestSequence))?.PropertyType != typeof(long))
+        {
+            failures.Add("machine snapshot requests and responses must carry menu-session and request-order fields");
+        }
+
+        if (typeof(SvsapmeMachineActionRequest).GetProperty(nameof(SvsapmeMachineActionRequest.MenuSessionId))?.PropertyType != typeof(Guid)
+            || typeof(SvsapmeMachineActionRequest).GetProperty(nameof(SvsapmeMachineActionRequest.RequestSequence))?.PropertyType != typeof(long)
+            || typeof(SvsapmeMachineActionResponse).GetProperty(nameof(SvsapmeMachineActionResponse.MenuSessionId))?.PropertyType != typeof(Guid)
+            || typeof(SvsapmeMachineActionResponse).GetProperty(nameof(SvsapmeMachineActionResponse.RequestSequence))?.PropertyType != typeof(long))
+        {
+            failures.Add("machine action responses must be scoped to the menu session and request order that created them");
+        }
+
         if (typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.MenuKind))?.PropertyType != typeof(SvsapmeMachineMenuKind)
             || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.Farm))?.PropertyType != typeof(SvsapmeFarmMenuSnapshot)
             || typeof(SvsapmeMachineSnapshotResponse).GetProperty(nameof(SvsapmeMachineSnapshotResponse.Processor))?.PropertyType != typeof(SvsapmeProcessorMenuSnapshot)
@@ -361,6 +470,19 @@ internal sealed class SvsapmeSelfTestService
             || typeof(SvsapmeProcessorSlotSnapshot).GetProperty(nameof(SvsapmeProcessorSlotSnapshot.CanCollect))?.PropertyType != typeof(bool))
         {
             failures.Add("processor snapshots must expose intermediate cask eject and collect-all state");
+        }
+
+        if (typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.NetworkOnline))?.PropertyType != typeof(bool)
+            || typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.EnergyOnline))?.PropertyType != typeof(bool)
+            || typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.StoredWh))?.PropertyType != typeof(long)
+            || typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.CapacityWh))?.PropertyType != typeof(long)
+            || typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.RequiredWhForNextStep))?.PropertyType != typeof(long)
+            || typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.InstalledUpgradeQualifiedItemIds))?.PropertyType != typeof(List<string>)
+            || typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.UpgradeSlotCapacity))?.PropertyType != typeof(int)
+            || typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.SpeedPermille))?.PropertyType != typeof(int)
+            || typeof(SvsapmeProcessorMenuSnapshot).GetProperty(nameof(SvsapmeProcessorMenuSnapshot.OutputBufferCapacityItems))?.PropertyType != typeof(int))
+        {
+            failures.Add("processor snapshots must expose live energy plus physical upgrade-slot state and effects");
         }
 
         if (typeof(SvsapmePoweredTransferMenuSnapshot).GetProperty(nameof(SvsapmePoweredTransferMenuSnapshot.InstalledUpgradeQualifiedItemIds))?.PropertyType != typeof(List<string>)
@@ -464,8 +586,9 @@ internal sealed class SvsapmeSelfTestService
         var tx3 = Guid.Parse("33333333-3333-3333-3333-333333333333");
         cache.Remember(7, tx1, new SvsapmeMachineActionResponse { TransactionId = tx1, Message = "first" });
         cache.Remember(7, tx2, new SvsapmeMachineActionResponse { TransactionId = tx2, Message = "second" });
+        cache.Remember(7, tx1, new SvsapmeMachineActionResponse { TransactionId = tx1, Message = "later duplicate" });
         if (!cache.TryGet(7, tx1, out var replay) || replay.Message != "first")
-            failures.Add("action cache must replay duplicate transaction responses");
+            failures.Add("action cache must retain and replay the first transaction response");
 
         cache.Remember(8, tx1, new SvsapmeMachineActionResponse { TransactionId = tx1, Message = "other-player" });
         if (!cache.TryGet(7, tx1, out replay) || replay.Message != "first")
@@ -488,6 +611,126 @@ internal sealed class SvsapmeSelfTestService
         return failures;
     }
 
+    private static IReadOnlyList<string> TestDurableActionLedger()
+    {
+        var failures = new List<string>();
+        const long playerId = 77112233L;
+        var transactionId = Guid.NewGuid();
+        var machineGuid = Guid.NewGuid();
+        var entries = new List<ExecutedMachineAction>();
+        var first = new ExecutedMachineAction
+        {
+            PlayerId = playerId,
+            TransactionId = transactionId,
+            MachineGuid = machineGuid,
+            ActionKind = SvsapmeMachineActionKind.LoadProcessorInput.ToString(),
+            Message = "first",
+            ConsumeEscrowedItem = true
+        };
+        if (!ExecutedMachineActionLedger.Remember(entries, first))
+            failures.Add("first consumed remote machine action must enter the durable ledger");
+
+        var duplicate = new ExecutedMachineAction
+        {
+            PlayerId = playerId,
+            TransactionId = transactionId,
+            MachineGuid = machineGuid,
+            ActionKind = SvsapmeMachineActionKind.LoadProcessorInput.ToString(),
+            Message = "later duplicate",
+            ConsumeEscrowedItem = true
+        };
+        if (ExecutedMachineActionLedger.Remember(entries, duplicate))
+            failures.Add("duplicate consumed transaction ids must not overwrite the first durable result");
+        if (!ExecutedMachineActionLedger.TryGet(entries, playerId, transactionId, out var replay)
+            || !ReferenceEquals(replay, first)
+            || replay.Message != "first")
+        {
+            failures.Add("durable machine action replay must retain the first committed response");
+        }
+
+        entries.Add(duplicate);
+        entries.Add(new ExecutedMachineAction());
+        if (!ExecutedMachineActionLedger.Normalize(entries))
+            failures.Add("durable machine action normalization must remove invalid and duplicate records");
+        if (entries.Count != 1 || entries[0].Message != "first")
+            failures.Add("durable machine action normalization must keep the first committed response");
+
+        return failures;
+    }
+
+    private static IReadOnlyList<string> TestMalformedBufferNormalization()
+    {
+        var failures = new List<string>();
+        var valid = new BufferedItemStack
+        {
+            QualifiedItemId = "(O)388",
+            Stack = 5,
+            PreservedParentSheetIndex = null!,
+            Type = null!,
+            Name = null!,
+            DisplayName = null!,
+            ModData = null!
+        };
+        var stacks = new List<BufferedItemStack>
+        {
+            new() { QualifiedItemId = string.Empty, Stack = 1 },
+            new() { QualifiedItemId = "(O)390", Stack = 0 },
+            valid
+        };
+        var discarded = 0;
+        if (!MachineStateRepository.NormalizeBufferedList(stacks, ref discarded)
+            || discarded != 2
+            || stacks.Count != 1
+            || !ReferenceEquals(stacks[0], valid))
+        {
+            failures.Add("load normalization must discard blank-id and non-positive buffered stacks while preserving valid stacks");
+        }
+        if (valid.PreservedParentSheetIndex is null
+            || valid.Type is null
+            || valid.Name is null
+            || valid.DisplayName is null
+            || valid.ModData is null)
+        {
+            failures.Add("load normalization must initialize optional buffered item metadata");
+        }
+
+        var processor = new SingleBlockProcessorMachineState
+        {
+            Slots = new List<SingleBlockProcessorSlotState>
+            {
+                new()
+                {
+                    Input = new BufferedItemStack { QualifiedItemId = "(O)433", Stack = 5 },
+                    Output = new BufferedItemStack { QualifiedItemId = string.Empty, Stack = 1 },
+                    InputCount = 5,
+                    RemainingMinutes = 120,
+                    TotalMinutes = 120
+                },
+                new()
+                {
+                    Input = new BufferedItemStack { QualifiedItemId = string.Empty, Stack = 1 },
+                    Output = new BufferedItemStack { QualifiedItemId = "(O)395", Stack = 1 },
+                    InputCount = 5,
+                    RemainingMinutes = 0,
+                    TotalMinutes = 120
+                }
+            }
+        };
+        discarded = 0;
+        if (!MachineStateRepository.NormalizeProcessorSlots(processor, ref discarded)
+            || discarded != 2
+            || processor.InputBuffer.Count != 1
+            || processor.InputBuffer[0].QualifiedItemId != "(O)433"
+            || processor.OutputBuffer.Count != 1
+            || processor.OutputBuffer[0].QualifiedItemId != "(O)395"
+            || processor.Slots.Any(SingleBlockProcessorRules.IsWorking))
+        {
+            failures.Add("malformed processor slots must preserve each valid counterpart in the matching recovery buffer");
+        }
+
+        return failures;
+    }
+
     private static IReadOnlyList<string> TestEscrowRestore()
     {
         var failures = new List<string>();
@@ -499,6 +742,7 @@ internal sealed class SvsapmeSelfTestService
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.StartElectricFurnace)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.StartElectricGeodeCrusher)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.LoadProcessorInput)
+            || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.InstallProcessorUpgrade)
             || !SvsapmeActionEscrowRules.ActionMayEscrowHeldItem(SvsapmeMachineActionKind.InstallPoweredUpgrade))
         {
             failures.Add("item-bearing SVSAPME machine actions must be escrow candidates");
@@ -573,6 +817,8 @@ internal sealed class SvsapmeSelfTestService
         var startGeodeCrusher = typeof(MachineRuntimeService).GetMethod("TryStartElectricGeodeCrusherManualUse", nonPublicInstance);
         var installPoweredUpgrade = typeof(MachineRuntimeService).GetMethod("TryInstallPoweredUpgrade", nonPublicInstance);
         var removePoweredUpgrade = typeof(MachineRuntimeService).GetMethod("TryRemovePoweredUpgrade", nonPublicInstance);
+        var installProcessorUpgrade = typeof(SingleBlockProcessorService).GetMethod("TryInstallProcessorUpgrade", nonPublicInstance);
+        var removeProcessorUpgrade = typeof(SingleBlockProcessorService).GetMethod("TryRemoveProcessorUpgrade", nonPublicInstance);
         var loadSeed = typeof(SingleBlockFarmService).GetMethod("TryLoadSeed", nonPublicInstance);
         var loadFertilizer = typeof(SingleBlockFarmService).GetMethod("TryLoadFertilizer", nonPublicInstance);
         var installModule = typeof(SingleBlockFarmService).GetMethod("TryInstallModule", nonPublicInstance);
@@ -592,6 +838,12 @@ internal sealed class SvsapmeSelfTestService
             || removePoweredUpgrade?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
         {
             failures.Add("MachineRuntimeService must expose host-dispatchable powered upgrade insert/eject actions");
+        }
+
+        if (installProcessorUpgrade?.ReturnType != typeof(SvsapmeMachineActionApplyResult)
+            || removeProcessorUpgrade?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
+        {
+            failures.Add("SingleBlockProcessorService must expose host-dispatchable processor upgrade insert/eject actions");
         }
 
         if (loadSeed?.ReturnType != typeof(SvsapmeMachineActionApplyResult))
@@ -1079,6 +1331,102 @@ internal sealed class SvsapmeSelfTestService
             failures.Add("single-block processor tiers must expose 16/64/144/256 internal slots");
         }
 
+        var copperTier = SingleBlockProcessorRules.GetTier(copperKegId);
+        var steelTier = SingleBlockProcessorRules.GetTier("(BC)" + ModItemCatalog.SteelKeg);
+        var goldTier = SingleBlockProcessorRules.GetTier("(BC)" + ModItemCatalog.GoldKeg);
+        var iridiumTier = SingleBlockProcessorRules.GetTier(iridiumKegId);
+        if (ProcessorUpgradeRules.GetSlotCapacity(copperTier) != 2
+            || ProcessorUpgradeRules.GetSlotCapacity(steelTier) != 3
+            || ProcessorUpgradeRules.GetSlotCapacity(goldTier) != 4
+            || ProcessorUpgradeRules.GetSlotCapacity(iridiumTier) != 5)
+        {
+            failures.Add("processor upgrade slots must scale 2/3/4/5 from copper through iridium");
+        }
+
+        var copperUpgradeProcessor = new SingleBlockProcessorMachineState();
+        ProcessorUpgradeRules.TryInstall(
+            copperUpgradeProcessor,
+            copperTier,
+            SingleBlockProcessorKind.Keg,
+            "(O)" + ModItemCatalog.SvsapSpeedCard);
+        ProcessorUpgradeRules.TryInstall(
+            copperUpgradeProcessor,
+            copperTier,
+            SingleBlockProcessorKind.Keg,
+            "(O)" + ModItemCatalog.SvsapCapacityCard);
+        if (ProcessorUpgradeRules.TryInstall(
+                copperUpgradeProcessor,
+                copperTier,
+                SingleBlockProcessorKind.Keg,
+                "(O)" + ModItemCatalog.SvsapSpeedCard).Success)
+        {
+            failures.Add("a copper processor must reject a third upgrade after its two physical slots are occupied");
+        }
+
+        var upgradeProcessor = new SingleBlockProcessorMachineState();
+        var speed1 = ProcessorUpgradeRules.TryInstall(
+            upgradeProcessor,
+            iridiumTier,
+            SingleBlockProcessorKind.Keg,
+            "(O)" + ModItemCatalog.SvsapSpeedCard);
+        var speed2 = ProcessorUpgradeRules.TryInstall(
+            upgradeProcessor,
+            iridiumTier,
+            SingleBlockProcessorKind.Keg,
+            "(O)" + ModItemCatalog.SvsapSpeedCard);
+        var capacity = ProcessorUpgradeRules.TryInstall(
+            upgradeProcessor,
+            iridiumTier,
+            SingleBlockProcessorKind.Keg,
+            "(O)" + ModItemCatalog.SvsapCapacityCard);
+        if (!speed1.Success || !speed1.ConsumesItem || !speed2.Success || !capacity.Success)
+            failures.Add("processor speed/capacity cards must install into physical upgrade slots and consume one card");
+        if (ProcessorUpgradeRules.GetSpeedPermille(upgradeProcessor) != 1200
+            || ProcessorUpgradeRules.CalculateScaledWork(10, 1200, 0, out var speedRemainder) != 12
+            || speedRemainder != 0)
+        {
+            failures.Add("two processor speed cards must advance 20% more deterministic work without fractional loss");
+        }
+        if (ProcessorUpgradeRules.GetOutputBufferCapacityItems(upgradeProcessor, iridiumTier) != 256)
+            failures.Add("one capacity card must provide one full iridium processor batch of completed-output buffering");
+
+        var qualityProcessor = new SingleBlockProcessorMachineState();
+        var qualityInstall = ProcessorUpgradeRules.TryInstall(
+            qualityProcessor,
+            iridiumTier,
+            SingleBlockProcessorKind.Keg,
+            "(O)" + ModItemCatalog.SvsapQualityCard);
+        var duplicateQuality = ProcessorUpgradeRules.TryInstall(
+            qualityProcessor,
+            iridiumTier,
+            SingleBlockProcessorKind.Keg,
+            "(O)" + ModItemCatalog.SvsapQualityCard);
+        var caskQuality = ProcessorUpgradeRules.TryInstall(
+            new SingleBlockProcessorMachineState(),
+            iridiumTier,
+            SingleBlockProcessorKind.Cask,
+            "(O)" + ModItemCatalog.SvsapQualityCard);
+        if (!qualityInstall.Success || duplicateQuality.Success || caskQuality.Success)
+            failures.Add("kegs may install one quality card, while casks must reject it as meaningless");
+
+        var goldCoffeeProbe = ItemRegistry.Create("(O)433", 1);
+        goldCoffeeProbe.Quality = 2;
+        if (!SingleBlockProcessorService.TryCreateAutomatedInputJob(SingleBlockProcessorKind.Keg, goldCoffeeProbe, out var automatedCoffee)
+            || SingleBlockProcessorService.GetProcessorInputCount(SingleBlockProcessorKind.Keg, goldCoffeeProbe) != 5
+            || automatedCoffee.InputCount != 5)
+        {
+            failures.Add("network auto-input probing must recognize the five-coffee-bean recipe from a stack-one inventory prototype");
+        }
+        else
+        {
+            ProcessorUpgradeRules.ApplyJobModifiers(qualityProcessor, SingleBlockProcessorKind.Keg, automatedCoffee);
+            if (!ProcessorUpgradeRules.PreservesKegInputQuality(qualityProcessor)
+                || automatedCoffee.Output?.Quality != 2)
+            {
+                failures.Add("a keg quality card must preserve gold input quality for automatically probed jobs");
+            }
+        }
+
         var processor = new SingleBlockProcessorMachineState();
         if (processor.AutoPullFromNetwork)
             failures.Add("single-block processors must default network auto-input to off until the player opts in");
@@ -1107,6 +1455,19 @@ internal sealed class SvsapmeSelfTestService
 
             if (wineSlot.RemainingMinutes != 10_000 || wineSlot.TotalMinutes != 10_000)
                 failures.Add("single-block keg fruit processing time must match vanilla wine time");
+
+            var goldApple = ItemRegistry.Create("(O)613", 1);
+            goldApple.Quality = 2;
+            if (!SingleBlockProcessorRules.TryCreateJob(SingleBlockProcessorKind.Keg, goldApple, out var qualityWineSlot, out _))
+            {
+                failures.Add("quality-card test fruit must create a keg job");
+            }
+            else
+            {
+                ProcessorUpgradeRules.ApplyJobModifiers(qualityProcessor, SingleBlockProcessorKind.Keg, qualityWineSlot);
+                if (qualityWineSlot.Output?.Quality != 2)
+                    failures.Add("a keg quality card must preserve the input ingredient quality on output");
+            }
 
             if (SingleBlockProcessorRules.GetRecoverableStack(wineSlot)?.QualifiedItemId != "(O)613")
                 failures.Add("unfinished single-block processor slots must recover the input, not the future output");
@@ -1461,6 +1822,18 @@ internal sealed class SvsapmeSelfTestService
         };
         if (MachineRegistryService.CanRetireConfirmedConsumedMachine(processorInputBufferState))
             failures.Add("consumed-candidate processors with buffered input stacks must stay recoverable instead of retiring");
+
+        var processorUpgradeState = new MachineState
+        {
+            MachineGuid = Guid.Parse("fcfcfcfc-fcfc-fcfc-fcfc-fcfcfcfcfcfc"),
+            QualifiedItemId = "(BC)" + ModItemCatalog.CopperKeg,
+            Processor =
+            {
+                InstalledUpgradeQualifiedItemIds = { "(O)" + ModItemCatalog.SvsapSpeedCard }
+            }
+        };
+        if (MachineRegistryService.CanRetireConfirmedConsumedMachine(processorUpgradeState))
+            failures.Add("consumed-candidate processors with installed upgrade cards must stay recoverable instead of retiring");
 
         var result = MachineRegistryService.RetireConfirmedConsumedMachine(data, machineGuid);
         if (!result.Retired)
@@ -1957,6 +2330,7 @@ internal sealed class SvsapmeSelfTestService
         "missing-machine-reclaim",
         "multiplayer-protocol",
         "action-idempotent",
+        "durable-action-ledger",
         "escrow-restore",
         "host-action-dispatch",
         "energy-production-rules",
@@ -1970,6 +2344,7 @@ internal sealed class SvsapmeSelfTestService
         "farm-fertilizer-quality",
         "farm-locked-output",
         "single-block-processor-rules",
+        "malformed-buffer-normalization",
         "daily-order-storage-gate",
         "location-cache-full-enum",
         "building-demolish-reclaim",

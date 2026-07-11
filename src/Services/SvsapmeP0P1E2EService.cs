@@ -21,7 +21,7 @@ internal sealed class SvsapmeP0P1E2EService
     private const string VersionEnv = "STARDEW_SVSAPME_P0P1_E2E_VERSION";
     private const string FarmNameEnv = "STARDEW_SVSAPME_P0P1_E2E_FARM";
     private const string JoinAddressEnv = "STARDEW_SVSAPME_P0P1_E2E_JOIN";
-    private const string DefaultVersionLabel = "ver1.4.0-alpha.1";
+    private const string DefaultVersionLabel = "ver1.4.1-rc1.0";
     private const int StartupTimeoutTicks = 12000;
     private const string SvsapNetworkIdKey = ModItemCatalog.SvsapUniqueId + "/NetworkId";
     private const string SvsapEndpointIdKey = ModItemCatalog.SvsapUniqueId + "/EndpointId";
@@ -841,6 +841,7 @@ internal sealed class SvsapmeP0P1E2EService
     private void CheckR6Prototype(SingleFixture fixture)
     {
         this.runtime.RunRouteTickForE2E();
+        PumpChestMutex(fixture.SourceChest, fixture.Location);
         this.energy.TryGetNetworkEnergy(fixture.NetworkId, out this.r6PrototypeEnergyAfter, out _, out _);
         this.r6PrototypeMoved = CountItem(fixture.TargetChest, "(O)390");
         var importerActive = this.TryProbeEndpoint(fixture.Location, fixture.ImporterTile, out var importerProbe);
@@ -853,6 +854,7 @@ internal sealed class SvsapmeP0P1E2EService
     private void CheckR6Powered(SingleFixture fixture)
     {
         this.runtime.RunRouteTickForE2E();
+        PumpChestMutex(fixture.SourceChest, fixture.Location);
         var energyReadOk = this.energy.TryGetNetworkEnergy(fixture.NetworkId, out var after, out var capacity, out var energyCode);
         var cellState = this.GetState(fixture.CellGuid);
         var cellStoredModData = fixture.CellObject.modData.GetValueOrDefault(MachineRegistryService.StoredWhKey);
@@ -866,6 +868,13 @@ internal sealed class SvsapmeP0P1E2EService
             $"poweredMoved={moved} sourceRemaining={CountItem(fixture.SourceChest, "(O)390")} targetCapacityBefore={this.r6TargetCapacityBeforeRoute} plannedMode={this.r6PlannedModeBeforeRoute} plannedItems={this.r6PlannedItemsBeforeRoute} prototypeMoved={this.r6PrototypeMoved} spentWh={spent} expectedHalfWh={moved} energyReadOk={energyReadOk} energyCode={energyCode} capacity={capacity} cellStateWh={cellState.StoredWh} cellModDataWh={cellStoredModData} cellActive={cellActive} cellProbe=\"{cellProbe}\" importerActive={importerActive} importerProbe=\"{importerProbe}\" cacheHasImporter={this.registry.MachinesByGuid.ContainsKey(fixture.ImporterGuid)}");
     }
 
+    private static void PumpChestMutex(Chest chest, GameLocation location)
+    {
+        // This fixture invokes a route tick synchronously. Advance the chest's
+        // normal NetMutex poll so the granted callback runs before assertions.
+        chest.GetMutex().Update(location);
+    }
+
     private SingleFixture CreateSingleFixture()
     {
         var location = this.GetFarm();
@@ -875,23 +884,27 @@ internal sealed class SvsapmeP0P1E2EService
 
         var coreTile = origin;
         var targetChestTile = origin + new Vector2(1, 0);
+        var storageInterfaceTile = origin + new Vector2(1, 1);
         var cellTile = origin + new Vector2(0, 1);
         var importerTile = origin + new Vector2(2, 0);
         var sourceChestTile = origin + new Vector2(3, 0);
 
         var core = this.PlaceLinkedMachine(location, coreTile, "(BC)" + ModItemCatalog.SvsapUniqueId + ".NetworkCore", networkId);
-        var targetChest = this.PlaceLinkedChest(location, targetChestTile, networkId);
+        var targetChest = this.PlaceNetworkStorageChest(location, storageInterfaceTile, targetChestTile, networkId);
         var cell = this.PlaceLinkedMachine(location, cellTile, "(BC)" + ModItemCatalog.CopperEnergyCell, networkId);
         var importer = this.PlaceLinkedMachine(location, importerTile, "(BC)" + ModItemCatalog.PoweredImporterCopper, networkId);
         var sourceChest = this.PlaceChest(location, sourceChestTile);
 
         var cellGuid = this.RegisterMachine(cell, location, cellTile, storedWh: 0);
         var importerGuid = this.RegisterMachine(importer, location, importerTile, storedWh: 0);
+        if (!this.runtime.TrySetPoweredFacingDirection(importer, location, importerTile, 1, out var directionMessage))
+            throw new InvalidOperationException($"Could not configure P0/P1 importer direction: {directionMessage}");
         this.WritePayload("single-fixture.json", new
         {
             networkId = networkId.ToString("N"),
             coreTile = FormatTile(coreTile),
             targetChestTile = FormatTile(targetChestTile),
+            storageInterfaceTile = FormatTile(storageInterfaceTile),
             cellTile = FormatTile(cellTile),
             importerTile = FormatTile(importerTile),
             sourceChestTile = FormatTile(sourceChestTile),
@@ -938,12 +951,14 @@ internal sealed class SvsapmeP0P1E2EService
         return obj;
     }
 
-    private Chest PlaceLinkedChest(GameLocation location, Vector2 tile, Guid networkId)
+    private Chest PlaceNetworkStorageChest(GameLocation location, Vector2 interfaceTile, Vector2 chestTile, Guid networkId)
     {
-        var chest = new Chest(CreateEmptyChestSlots(), tile, false, 0, false);
-        this.RegisterSvsapEndpoint(chest, location, tile, networkId, "Chest");
-        location.Objects[tile] = chest;
-        return chest;
+        var storageInterface = this.PlaceMachine(
+            location,
+            interfaceTile,
+            "(BC)" + ModItemCatalog.SvsapPrefix + "StorageInterface");
+        this.RegisterSvsapEndpoint(storageInterface, location, interfaceTile, networkId, "StorageInterface");
+        return this.PlaceChest(location, chestTile);
     }
 
     private Chest PlaceChest(GameLocation location, Vector2 tile)

@@ -1711,13 +1711,21 @@ internal sealed class MachineRuntimeService
         {
             if (obj is Chest chest)
             {
-                if (ChestAccessHelper.TryAcquireImmediate(chest, out var chestLease))
-                {
-                    using (chestLease)
+                if (ChestAccessHelper.TryRunWithLock(
+                    chest,
+                    () =>
                     {
+                        if (!this.IsCurrentMachineInstance(location, machine, placedObject, state))
+                            return;
+
                         if (this.TryRoutePoweredImportFromChest(api, state, networkId, chest, tier, settings))
-                            return true;
-                    }
+                        {
+                            SyncPlacedObjectStateModData(location, machine, state);
+                            this.repository.Save();
+                        }
+                    }))
+                {
+                    return false;
                 }
 
                 continue;
@@ -1838,25 +1846,42 @@ internal sealed class MachineRuntimeService
                 continue;
             }
 
-            if (!ChestAccessHelper.TryAcquireImmediate(chest, out var chestLease))
-                continue;
-
-            using (chestLease)
-            {
-                if (settings.FilterBlacklist)
+            if (!ChestAccessHelper.TryRunWithLock(
+                chest,
+                () =>
                 {
-                    if (this.TryRoutePoweredExportBlacklist(api, state, networkId, location, tile, chest, tier, settings))
-                        return true;
+                    if (!this.IsCurrentMachineInstance(location, machine, placedObject, state))
+                        return;
 
-                    continue;
-                }
-
-                if (this.TryRoutePoweredExportWhitelist(api, state, networkId, location, tile, chest, tier, settings))
-                    return true;
+                    var changed = settings.FilterBlacklist
+                        ? this.TryRoutePoweredExportBlacklist(api, state, networkId, location, tile, chest, tier, settings)
+                        : this.TryRoutePoweredExportWhitelist(api, state, networkId, location, tile, chest, tier, settings);
+                    if (changed)
+                    {
+                        SyncPlacedObjectStateModData(location, machine, state);
+                        this.repository.Save();
+                    }
+                }))
+            {
+                continue;
             }
+
+            return false;
         }
 
         return false;
+    }
+
+    private bool IsCurrentMachineInstance(
+        GameLocation location,
+        MachineLocation machine,
+        SObject expectedObject,
+        MachineState expectedState)
+    {
+        return location.Objects.TryGetValue(machine.Tile, out var currentObject)
+            && ReferenceEquals(currentObject, expectedObject)
+            && this.repository.TryGet(machine.MachineGuid, out var currentState)
+            && ReferenceEquals(currentState, expectedState);
     }
 
     private bool TryRoutePoweredExportToMachine(

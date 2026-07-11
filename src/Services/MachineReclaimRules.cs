@@ -122,6 +122,7 @@ internal static class MachineReclaimRules
                 }
 
                 installedModuleStacks += FarmModuleRules.GetInstalledModuleItems(state.Farm).Count();
+                installedModuleStacks += ProcessorUpgradeRules.GetInstalledUpgradeItems(state.Processor).Count;
             }
         }
 

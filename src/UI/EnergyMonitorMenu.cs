@@ -7,9 +7,12 @@ namespace SVSAPME.UI;
 
 internal sealed class EnergyMonitorMenu : IClickableMenu
 {
-    private const int Pad = 24;
+    private const int Pad = SvsapmeUiText.ContentPad;
+    private const int ViewRefreshTicks = 30;
     private static readonly Rectangle PanelSource = new(0, 256, 60, 60);
     private readonly Func<EnergyMonitorView> getView;
+    private EnergyMonitorView? cachedView;
+    private int cachedAtTick = -1;
     private string? hoverTitle;
     private IReadOnlyList<string> hoverLines = Array.Empty<string>();
 
@@ -32,16 +35,22 @@ internal sealed class EnergyMonitorMenu : IClickableMenu
     public override void draw(SpriteBatch b)
     {
         var panel = new Rectangle(this.xPositionOnScreen, this.yPositionOnScreen, this.width, this.height);
-        IClickableMenu.drawTextureBox(b, Game1.menuTexture, PanelSource, panel.X, panel.Y, panel.Width, panel.Height, Color.White, 1f, true);
-        Utility.drawTextWithShadow(b, ModText.Get("ui.energyMeter.title", "Energy Meter"), Game1.dialogueFont, new Vector2(panel.X + Pad + 8, panel.Y + 24), Game1.textColor);
+        SvsapmeUiText.DrawStardewAE2Frame(b, panel);
+        SvsapmeUiText.DrawFittedTitle(
+            b,
+            ModText.Get("ui.energyMeter.title", "Energy Meter"),
+            new Rectangle(panel.X + Pad + 8, panel.Y + 16, panel.Width - Pad * 2 - 70, 52),
+            Game1.textColor);
 
-        var view = this.getView();
-        var content = new Rectangle(panel.X + Pad, panel.Y + 86, panel.Width - Pad * 2, panel.Height - 116);
+        var view = this.GetCachedView();
+        var content = new Rectangle(panel.X + Pad, panel.Y + 86, panel.Width - Pad * 2, panel.Height - 122);
         DrawInset(b, content);
 
-        var light = !view.Online ? PixelStatus.Offline : view.CapacityWh > 0 && view.StoredWh * 10 < view.CapacityWh ? PixelStatus.Warning : PixelStatus.Ready;
+        var light = ResolveEnergyStatus(view);
         SvsapmeUiText.DrawPixelStatusLight(b, content.X + 16, content.Y + 17, light);
-        SvsapmeUiText.DrawFittedLine(b, view.StatusText, new Rectangle(content.X + 34, content.Y + 8, content.Width - 50, 28), view.Online ? Game1.textColor : Color.Crimson);
+        var statusText = view.Online && !string.IsNullOrWhiteSpace(view.Warning) ? view.Warning : view.StatusText;
+        var statusColor = light == PixelStatus.Offline ? Color.Crimson : light == PixelStatus.Warning ? Color.DarkOrange : Game1.textColor;
+        SvsapmeUiText.DrawFittedLine(b, statusText, new Rectangle(content.X + 34, content.Y + 8, content.Width - 50, 28), statusColor);
 
         var meter = new Rectangle(content.X + 18, content.Y + 48, content.Width - 36, 34);
         b.Draw(Game1.staminaRect, meter, Color.Black * 0.45f);
@@ -81,8 +90,8 @@ internal sealed class EnergyMonitorMenu : IClickableMenu
     {
         this.hoverTitle = null;
         this.hoverLines = Array.Empty<string>();
-        var view = this.getView();
-        var content = new Rectangle(this.xPositionOnScreen + Pad, this.yPositionOnScreen + 86, this.width - Pad * 2, this.height - 116);
+        var view = this.GetCachedView();
+        var content = new Rectangle(this.xPositionOnScreen + Pad, this.yPositionOnScreen + 86, this.width - Pad * 2, this.height - 122);
         var meter = new Rectangle(content.X + 18, content.Y + 48, content.Width - 36, 34);
         var listY = meter.Bottom + 80;
         var listWidth = (content.Width - 54) / 2;
@@ -100,7 +109,7 @@ internal sealed class EnergyMonitorMenu : IClickableMenu
 
     private static EnergyMonitorDeviceView? HitDeviceRow(Rectangle bounds, IReadOnlyList<EnergyMonitorDeviceView> devices, int x, int y)
     {
-        var rows = Math.Min(7, devices.Count);
+        var rows = GetVisibleDeviceRowCount(bounds, devices.Count);
         for (var index = 0; index < rows; index++)
         {
             var row = new Rectangle(bounds.X + 10, bounds.Y + 36 + index * SvsapmeUiText.SmallLineHeight, bounds.Width - 20, SvsapmeUiText.SmallLineHeight);
@@ -115,13 +124,47 @@ internal sealed class EnergyMonitorMenu : IClickableMenu
     {
         DrawInset(b, bounds);
         SvsapmeUiText.DrawFittedLine(b, title, new Rectangle(bounds.X + 10, bounds.Y + 8, bounds.Width - 20, 24), Game1.textColor);
-        var lines = devices.Take(7).Select(device => ModText.Get("ui.energyMeter.deviceLine", "{{name}}: {{value}}", new { name = device.DisplayName, value = FormatWh(device.Wh) }));
+        var lines = devices.Take(GetVisibleDeviceRowCount(bounds, devices.Count)).Select(device => ModText.Get("ui.energyMeter.deviceLine", "{{name}}: {{value}}", new { name = device.DisplayName, value = FormatWh(device.Wh) }));
         SvsapmeUiText.DrawFittedLines(b, lines, new Rectangle(bounds.X + 12, bounds.Y + 38, bounds.Width - 24, bounds.Height - 48), Game1.textColor);
     }
 
     private static void DrawInset(SpriteBatch b, Rectangle bounds)
     {
         IClickableMenu.drawTextureBox(b, Game1.menuTexture, PanelSource, bounds.X, bounds.Y, bounds.Width, bounds.Height, Color.White * 0.88f, 1f, false);
+    }
+
+    internal static PixelStatus ResolveEnergyStatus(EnergyMonitorView view)
+    {
+        if (!view.Online)
+            return PixelStatus.Offline;
+        if (!string.IsNullOrWhiteSpace(view.Warning)
+            || view.CapacityWh > 0 && view.StoredWh / (decimal)view.CapacityWh < 0.1m)
+        {
+            return PixelStatus.Warning;
+        }
+
+        return PixelStatus.Ready;
+    }
+
+    internal static int GetVisibleDeviceRowCount(Rectangle bounds, int availableCount)
+    {
+        var availableHeight = Math.Max(0, bounds.Height - 48);
+        return Math.Min(Math.Max(0, availableCount), availableHeight / Math.Max(1, SvsapmeUiText.SmallLineHeight));
+    }
+
+    private EnergyMonitorView GetCachedView()
+    {
+        var tick = Game1.ticks;
+        if (this.cachedView is null
+            || this.cachedAtTick < 0
+            || tick < this.cachedAtTick
+            || tick - this.cachedAtTick >= ViewRefreshTicks)
+        {
+            this.cachedView = this.getView();
+            this.cachedAtTick = tick;
+        }
+
+        return this.cachedView;
     }
 
     private static string FormatWh(long value) => Math.Abs(value) >= 1000 ? $"{value / 1000m:0.00} kWh" : $"{value:N0} Wh";

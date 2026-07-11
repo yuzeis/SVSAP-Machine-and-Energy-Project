@@ -52,7 +52,11 @@ internal enum SvsapmeMachineActionKind
     ToggleProcessorFilterMode,
     AddProcessorFilter,
     ClearProcessorFilter,
-    CollectProcessorOutput
+    CollectProcessorOutput,
+    InstallProcessorUpgrade,
+    RemoveProcessorUpgrade,
+    UprootFarmPlot,
+    ClearFarmPlots
 }
 
 internal enum SvsapmeMachineMenuKind
@@ -66,6 +70,8 @@ internal enum SvsapmeMachineMenuKind
 
 internal sealed class SvsapmeMachineSnapshotRequest
 {
+    public Guid MenuSessionId { get; set; }
+    public long RequestSequence { get; set; }
     public Guid MachineGuid { get; set; }
     public int Offset { get; set; }
     public int Limit { get; set; } = 64;
@@ -73,6 +79,8 @@ internal sealed class SvsapmeMachineSnapshotRequest
 
 internal sealed class SvsapmeMachineSnapshotResponse
 {
+    public Guid MenuSessionId { get; set; }
+    public long RequestSequence { get; set; }
     public Guid MachineGuid { get; set; }
     public bool Success { get; set; }
     public string Message { get; set; } = string.Empty;
@@ -99,6 +107,8 @@ internal sealed class SvsapmeMachineSnapshotResponse
 internal sealed class SvsapmeMachineActionRequest
 {
     public Guid TransactionId { get; set; }
+    public Guid MenuSessionId { get; set; }
+    public long RequestSequence { get; set; }
     public Guid MachineGuid { get; set; }
     public SvsapmeMachineActionKind ActionKind { get; set; }
     public string QualifiedItemId { get; set; } = string.Empty;
@@ -124,6 +134,8 @@ internal sealed class SvsapmeMachineActionRequest
 internal sealed class SvsapmeMachineActionResponse
 {
     public Guid TransactionId { get; set; }
+    public Guid MenuSessionId { get; set; }
+    public long RequestSequence { get; set; }
     public Guid MachineGuid { get; set; }
     public bool Success { get; set; }
     public bool ConsumeEscrowedItem { get; set; }
@@ -135,6 +147,8 @@ internal sealed class SvsapmeMachineActionResponse
 internal sealed class SvsapmeFarmMenuSnapshot
 {
     public int PlotCapacity { get; set; }
+    public int OccupiedPlots { get; set; }
+    public int LockedPlots { get; set; }
     public int Offset { get; set; }
     public bool AutoPullFromNetwork { get; set; }
     public bool AutoPushOutputToNetwork { get; set; }
@@ -170,6 +184,11 @@ internal sealed class SvsapmeProcessorMenuSnapshot
 {
     public int SlotCapacity { get; set; }
     public int Offset { get; set; }
+    public bool NetworkOnline { get; set; }
+    public bool EnergyOnline { get; set; }
+    public long StoredWh { get; set; }
+    public long CapacityWh { get; set; }
+    public long RequiredWhForNextStep { get; set; }
     public bool AutoPullFromNetwork { get; set; }
     public bool AutoPushOutputToNetwork { get; set; }
     public string InputMode { get; set; } = string.Empty;
@@ -177,6 +196,10 @@ internal sealed class SvsapmeProcessorMenuSnapshot
     public List<string> FilterQualifiedItemIds { get; set; } = new();
     public List<BufferedItemStack> InputBuffer { get; set; } = new();
     public List<BufferedItemStack> OutputBuffer { get; set; } = new();
+    public List<string> InstalledUpgradeQualifiedItemIds { get; set; } = new();
+    public int UpgradeSlotCapacity { get; set; }
+    public int SpeedPermille { get; set; } = 1000;
+    public int OutputBufferCapacityItems { get; set; }
     public List<SvsapmeProcessorSlotSnapshot> Slots { get; set; } = new();
     public decimal EstimatedDailyValue { get; set; }
 }

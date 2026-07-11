@@ -14,6 +14,7 @@ internal static class SvsapmeActionEscrowRules
             or SvsapmeMachineActionKind.StartElectricFurnace
             or SvsapmeMachineActionKind.StartElectricGeodeCrusher
             or SvsapmeMachineActionKind.LoadProcessorInput
+            or SvsapmeMachineActionKind.InstallProcessorUpgrade
             or SvsapmeMachineActionKind.InstallPoweredUpgrade;
     }
 

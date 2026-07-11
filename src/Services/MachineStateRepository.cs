@@ -7,7 +7,7 @@ namespace SVSAPME.Services;
 internal sealed class MachineStateRepository
 {
     private const string SaveKey = "machines";
-    private const int CurrentSchemaVersion = 5;
+    private const int CurrentSchemaVersion = 7;
 
     private readonly IModHelper helper;
     private readonly IMonitor monitor;
@@ -84,14 +84,24 @@ internal sealed class MachineStateRepository
         loaded.Machines ??= new();
         loaded.PendingReclaims ??= new();
         loaded.PendingRemoteDeliveries ??= new();
+        loaded.ExecutedRemoteActions ??= new();
+        changed |= ExecutedMachineActionLedger.Normalize(loaded.ExecutedRemoteActions);
+        var discardedBufferedItems = 0;
         foreach (var delivery in loaded.PendingRemoteDeliveries)
+        {
             delivery.ReturnedItems ??= new();
+            changed |= NormalizeBufferedList(delivery.ReturnedItems, ref discardedBufferedItems);
+        }
+        foreach (var executed in loaded.ExecutedRemoteActions)
+            changed |= NormalizeBufferedList(executed.ReturnedItems, ref discardedBufferedItems);
 
         foreach (var state in loaded.Machines.Values)
         {
             state.OutputBuffer ??= new();
+            changed |= NormalizeBufferedList(state.OutputBuffer, ref discardedBufferedItems);
             state.Farm ??= new();
             state.Farm.InputBuffer ??= new();
+            changed |= NormalizeBufferedList(state.Farm.InputBuffer, ref discardedBufferedItems);
             state.Farm.Plots ??= new();
             state.Farm.PlotLocks ??= new();
             state.Farm.SeedFilterQualifiedItemIds ??= new();
@@ -101,8 +111,22 @@ internal sealed class MachineStateRepository
             state.Processor.Slots ??= new();
             state.Processor.InputBuffer ??= new();
             state.Processor.OutputBuffer ??= new();
+            changed |= NormalizeBufferedList(state.Processor.InputBuffer, ref discardedBufferedItems);
+            changed |= NormalizeBufferedList(state.Processor.OutputBuffer, ref discardedBufferedItems);
+            changed |= NormalizeProcessorSlots(state.Processor, ref discardedBufferedItems);
+            state.Processor.InstalledUpgradeQualifiedItemIds ??= new();
             state.Processor.FilterQualifiedItemIds ??= new();
             NormalizeMachineFilterState(state.Processor);
+            changed |= ProcessorUpgradeRules.NormalizeInstalledUpgrades(state.Processor);
+            var normalizedKegRemainder = Math.Clamp(state.Processor.KegSpeedRemainderPermille, 0, 999);
+            var normalizedCaskRemainder = Math.Clamp(state.Processor.CaskSpeedRemainderPermille, 0, 999);
+            if (state.Processor.KegSpeedRemainderPermille != normalizedKegRemainder
+                || state.Processor.CaskSpeedRemainderPermille != normalizedCaskRemainder)
+            {
+                state.Processor.KegSpeedRemainderPermille = normalizedKegRemainder;
+                state.Processor.CaskSpeedRemainderPermille = normalizedCaskRemainder;
+                changed = true;
+            }
             if (state.Processor.LastKegUpdateTime <= 0)
             {
                 state.Processor.LastKegUpdateTime = 600;
@@ -138,7 +162,82 @@ internal sealed class MachineStateRepository
             state.ModData ??= new();
         }
 
+        if (discardedBufferedItems > 0)
+        {
+            this.monitor.Log(
+                $"Discarded {discardedBufferedItems:N0} malformed SVSAPME buffered item payload(s) while loading the save.",
+                LogLevel.Warn);
+        }
+
         return changed;
+    }
+
+    internal static bool NormalizeProcessorSlots(
+        SingleBlockProcessorMachineState processor,
+        ref int discardedBufferedItems)
+    {
+        var changed = false;
+        foreach (var slot in processor.Slots)
+        {
+            if (slot is null)
+            {
+                discardedBufferedItems++;
+                changed = true;
+                continue;
+            }
+
+            var invalidInput = slot.Input is not null && !NormalizeBufferedStack(slot.Input);
+            var invalidOutput = slot.Output is not null && !NormalizeBufferedStack(slot.Output);
+            if (!invalidInput && !invalidOutput)
+                continue;
+
+            discardedBufferedItems += (invalidInput ? 1 : 0) + (invalidOutput ? 1 : 0);
+            if (!invalidInput && slot.Input is not null)
+                processor.InputBuffer.Add(slot.Input);
+            if (!invalidOutput && slot.Output is not null)
+                processor.OutputBuffer.Add(slot.Output);
+            SingleBlockProcessorRules.ClearSlot(slot);
+            changed = true;
+        }
+
+        if (processor.Slots.RemoveAll(slot => slot is null) > 0)
+            changed = true;
+        return changed;
+    }
+
+    internal static bool NormalizeBufferedList(
+        List<BufferedItemStack> stacks,
+        ref int discardedBufferedItems)
+    {
+        var changed = false;
+        for (var index = 0; index < stacks.Count;)
+        {
+            var stack = stacks[index];
+            if (stack is null || !NormalizeBufferedStack(stack))
+            {
+                stacks.RemoveAt(index);
+                discardedBufferedItems++;
+                changed = true;
+                continue;
+            }
+
+            index++;
+        }
+
+        return changed;
+    }
+
+    private static bool NormalizeBufferedStack(BufferedItemStack stack)
+    {
+        if (string.IsNullOrWhiteSpace(stack.QualifiedItemId) || stack.Stack <= 0)
+            return false;
+
+        stack.PreservedParentSheetIndex ??= string.Empty;
+        stack.Type ??= string.Empty;
+        stack.Name ??= string.Empty;
+        stack.DisplayName ??= string.Empty;
+        stack.ModData ??= new();
+        return true;
     }
 
     private static bool NormalizeFarmPlots(FarmMachineState farm)

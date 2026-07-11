@@ -620,6 +620,12 @@ internal sealed class MachineRegistryService
                 items.Add(processorItem);
                 reclaimedItems++;
             }
+
+            foreach (var upgradeQualifiedItemId in ProcessorUpgradeRules.GetInstalledUpgradeItems(state.Processor))
+            {
+                items.Add(ItemRegistry.Create(upgradeQualifiedItemId, 1));
+                reclaimedItems++;
+            }
         }
 
         return new ReclaimBuildResult(items, machineGuids, reclaimedMachines, reclaimedItems);
@@ -645,7 +651,8 @@ internal sealed class MachineRegistryService
             || FarmModuleRules.GetInstalledModuleItems(state.Farm).Any()
             || state.Processor.InputBuffer.Any(stack => stack.Stack > 0)
             || state.Processor.OutputBuffer.Any(stack => stack.Stack > 0)
-            || state.Processor.Slots.Any(SingleBlockProcessorRules.IsWorking);
+            || state.Processor.Slots.Any(SingleBlockProcessorRules.IsWorking)
+            || ProcessorUpgradeRules.GetInstalledUpgradeItems(state.Processor).Any();
     }
 
     internal static ConfirmedMachineConsumptionResult RetireConfirmedConsumedMachine(MachineSaveData data, Guid machineGuid)
@@ -686,6 +693,7 @@ internal sealed class MachineRegistryService
             state.Processor.InputBuffer.Clear();
             state.Processor.OutputBuffer.Clear();
             state.Processor.Slots.Clear();
+            ProcessorUpgradeRules.ClearInstalledUpgrades(state.Processor);
             state.ModData[ReclaimInTransitKey] = "1";
             state.MissingDays = 0;
         }

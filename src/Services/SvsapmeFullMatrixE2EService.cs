@@ -1,4 +1,5 @@
 #if DEBUG
+using System.Reflection;
 using System.Text.Json;
 using Koizumi.SVSAP.Api;
 using Microsoft.Xna.Framework;
@@ -20,7 +21,7 @@ internal sealed class SvsapmeFullMatrixE2EService
     private const string OutputDirEnv = "STARDEW_SVSAPME_FULL_E2E_OUTPUT";
     private const string VersionEnv = "STARDEW_SVSAPME_FULL_E2E_VERSION";
     private const string FarmNameEnv = "STARDEW_SVSAPME_FULL_E2E_FARM";
-    private const string DefaultVersionLabel = "ver1.4.0-alpha.1";
+    private const string DefaultVersionLabel = "ver1.4.1-rc1.0";
     private const int StartupTimeoutTicks = 12000;
     private const string SvsapNetworkIdKey = ModItemCatalog.SvsapUniqueId + "/NetworkId";
     private const string SvsapEndpointIdKey = ModItemCatalog.SvsapUniqueId + "/EndpointId";
@@ -47,6 +48,7 @@ internal sealed class SvsapmeFullMatrixE2EService
     private int startupTicks;
     private int startupStage;
     private int ticks;
+    private Queue<Action>? pendingChecks;
 
     public SvsapmeFullMatrixE2EService(
         IModHelper helper,
@@ -122,17 +124,26 @@ internal sealed class SvsapmeFullMatrixE2EService
 
         try
         {
-            this.RunAll();
+            if (this.pendingChecks is null)
+            {
+                this.PrepareRun();
+                return;
+            }
+
+            if (this.pendingChecks.Count > 0)
+            {
+                this.pendingChecks.Dequeue().Invoke();
+                return;
+            }
+
             this.WriteResults("full-matrix-complete.json");
+            this.Stop();
         }
         catch (Exception ex)
         {
             this.Record("exception", false, $"{ex.GetType().Name}: {ex.Message}");
             this.WriteResults("full-matrix-fail.json");
             this.monitor.Log($"SVSAPME_FULL_E2E_FAIL {ex}", LogLevel.Error);
-        }
-        finally
-        {
             this.Stop();
         }
     }
@@ -217,7 +228,7 @@ internal sealed class SvsapmeFullMatrixE2EService
         Game1.player.isCustomized.Value = true;
     }
 
-    private void RunAll()
+    private void PrepareRun()
     {
         var config = this.getConfig();
         config.EnergyTickInterval = 1;
@@ -229,51 +240,57 @@ internal sealed class SvsapmeFullMatrixE2EService
 
         this.registry.RebuildCache();
 
-        this.Check("36", this.TestCarbonGenerator);
-        this.Check("37", this.TestSolarPanel);
-        this.Check("38", this.TestLightningCapacitor);
-        this.Check("39", this.TestEnergyCells);
-        this.Check("40", this.TestBatterySynthesizer);
-        this.Check("41", this.TestBatteryDischarger);
-        this.Check("42", this.TestEnergyMonitorBackend);
-        this.Check("43", this.TestFarmTiers);
-        this.Check("44", this.TestFarmChamberRecipes);
-        this.Check("45", this.TestGrowthLights);
-        this.Check("46", this.TestThermostats);
-        this.Check("47", this.TestSlowRelease);
-        this.Check("48", this.TestModuleHotSwapProgress);
-        this.Check("49", this.TestPoweredImporterTiers);
-        this.Check("50", this.TestPoweredExporterTiers);
-        this.Check("51", this.TestPoweredInterfaceRangeAndAction);
-        this.Check("52", this.TestElectricFurnace);
-        this.Check("53", this.TestElectricGeodeCrusher);
-        this.Check("54", this.TestL7NoRegression);
-        this.Check("55", this.TestAtomicEnergyPayments);
-        this.Check("56", this.TestNetworkConnection);
-        this.Check("57", this.TestCraftingTerminalSurface);
-        this.Check("58", this.TestPatternSurface);
-        this.Check("59", this.TestQualityStrategySurface);
-        this.Check("60", this.TestCrossLocationNetwork);
-        this.Check("61", this.TestMachineGuidPickupReplay);
-        this.Check("62", this.TestChargedCellPickupReplay);
-        this.Check("63", this.TestPersistentContainers);
-        this.Check("64", this.TestJunimoGlobalInventoryCoverage);
-        this.Check("65", this.TestConsumedChargedMachine);
-        this.Check("66", this.TestDigitizeGuard);
-        this.Check("67", this.TestStackGuard);
-        this.Check("68", this.TestPendingReclaimLifecycle);
-        this.Check("69", this.TestClaimGate);
-        this.Check("70", this.TestDemolishHeldExclusion);
-        this.Check("71", this.TestRepositoryRoundTrip);
-        this.Check("81", this.TestAllMachineTypesRepositoryRoundTrip);
-        this.Check("83", this.TestDebugRecipeModeBehavior);
-        this.Check("84", this.TestRecipeModeSwitching);
-        this.Check("88", this.TestFullNetworkStress);
-        this.Check("89", this.TestZeroEnergyDegrade);
-        this.Check("90", this.TestEnergyBoundaries);
-        this.Check("91", this.TestRapidPickupReplay);
-        this.Check("92", this.TestInterruptedSettlementRoundTrip);
-        this.Check("93", this.TestSvsapRecipeParity);
+        this.pendingChecks = new Queue<Action>(new Action[]
+        {
+            () => this.Check("36", this.TestCarbonGenerator),
+            () => this.Check("37", this.TestSolarPanel),
+            () => this.Check("38", this.TestLightningCapacitor),
+            () => this.Check("39", this.TestEnergyCells),
+            () => this.Check("40", this.TestBatterySynthesizer),
+            () => this.Check("41", this.TestBatteryDischarger),
+            () => this.Check("42", this.TestEnergyMonitorBackend),
+            () => this.Check("43", this.TestFarmTiers),
+            () => this.Check("44", this.TestFarmChamberRecipes),
+            () => this.Check("45", this.TestGrowthLights),
+            () => this.Check("46", this.TestThermostats),
+            () => this.Check("47", this.TestSlowRelease),
+            () => this.Check("48", this.TestModuleHotSwapProgress),
+            () => this.Check("49", this.TestPoweredImporterTiers),
+            () => this.Check("50", this.TestPoweredExporterTiers),
+            () => this.Check("51", this.TestPoweredInterfaceRangeAndAction),
+            () => this.Check("52", this.TestElectricFurnace),
+            () => this.Check("53", this.TestElectricGeodeCrusher),
+            () => this.Check("54", this.TestL7NoRegression),
+            () => this.Check("55", this.TestAtomicEnergyPayments),
+            () => this.Check("56", this.TestNetworkConnection),
+            () => this.Check("57", this.TestCraftingTerminalSurface),
+            () => this.Check("58", this.TestPatternSurface),
+            () => this.Check("59", this.TestQualityStrategySurface),
+            () => this.Check("60", this.TestCrossLocationNetwork),
+            () => this.Check("61", this.TestMachineGuidPickupReplay),
+            () => this.Check("62", this.TestChargedCellPickupReplay),
+            () => this.Check("63", this.TestPersistentContainers),
+            () => this.Check("64", this.TestJunimoGlobalInventoryCoverage),
+            () => this.Check("65", this.TestConsumedChargedMachine),
+            () => this.Check("66", this.TestDigitizeGuard),
+            () => this.Check("67", this.TestStackGuard),
+            () => this.Check("68", this.TestPendingReclaimLifecycle),
+            () => this.Check("69", this.TestClaimGate),
+            () => this.Check("70", this.TestDemolishHeldExclusion),
+            () => this.Check("71", this.TestRepositoryRoundTrip),
+            () => this.Check("72", this.TestProcessorUpgradeSlots),
+            () => this.Check("81", this.TestAllMachineTypesRepositoryRoundTrip),
+            () => this.Check("83", this.TestDebugRecipeModeBehavior),
+            () => this.Check("84", this.TestRecipeModeSwitching),
+            () => this.Check("88", this.TestFullNetworkStress),
+            () => this.Check("89", this.TestZeroEnergyDegrade),
+            () => this.Check("90", this.TestEnergyBoundaries),
+            () => this.Check("91", this.TestRapidPickupReplay),
+            () => this.Check("92", this.TestInterruptedSettlementRoundTrip),
+            () => this.Check("93", this.TestSvsapRecipeParity),
+            () => this.Check("94", this.TestFarmUprootAndClearAll),
+            () => this.Check("95", this.TestProcessorAutoPullCoffeeWithQualityCard)
+        });
     }
 
     private void Check(string id, Func<(bool Pass, string Evidence)> test)
@@ -630,16 +647,171 @@ internal sealed class SvsapmeFullMatrixE2EService
         this.getSvsapApi()!.TryInsertItem(fixture.NetworkId, silver, out _, out _, out _);
         this.getSvsapApi()!.TryInsertItem(fixture.NetworkId, gold, out _, out _, out _);
         this.runtime.RunRouteTickForE2E();
+        PumpChestMutex(targetChest, fixture.Location);
         var movedQuality = targetChest.Items.FirstOrDefault(item => item is not null)?.Quality ?? -1;
         return (install.Success && toggle && movedQuality == 2, $"install={install.Success} toggle={toggle} movedQuality={movedQuality}");
+    }
+
+    private (bool, string) TestProcessorUpgradeSlots()
+    {
+        var fixture = this.CreateFixture(width: 6, height: 3);
+        var kegTile = fixture.Origin + new Vector2(2, 0);
+        var caskTile = fixture.Origin + new Vector2(3, 0);
+        var keg = this.PlaceLinkedMachine(fixture.Location, kegTile, "(BC)" + ModItemCatalog.IridiumKeg, fixture.NetworkId);
+        var cask = this.PlaceLinkedMachine(fixture.Location, caskTile, "(BC)" + ModItemCatalog.IridiumCask, fixture.NetworkId);
+        this.RegisterMachine(keg, fixture.Location, kegTile, 0);
+        this.RegisterMachine(cask, fixture.Location, caskTile, 0);
+        var processor = new SingleBlockProcessorService(
+            this.repository,
+            this.registry,
+            this.energy,
+            this.getSvsapApi,
+            this.getConfig,
+            this.helper.Input,
+            this.monitor);
+
+        var speed = processor.TryInstallProcessorUpgrade(keg, fixture.Location, kegTile, "(O)" + ModItemCatalog.SvsapSpeedCard);
+        var capacity = processor.TryInstallProcessorUpgrade(keg, fixture.Location, kegTile, "(O)" + ModItemCatalog.SvsapCapacityCard);
+        var quality = processor.TryInstallProcessorUpgrade(keg, fixture.Location, kegTile, "(O)" + ModItemCatalog.SvsapQualityCard);
+        var caskQuality = processor.TryInstallProcessorUpgrade(cask, fixture.Location, caskTile, "(O)" + ModItemCatalog.SvsapQualityCard);
+        var dashboard = processor.GetDashboard(keg, fixture.Location, kegTile);
+        var removed = processor.TryRemoveProcessorUpgrade(keg, fixture.Location, kegTile, 1);
+        var removedId = removed.ReturnedItems.FirstOrDefault()?.QualifiedItemId ?? string.Empty;
+        var pass = speed.Success
+            && capacity.Success
+            && quality.Success
+            && !caskQuality.Success
+            && dashboard.UpgradeSlotCapacity == 5
+            && dashboard.UpgradeQualifiedItemIds.Count == 3
+            && dashboard.SpeedPermille == 1100
+            && dashboard.OutputBufferCapacityItems == 256
+            && removed.Success
+            && removedId == "(O)" + ModItemCatalog.SvsapCapacityCard;
+        return (pass, $"installed={dashboard.UpgradeQualifiedItemIds.Count}/{dashboard.UpgradeSlotCapacity} speed={dashboard.SpeedPermille} buffer={dashboard.OutputBufferCapacityItems} caskQuality={caskQuality.Success} removed={removedId}");
+    }
+
+    private (bool, string) TestFarmUprootAndClearAll()
+    {
+        var fixture = this.CreateFixture(width: 5, height: 3);
+        var farmTile = fixture.Origin + new Vector2(2, 0);
+        var farmObject = this.PlaceLinkedMachine(fixture.Location, farmTile, "(BC)" + ModItemCatalog.CopperFarm, fixture.NetworkId);
+        var farmGuid = this.RegisterMachine(farmObject, fixture.Location, farmTile, 0);
+        var state = this.GetState(farmGuid);
+        state.Farm.AutoPullFromNetwork = true;
+        state.Farm.InternalFertilizerCount = 3;
+        state.Farm.InputBuffer.Add(new BufferedItemStack { QualifiedItemId = "(O)499", Stack = 7 });
+        state.Farm.Plots.Add(new FarmPlotState
+        {
+            PlotIndex = 0,
+            SeedQualifiedItemId = "(O)499",
+            HarvestQualifiedItemId = "(O)454",
+            FertilizerQualifiedItemId = "(O)368",
+            ProgressUnits = 3_000,
+            IsLocked = true,
+            LockedSeedQualifiedItemId = "(O)499"
+        });
+        state.Farm.Plots.Add(new FarmPlotState
+        {
+            PlotIndex = 1,
+            SeedQualifiedItemId = "(O)745",
+            HarvestQualifiedItemId = "(O)454",
+            ProgressUnits = 1_000,
+            IsLocked = true,
+            LockedSeedQualifiedItemId = "(O)745"
+        });
+        state.Farm.PlotLocks[0] = "(O)499";
+        state.Farm.PlotLocks[1] = "(O)745";
+        state.Farm.PlotLocks[2] = "(O)499";
+
+        var farmService = new SingleBlockFarmService(
+            this.repository,
+            this.registry,
+            this.energy,
+            this.getSvsapApi,
+            this.getConfig,
+            this.helper.Input,
+            this.monitor);
+        var uproot = farmService.TryUprootFarmPlot(farmObject, fixture.Location, farmTile, 0);
+        var uprootSafe = uproot.Success
+            && uproot.ReturnedItems.Count == 0
+            && state.Farm.Plots.Count == 1
+            && state.Farm.Plots[0].PlotIndex == 1
+            && !state.Farm.PlotLocks.ContainsKey(0)
+            && state.Farm.PlotLocks.ContainsKey(1)
+            && state.Farm.PlotLocks.ContainsKey(2)
+            && state.Farm.AutoPullFromNetwork
+            && state.Farm.InputBuffer.Sum(stack => stack.Stack) == 7
+            && state.Farm.InternalFertilizerCount == 3;
+
+        var clear = farmService.TryClearFarmPlots(farmObject, fixture.Location, farmTile);
+        var clearSafe = clear.Success
+            && clear.ReturnedItems.Count == 0
+            && state.Farm.Plots.Count == 0
+            && state.Farm.PlotLocks.Count == 0
+            && state.Farm.AutoPullFromNetwork
+            && state.Farm.InputBuffer.Sum(stack => stack.Stack) == 7
+            && state.Farm.InternalFertilizerCount == 3;
+        var repeated = farmService.TryClearFarmPlots(farmObject, fixture.Location, farmTile);
+        return (
+            uprootSafe && clearSafe && !repeated.Success,
+            $"uproot={uproot.Success}/{uprootSafe} clear={clear.Success}/{clearSafe} repeated={repeated.Success} autoPull={state.Farm.AutoPullFromNetwork} inputs={state.Farm.InputBuffer.Sum(stack => stack.Stack)} fertilizer={state.Farm.InternalFertilizerCount}");
+    }
+
+    private (bool, string) TestProcessorAutoPullCoffeeWithQualityCard()
+    {
+        var fixture = this.CreateFixture(width: 5, height: 3);
+        var kegTile = fixture.Origin + new Vector2(2, 0);
+        var keg = this.PlaceLinkedMachine(fixture.Location, kegTile, "(BC)" + ModItemCatalog.IridiumKeg, fixture.NetworkId);
+        var kegGuid = this.RegisterMachine(keg, fixture.Location, kegTile, 0);
+        var processor = new SingleBlockProcessorService(
+            this.repository,
+            this.registry,
+            this.energy,
+            this.getSvsapApi,
+            this.getConfig,
+            this.helper.Input,
+            this.monitor);
+        var quality = processor.TryInstallProcessorUpgrade(keg, fixture.Location, kegTile, "(O)" + ModItemCatalog.SvsapQualityCard);
+        var state = this.GetState(kegGuid);
+        state.Processor.AutoPullFromNetwork = true;
+        state.Processor.AutoPushOutputToNetwork = false;
+        this.getConfig().EnableAutomaticProcessorInputFromNetwork = true;
+
+        var coffee = ItemRegistry.Create("(O)433", 5);
+        coffee.Quality = 2;
+        var inserted = this.getSvsapApi()!.TryInsertItem(fixture.NetworkId, coffee, out var remainder, out _, out _)
+            && (remainder is null || remainder.Stack <= 0);
+        var before = this.getSvsapApi()!.GetAvailableCount(fixture.NetworkId, "(O)433", quality: 2);
+        var method = typeof(SingleBlockProcessorService).GetMethod(
+            "ProcessProcessorNetworkAutomation",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingMethodException(nameof(SingleBlockProcessorService), "ProcessProcessorNetworkAutomation");
+        var machine = this.registry.MachinesByGuid[kegGuid];
+        var changed = (bool)(method.Invoke(processor, new object[] { this.getSvsapApi()!, fixture.NetworkId, machine, state }) ?? false);
+        var after = this.getSvsapApi()!.GetAvailableCount(fixture.NetworkId, "(O)433", quality: 2);
+        var job = state.Processor.Slots.FirstOrDefault(SingleBlockProcessorRules.IsWorking);
+        var pass = quality.Success
+            && inserted
+            && before == 5
+            && changed
+            && after == 0
+            && job is not null
+            && job.InputCount == 5
+            && job.Input?.Quality == 2
+            && job.Output?.Quality == 2;
+        return (
+            pass,
+            $"quality={quality.Success} inserted={inserted} before={before} changed={changed} after={after} inputCount={job?.InputCount ?? 0} inputQ={job?.Input?.Quality ?? -1} outputQ={job?.Output?.Quality ?? -1}");
     }
 
     private (bool, string) TestCrossLocationNetwork()
     {
         var fixture = this.CreateFixture(width: 4, height: 3);
         var farmhouse = Game1.getLocationFromName("FarmHouse") ?? throw new InvalidOperationException("FarmHouse missing.");
-        var chestTile = FindClearBlock(farmhouse, 2, 2);
-        var remoteChest = this.PlaceLinkedChest(farmhouse, chestTile, fixture.NetworkId);
+        var clearOrigin = FindClearBlock(farmhouse, 3, 3);
+        var interfaceTile = clearOrigin + new Vector2(1, 1);
+        var chestTile = clearOrigin + new Vector2(2, 1);
+        var remoteChest = this.PlaceNetworkStorageChest(farmhouse, interfaceTile, chestTile, fixture.NetworkId);
         var inserted = this.InsertNetwork(fixture.NetworkId, "(O)388", 11);
         var foundRemote = CountItem(remoteChest, "(O)388") + CountItem(fixture.TargetChest, "(O)388");
         return (inserted && foundRemote == 11, $"farmhouse={farmhouse.NameOrUniqueName} inserted={inserted} totalNetworkChestCount={foundRemote}");
@@ -802,12 +974,26 @@ internal sealed class SvsapmeFullMatrixE2EService
     private (bool, string) TestRepositoryRoundTrip()
     {
         var item = this.CreateStatefulMachineItem("(BC)" + ModItemCatalog.IridiumEnergyCell, out var guid, storedWh: 123_456);
+        var transactionId = Guid.NewGuid();
+        this.repository.Data.ExecutedRemoteActions.Add(new ExecutedMachineAction
+        {
+            PlayerId = 77112233L,
+            TransactionId = transactionId,
+            MachineGuid = guid,
+            ActionKind = SvsapmeMachineActionKind.FuelCarbonGenerator.ToString(),
+            Message = "persisted",
+            ConsumeEscrowedItem = true
+        });
         this.repository.Save();
         this.repository.Load();
         var exists = this.repository.Data.Machines.TryGetValue(guid, out var state);
+        var replayPersisted = ExecutedMachineActionLedger.TryGet(this.repository.Data.ExecutedRemoteActions, 77112233L, transactionId, out var replay)
+            && replay.Message == "persisted";
         this.repository.Data.Machines.Remove(guid);
+        this.repository.Data.ExecutedRemoteActions.RemoveAll(entry => entry.TransactionId == transactionId);
+        this.repository.Save();
         _ = item;
-        return (exists && state!.StoredWh == 123_456 && state.CapacityWh == 640_000, $"exists={exists} stored={state?.StoredWh ?? -1} capacity={state?.CapacityWh ?? -1}");
+        return (exists && state!.StoredWh == 123_456 && state.CapacityWh == 640_000 && replayPersisted, $"exists={exists} stored={state?.StoredWh ?? -1} capacity={state?.CapacityWh ?? -1} durableReplay={replayPersisted}");
     }
 
     private (bool, string) TestAllMachineTypesRepositoryRoundTrip()
@@ -1057,10 +1243,13 @@ internal sealed class SvsapmeFullMatrixE2EService
         var sourceTile = importerTile + new Vector2(1, 0);
         var importer = this.PlaceLinkedMachine(fixture.Location, importerTile, importerQualifiedItemId, fixture.NetworkId);
         this.RegisterMachine(importer, fixture.Location, importerTile, 0);
+        if (!this.runtime.TrySetPoweredFacingDirection(importer, fixture.Location, importerTile, 1, out _))
+            return 0;
         var sourceChest = this.PlaceChest(fixture.Location, sourceTile);
         AddItemsToChest(sourceChest, "(O)390", Math.Max(expected + 10, 1500));
         this.SetNetworkEnergy(fixture, powered ? 100_000 : 0);
         this.runtime.RunRouteTickForE2E();
+        PumpChestMutex(sourceChest, fixture.Location);
         return CountItem(fixture.TargetChest, "(O)390");
     }
 
@@ -1071,12 +1260,22 @@ internal sealed class SvsapmeFullMatrixE2EService
         var targetChest = this.PlaceChest(fixture.Location, exporterTile + new Vector2(1, 0));
         var exporter = this.PlaceLinkedMachine(fixture.Location, exporterTile, exporterQualifiedItemId, fixture.NetworkId);
         this.RegisterMachine(exporter, fixture.Location, exporterTile, 0);
+        if (!this.runtime.TrySetPoweredFacingDirection(exporter, fixture.Location, exporterTile, 1, out _))
+            return 0;
         if (!this.runtime.TrySetPoweredFilterSlot(exporter, fixture.Location, exporterTile, 0, "(O)390", out _))
             return 0;
         this.SetNetworkEnergy(fixture, 100_000);
         this.InsertNetwork(fixture.NetworkId, "(O)390", Math.Max(expected + 10, 1500));
         this.runtime.RunRouteTickForE2E();
+        PumpChestMutex(targetChest, fixture.Location);
         return CountItem(targetChest, "(O)390");
+    }
+
+    private static void PumpChestMutex(Chest chest, GameLocation location)
+    {
+        // FullMatrix executes all cases in one update. Production chests poll their
+        // NetMutex on later updates, so the fixture must advance that poll explicitly.
+        chest.GetMutex().Update(location);
     }
 
     private Fixture CreateFixture(int width, int height)
@@ -1086,11 +1285,13 @@ internal sealed class SvsapmeFullMatrixE2EService
         ClearBlock(location, origin, width, height);
         var networkId = Guid.NewGuid();
         var coreTile = origin;
-        var targetChestTile = origin + new Vector2(1, 0);
+        var interfaceTile = origin + new Vector2(1, 1);
+        var targetChestTile = origin + new Vector2(1, 2);
+        var sourceChestTile = origin + new Vector2(3, 1);
         var cellTile = origin + new Vector2(0, 1);
         this.PlaceLinkedMachine(location, coreTile, "(BC)" + ModItemCatalog.SvsapUniqueId + ".NetworkCore", networkId);
-        var targetChest = this.PlaceLinkedChest(location, targetChestTile, networkId);
-        var sourceChest = this.PlaceChest(location, origin + new Vector2(1, 1));
+        var targetChest = this.PlaceNetworkStorageChest(location, interfaceTile, targetChestTile, networkId);
+        var sourceChest = this.PlaceChest(location, sourceChestTile);
         var cell = this.PlaceLinkedMachine(location, cellTile, "(BC)" + ModItemCatalog.IridiumEnergyCell, networkId);
         var cellGuid = this.RegisterMachine(cell, location, cellTile, 0);
         return new Fixture(location, origin, networkId, targetChest, sourceChest, cell, cellTile, cellGuid);
@@ -1113,12 +1314,14 @@ internal sealed class SvsapmeFullMatrixE2EService
         return obj;
     }
 
-    private Chest PlaceLinkedChest(GameLocation location, Vector2 tile, Guid networkId)
+    private Chest PlaceNetworkStorageChest(GameLocation location, Vector2 interfaceTile, Vector2 chestTile, Guid networkId)
     {
-        var chest = new Chest(CreateEmptyChestSlots(), tile, false, 0, false);
-        this.RegisterSvsapEndpoint(chest, location, tile, networkId, "Chest");
-        location.Objects[tile] = chest;
-        return chest;
+        var storageInterface = this.PlaceMachine(
+            location,
+            interfaceTile,
+            "(BC)" + ModItemCatalog.SvsapPrefix + "StorageInterface");
+        this.RegisterSvsapEndpoint(storageInterface, location, interfaceTile, networkId, "StorageInterface");
+        return this.PlaceChest(location, chestTile);
     }
 
     private Chest PlaceChest(GameLocation location, Vector2 tile)

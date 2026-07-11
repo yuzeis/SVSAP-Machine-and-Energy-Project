@@ -112,25 +112,32 @@ internal sealed class SingleBlockProcessorService
         if (elapsedMinutes <= 0)
             return;
 
-        var api = this.getSvsapApi();
-        if (api is null)
-            return;
-
         var changed = false;
+        var api = this.getSvsapApi();
         foreach (var machine in this.registry.MachinesByGuid.Values
             .Where(machine => SingleBlockProcessorRules.IsKegMachine(machine.QualifiedItemId))
             .OrderBy(machine => machine.MachineGuid)
             .ToList())
         {
-            if (!this.repository.TryGet(machine.MachineGuid, out var state)
-                || !TryGetActiveEndpoint(api, machine, out _, out var endpoint))
-            {
+            if (!this.repository.TryGet(machine.MachineGuid, out var state))
                 continue;
-            }
 
-            changed |= this.AdvanceKegMachine(endpoint.NetworkId, machine, state, elapsedMinutes);
-            changed |= SetKegUpdateTime(state.Processor, e.NewTime);
-            changed |= this.ProcessProcessorNetworkAutomation(api, endpoint.NetworkId, machine, state);
+            try
+            {
+                if (api is not null && TryGetActiveEndpoint(api, machine, out _, out var endpoint))
+                {
+                    changed |= this.AdvanceKegMachine(endpoint.NetworkId, machine, state, elapsedMinutes);
+                    changed |= this.ProcessProcessorNetworkAutomation(api, endpoint.NetworkId, machine, state);
+                }
+            }
+            catch (Exception ex)
+            {
+                this.monitor.Log($"Single-block keg {machine.MachineGuid:N} failed during TimeChanged: {ex.Message}", LogLevel.Warn);
+            }
+            finally
+            {
+                changed |= SetKegUpdateTime(state.Processor, e.NewTime);
+            }
         }
 
         if (changed)
@@ -142,27 +149,34 @@ internal sealed class SingleBlockProcessorService
         if (!Context.IsMainPlayer || !Context.IsWorldReady || !this.getConfig().EnableElectricMachines)
             return;
 
-        var api = this.getSvsapApi();
-        if (api is null)
-            return;
-
         var changed = false;
+        var api = this.getSvsapApi();
         foreach (var machine in this.registry.MachinesByGuid.Values
             .Where(machine => SingleBlockProcessorRules.IsKegMachine(machine.QualifiedItemId))
             .OrderBy(machine => machine.MachineGuid)
             .ToList())
         {
-            if (!this.repository.TryGet(machine.MachineGuid, out var state)
-                || !TryGetActiveEndpoint(api, machine, out _, out var endpoint))
-            {
+            if (!this.repository.TryGet(machine.MachineGuid, out var state))
                 continue;
-            }
 
-            var overnightMinutes = GetKegMinutesUntilDayBoundary(state.Processor.LastKegUpdateTime);
-            if (overnightMinutes > 0)
-                changed |= this.AdvanceKegMachine(endpoint.NetworkId, machine, state, overnightMinutes);
-            changed |= SetKegUpdateTime(state.Processor, 600);
-            changed |= this.ProcessProcessorNetworkAutomation(api, endpoint.NetworkId, machine, state);
+            try
+            {
+                if (api is not null && TryGetActiveEndpoint(api, machine, out _, out var endpoint))
+                {
+                    var overnightMinutes = GetKegMinutesUntilDayBoundary(state.Processor.LastKegUpdateTime);
+                    if (overnightMinutes > 0)
+                        changed |= this.AdvanceKegMachine(endpoint.NetworkId, machine, state, overnightMinutes);
+                    changed |= this.ProcessProcessorNetworkAutomation(api, endpoint.NetworkId, machine, state);
+                }
+            }
+            catch (Exception ex)
+            {
+                this.monitor.Log($"Single-block keg {machine.MachineGuid:N} failed during DayStarted: {ex.Message}", LogLevel.Warn);
+            }
+            finally
+            {
+                changed |= SetKegUpdateTime(state.Processor, 600);
+            }
         }
 
         foreach (var machine in this.registry.MachinesByGuid.Values
@@ -170,14 +184,21 @@ internal sealed class SingleBlockProcessorService
             .OrderBy(machine => machine.MachineGuid)
             .ToList())
         {
-            if (!this.repository.TryGet(machine.MachineGuid, out var state)
-                || !TryGetActiveEndpoint(api, machine, out _, out var endpoint))
-            {
+            if (api is null || !this.repository.TryGet(machine.MachineGuid, out var state))
                 continue;
-            }
 
-            changed |= this.AdvanceCaskMachine(endpoint.NetworkId, machine, state);
-            changed |= this.ProcessProcessorNetworkAutomation(api, endpoint.NetworkId, machine, state);
+            try
+            {
+                if (!TryGetActiveEndpoint(api, machine, out _, out var endpoint))
+                    continue;
+
+                changed |= this.AdvanceCaskMachine(endpoint.NetworkId, machine, state);
+                changed |= this.ProcessProcessorNetworkAutomation(api, endpoint.NetworkId, machine, state);
+            }
+            catch (Exception ex)
+            {
+                this.monitor.Log($"Single-block cask {machine.MachineGuid:N} failed during DayStarted: {ex.Message}", LogLevel.Warn);
+            }
         }
 
         if (changed)
@@ -216,7 +237,7 @@ internal sealed class SingleBlockProcessorService
             || !TryReadMachineGuid(placedObject, out var machineGuid)
             || !this.repository.TryGet(machineGuid, out var state))
         {
-            return new ProcessorDashboardView(false, false, false, MachineInputModes.AllEligible, MachineFilterModes.Whitelist, 0, 0, 0, 0, 0, 0, 0m, null, null, null);
+            return new ProcessorDashboardView(false, false, false, 0, 0, 0, false, false, MachineInputModes.AllEligible, MachineFilterModes.Whitelist, 0, 0, 0, 0, 0, 0, 0m, null, null, null, Array.Empty<string>(), 0, ProcessorUpgradeRules.BaseSpeedPermille, 0);
         }
 
         var tier = SingleBlockProcessorRules.GetTier(placedObject.QualifiedItemId);
@@ -224,11 +245,51 @@ internal sealed class SingleBlockProcessorService
         var active = SingleBlockProcessorRules.CountActive(state.Processor);
         var ready = SingleBlockProcessorRules.CountReady(state.Processor);
         var empty = SingleBlockProcessorRules.CountEmpty(state.Processor);
-        var inputStacks = state.Processor.InputBuffer.Count;
-        var outputStacks = state.Processor.OutputBuffer.Count;
-        var dailyValue = EstimateProcessorDailyValue(state.Processor);
+        var inputStacks = CountBufferedItems(state.Processor.InputBuffer);
+        var outputStacks = CountBufferedItems(state.Processor.OutputBuffer);
+        var processorKind = SingleBlockProcessorRules.GetProcessorKind(placedObject.QualifiedItemId);
+        var speedPermille = ProcessorUpgradeRules.GetSpeedPermille(state.Processor);
+        var dailyValue = EstimateProcessorDailyValue(state.Processor, speedPermille);
+        var upgradeItems = ProcessorUpgradeRules.GetInstalledUpgradeItems(state.Processor);
+        var upgradeSlotCapacity = ProcessorUpgradeRules.GetSlotCapacity(tier);
+        var outputBufferCapacityItems = ProcessorUpgradeRules.GetOutputBufferCapacityItems(state.Processor, tier);
+        var networkOnline = false;
+        var energyOnline = false;
+        var storedWh = 0L;
+        var capacityWh = 0L;
+        var nextWorkUnits = processorKind == SingleBlockProcessorKind.Keg
+            ? ProcessorUpgradeRules.CalculateScaledWork(10, speedPermille, state.Processor.KegSpeedRemainderPermille, out _)
+            : ProcessorUpgradeRules.CalculateScaledWork(1, speedPermille, state.Processor.CaskSpeedRemainderPermille, out _);
+        var requiredWhForNextStep = active <= 0
+            ? 0
+            : processorKind == SingleBlockProcessorKind.Keg
+                ? CalculateRequiredWhForWork(
+                    state.Processor.Slots
+                        .Where(slot => SingleBlockProcessorRules.IsWorking(slot) && slot.RemainingMinutes > 0)
+                        .Select(slot => Math.Min(slot.RemainingMinutes, nextWorkUnits)),
+                    tier.KegWhPerSlotPerHour,
+                    1.0 / 60.0)
+                : CalculateRequiredWhForWork(
+                    state.Processor.Slots
+                        .Where(slot => SingleBlockProcessorRules.IsWorking(slot) && slot.RemainingDays > 0)
+                        .Select(slot => Math.Min(slot.RemainingDays, nextWorkUnits)),
+                    tier.CaskWhPerSlotPerDay,
+                    1.0);
+        var api = this.getSvsapApi();
+        if (api is not null
+            && TryGetActiveEndpoint(api, new MachineLocation(machineGuid, location.NameOrUniqueName, tile, placedObject.QualifiedItemId), out _, out var endpoint))
+        {
+            networkOnline = true;
+            energyOnline = this.energy.TryGetNetworkEnergy(endpoint.NetworkId, out storedWh, out capacityWh, out _);
+        }
+
         return new ProcessorDashboardView(
             true,
+            networkOnline,
+            energyOnline,
+            storedWh,
+            capacityWh,
+            requiredWhForNextStep,
             state.Processor.AutoPullFromNetwork,
             state.Processor.AutoPushOutputToNetwork,
             state.Processor.InputMode,
@@ -242,7 +303,11 @@ internal sealed class SingleBlockProcessorService
             dailyValue,
             state.Processor.InputBuffer.FirstOrDefault(),
             state.Processor.Slots.FirstOrDefault(slot => SingleBlockProcessorRules.IsReady(slot))?.Output,
-            state.Processor.OutputBuffer.FirstOrDefault());
+            state.Processor.OutputBuffer.FirstOrDefault(),
+            upgradeItems,
+            upgradeSlotCapacity,
+            speedPermille,
+            outputBufferCapacityItems);
     }
 
     internal SvsapmeMachineActionApplyResult ToggleProcessorAutoPull(SObject placedObject, GameLocation location, Vector2 tile)
@@ -316,6 +381,72 @@ internal sealed class SingleBlockProcessorService
         });
     }
 
+    internal SvsapmeMachineActionApplyResult TryInstallProcessorUpgrade(
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile,
+        string qualifiedItemId)
+    {
+        if (!SingleBlockProcessorRules.IsProcessorMachine(placedObject.QualifiedItemId))
+            return new(false, false, ModText.Get("hud.processor.notProcessor", "Target machine is not a Single-Block Keg or Cask."));
+
+        if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
+            || !TryReadMachineGuid(placedObject, out var machineGuid)
+            || !this.repository.TryGet(machineGuid, out var state))
+        {
+            return new(false, false, ModText.Get("hud.processor.registerFailed", "SVSAPME could not register this processor."));
+        }
+
+        var tier = SingleBlockProcessorRules.GetTier(placedObject.QualifiedItemId);
+        var kind = SingleBlockProcessorRules.GetProcessorKind(placedObject.QualifiedItemId);
+        var result = ProcessorUpgradeRules.TryInstall(state.Processor, tier, kind, qualifiedItemId);
+        if (!result.Success)
+            return new(false, false, result.Message);
+
+        this.repository.Save();
+        return new(true, result.ConsumesItem, result.Message);
+    }
+
+    internal SvsapmeMachineActionApplyResult TryRemoveProcessorUpgrade(
+        SObject placedObject,
+        GameLocation location,
+        Vector2 tile,
+        int slotIndex)
+    {
+        if (!SingleBlockProcessorRules.IsProcessorMachine(placedObject.QualifiedItemId))
+            return new(false, false, ModText.Get("hud.processor.notProcessor", "Target machine is not a Single-Block Keg or Cask."));
+
+        if (!this.registry.TryRegisterPlacedMachine(placedObject, location, tile)
+            || !TryReadMachineGuid(placedObject, out var machineGuid)
+            || !this.repository.TryGet(machineGuid, out var state))
+        {
+            return new(false, false, ModText.Get("hud.processor.registerFailed", "SVSAPME could not register this processor."));
+        }
+
+        ProcessorUpgradeRules.NormalizeInstalledUpgrades(state.Processor);
+        if (slotIndex < 0 || slotIndex >= state.Processor.InstalledUpgradeQualifiedItemIds.Count)
+        {
+            return new(false, false, ModText.Get(
+                "hud.processor.upgrade.empty",
+                "That processor upgrade slot is empty."));
+        }
+
+        var qualifiedItemId = state.Processor.InstalledUpgradeQualifiedItemIds[slotIndex];
+        state.Processor.InstalledUpgradeQualifiedItemIds.RemoveAt(slotIndex);
+        this.repository.Save();
+        var returned = ItemRegistry.Create(qualifiedItemId, 1);
+        return new SvsapmeMachineActionApplyResult(
+            true,
+            false,
+            ModText.Get(
+                "hud.processor.upgrade.removed",
+                "Processor upgrade removed: {{item}}.",
+                new { item = returned.DisplayName }))
+        {
+            ReturnedItems = new List<BufferedItemStack> { BufferedItemCodec.FromItem(returned) }
+        };
+    }
+
     internal SvsapmeMachineActionApplyResult TryBufferHeldProcessorInput(
         SObject placedObject,
         GameLocation location,
@@ -340,7 +471,7 @@ internal sealed class SingleBlockProcessorService
         var tier = SingleBlockProcessorRules.GetTier(placedObject.QualifiedItemId);
         SingleBlockProcessorRules.NormalizeSlots(state.Processor, tier);
         var bufferedCount = Math.Max(1, held.Stack);
-        AddBufferedInput(state.Processor.InputBuffer, held);
+        AddBufferedItem(state.Processor.InputBuffer, held);
         ConsumeHeldItem(player, bufferedCount);
         var filled = this.FillEmptyProcessorSlotsFromBuffer(state.Processor, kind);
         this.repository.Save();
@@ -371,6 +502,17 @@ internal sealed class SingleBlockProcessorService
                 ? ModText.Get("ui.processor.energy.keg", "Energy: {{wh}} Wh/slot/hour while processing", new { wh = tier.KegWhPerSlotPerHour.ToString("N0") })
                 : ModText.Get("ui.processor.energy.cask", "Energy: {{wh}} Wh/slot/day while aging", new { wh = tier.CaskWhPerSlotPerDay.ToString("N0") })
         };
+
+        lines.Add(ModText.Get(
+            "ui.processor.upgrade.status",
+            "Upgrades: {{used}}/{{capacity}}, speed {{percent}}%, completed-output buffer {{buffer}} items",
+            new
+            {
+                used = ProcessorUpgradeRules.GetInstalledUpgradeItems(state.Processor).Count.ToString("N0"),
+                capacity = ProcessorUpgradeRules.GetSlotCapacity(tier).ToString("N0"),
+                percent = (ProcessorUpgradeRules.GetSpeedPermille(state.Processor) / 10).ToString("N0"),
+                buffer = ProcessorUpgradeRules.GetOutputBufferCapacityItems(state.Processor, tier).ToString("N0")
+            }));
 
         if (state.Processor.InputBuffer.Count > 0)
             lines.Add(ModText.Get("ui.processor.inputBuffer", "Input buffer: {{items}}", new { items = FormatBufferedItems(state.Processor.InputBuffer) }));
@@ -421,7 +563,7 @@ internal sealed class SingleBlockProcessorService
         return new(true, false, message);
     }
 
-    private static decimal EstimateProcessorDailyValue(SingleBlockProcessorMachineState processor)
+    private static decimal EstimateProcessorDailyValue(SingleBlockProcessorMachineState processor, int speedPermille)
     {
         decimal value = 0;
         foreach (var slot in processor.Slots)
@@ -437,7 +579,7 @@ internal sealed class SingleBlockProcessorService
                 var dailyFactor = slot.TotalDays > 0
                     ? 1m / Math.Max(1, total)
                     : 1200m / Math.Max(1, total);
-                value += salePrice * Math.Max(0.01m, dailyFactor);
+                value += salePrice * Math.Max(0.01m, dailyFactor) * Math.Max(1m, speedPermille / 1000m);
             }
             catch
             {
@@ -508,7 +650,7 @@ internal sealed class SingleBlockProcessorService
 
         var tier = SingleBlockProcessorRules.GetTier(placedObject.QualifiedItemId);
         SingleBlockProcessorRules.NormalizeSlots(state.Processor, tier);
-        AddBufferedInput(state.Processor.InputBuffer, item);
+        AddBufferedItem(state.Processor.InputBuffer, item);
         var filled = this.FillEmptyProcessorSlotsFromBuffer(state.Processor, kind);
         this.repository.Save();
         return new(
@@ -670,6 +812,10 @@ internal sealed class SingleBlockProcessorService
         if (empty is null)
             return new(false, false, ModText.Get("hud.processor.full", "This processor has no empty slot."));
 
+        ProcessorUpgradeRules.ApplyJobModifiers(
+            state.Processor,
+            SingleBlockProcessorRules.GetProcessorKind(placedObject.QualifiedItemId),
+            job);
         AssignSlot(empty, job);
         if (SingleBlockProcessorRules.GetProcessorKind(placedObject.QualifiedItemId) == SingleBlockProcessorKind.Keg)
             SetKegUpdateTime(state.Processor, Game1.timeOfDay);
@@ -782,15 +928,27 @@ internal sealed class SingleBlockProcessorService
         if (active <= 0)
             return false;
 
-        var requiredWh = CalculateRequiredWh(active, tier.KegWhPerSlotPerHour, elapsedMinutes / 60.0);
+        var speedPermille = ProcessorUpgradeRules.GetSpeedPermille(state.Processor);
+        var effectiveMinutes = ProcessorUpgradeRules.CalculateScaledWork(
+            elapsedMinutes,
+            speedPermille,
+            state.Processor.KegSpeedRemainderPermille,
+            out var nextRemainder);
+        var requiredWh = CalculateRequiredWhForWork(
+            state.Processor.Slots
+                .Where(slot => SingleBlockProcessorRules.IsWorking(slot) && slot.RemainingMinutes > 0)
+                .Select(slot => Math.Min(slot.RemainingMinutes, effectiveMinutes)),
+            tier.KegWhPerSlotPerHour,
+            1.0 / 60.0);
         if (requiredWh > 0
             && !this.energy.TryConsumeWh(networkId, requiredWh, ModItemCatalog.UniqueId, BuildMachineEnergyReason(state, "single-block-keg"), allowPartial: false, out _, out _, out _))
         {
             return false;
         }
 
+        state.Processor.KegSpeedRemainderPermille = nextRemainder;
         foreach (var slot in state.Processor.Slots)
-            SingleBlockProcessorRules.AdvanceKegSlot(slot, elapsedMinutes);
+            SingleBlockProcessorRules.AdvanceKegSlot(slot, effectiveMinutes);
 
         return true;
     }
@@ -803,15 +961,27 @@ internal sealed class SingleBlockProcessorService
         if (active <= 0)
             return false;
 
-        var requiredWh = CalculateRequiredWh(active, tier.CaskWhPerSlotPerDay, 1.0);
+        var speedPermille = ProcessorUpgradeRules.GetSpeedPermille(state.Processor);
+        var effectiveDays = ProcessorUpgradeRules.CalculateScaledWork(
+            1,
+            speedPermille,
+            state.Processor.CaskSpeedRemainderPermille,
+            out var nextRemainder);
+        var requiredWh = CalculateRequiredWhForWork(
+            state.Processor.Slots
+                .Where(slot => SingleBlockProcessorRules.IsWorking(slot) && slot.RemainingDays > 0)
+                .Select(slot => Math.Min(slot.RemainingDays, effectiveDays)),
+            tier.CaskWhPerSlotPerDay,
+            1.0);
         if (requiredWh > 0
             && !this.energy.TryConsumeWh(networkId, requiredWh, ModItemCatalog.UniqueId, BuildMachineEnergyReason(state, "single-block-cask"), allowPartial: false, out _, out _, out _))
         {
             return false;
         }
 
+        state.Processor.CaskSpeedRemainderPermille = nextRemainder;
         foreach (var slot in state.Processor.Slots)
-            SingleBlockProcessorRules.AdvanceCaskSlot(slot, 1);
+            SingleBlockProcessorRules.AdvanceCaskSlot(slot, effectiveDays);
 
         return true;
     }
@@ -824,7 +994,7 @@ internal sealed class SingleBlockProcessorService
         var changed = false;
         if (this.getConfig().EnableAutomaticProcessorOutputToNetwork && state.Processor.AutoPushOutputToNetwork)
         {
-            changed |= this.FlushReadyProcessorSlotsToNetwork(api, state, networkId);
+            changed |= this.FlushReadyProcessorSlotsToNetwork(api, state, networkId, tier);
             changed |= this.FlushProcessorOutputBufferToNetwork(api, state, networkId);
         }
 
@@ -838,7 +1008,7 @@ internal sealed class SingleBlockProcessorService
         return changed;
     }
 
-    private bool FlushReadyProcessorSlotsToNetwork(ISvsapApi api, MachineState state, Guid networkId)
+    private bool FlushReadyProcessorSlotsToNetwork(ISvsapApi api, MachineState state, Guid networkId, ProcessorTierInfo tier)
     {
         var changed = false;
         foreach (var slot in state.Processor.Slots)
@@ -847,17 +1017,18 @@ internal sealed class SingleBlockProcessorService
                 continue;
 
             var item = BufferedItemCodec.CreateItem(slot.Output);
-            if (!api.TryInsertItem(networkId, item, out var remainder, out _, out _))
-                continue;
-
-            changed = true;
-            if (remainder is null || remainder.Stack <= 0)
+            var inserted = api.TryInsertItem(networkId, item, out var remainder, out _, out _);
+            if (inserted && (remainder is null || remainder.Stack <= 0))
             {
+                changed = true;
                 SingleBlockProcessorRules.ClearSlot(slot);
                 continue;
             }
 
-            slot.Output = BufferedItemCodec.FromItem(remainder);
+            var uninserted = remainder ?? item;
+            slot.Output = BufferedItemCodec.FromItem(uninserted);
+            changed |= inserted;
+            changed |= TryBufferCompletedSlotOutput(state.Processor, slot, tier);
         }
 
         return changed;
@@ -939,6 +1110,8 @@ internal sealed class SingleBlockProcessorService
             if (!SingleBlockProcessorRules.TryCreateJob(kind, item, out job, out _))
                 continue;
 
+            ProcessorUpgradeRules.ApplyJobModifiers(processor, kind, job);
+
             processor.InputBuffer[i].Stack -= Math.Max(1, job.InputCount);
             if (processor.InputBuffer[i].Stack <= 0)
                 processor.InputBuffer.RemoveAt(i);
@@ -964,7 +1137,8 @@ internal sealed class SingleBlockProcessorService
                     item => this.IsEligibleAutomatedProcessorInput(state.Processor, kind, item),
                     item => GetProcessorInputCount(kind, item),
                     highQualityFirst: false,
-                    preserveGoldIridium: kind == SingleBlockProcessorKind.Keg,
+                    preserveGoldIridium: kind == SingleBlockProcessorKind.Keg
+                        && !ProcessorUpgradeRules.PreservesKegInputQuality(state.Processor),
                     out var extracted,
                     out _,
                     out _)
@@ -979,13 +1153,14 @@ internal sealed class SingleBlockProcessorService
                 if (!api.TryInsertItem(networkId, extracted, out var remainder, out _, out _)
                     || remainder is not null && remainder.Stack > 0)
                 {
-                    AddBufferedInput(state.Processor.InputBuffer, remainder ?? extracted);
+                    AddBufferedItem(state.Processor.InputBuffer, remainder ?? extracted);
                     changed = true;
                 }
 
                 break;
             }
 
+            ProcessorUpgradeRules.ApplyJobModifiers(state.Processor, kind, job);
             AssignSlot(empty, job);
             if (kind == SingleBlockProcessorKind.Keg)
                 SetKegUpdateTime(state.Processor, Game1.timeOfDay);
@@ -999,15 +1174,24 @@ internal sealed class SingleBlockProcessorService
     private bool IsEligibleAutomatedProcessorInput(SingleBlockProcessorMachineState processor, SingleBlockProcessorKind kind, Item item)
     {
         return MatchesProcessorFilter(processor, item)
-            && SingleBlockProcessorRules.TryCreateJob(kind, item, out var job, out _)
-            && item.Stack >= job.InputCount;
+            && TryCreateAutomatedInputJob(kind, item, out _);
     }
 
-    private static int GetProcessorInputCount(SingleBlockProcessorKind kind, Item item)
+    internal static int GetProcessorInputCount(SingleBlockProcessorKind kind, Item item)
     {
-        return SingleBlockProcessorRules.TryCreateJob(kind, item, out var job, out _)
+        return TryCreateAutomatedInputJob(kind, item, out var job)
             ? Math.Max(1, job.InputCount)
             : 0;
+    }
+
+    internal static bool TryCreateAutomatedInputJob(
+        SingleBlockProcessorKind kind,
+        Item item,
+        out SingleBlockProcessorSlotState job)
+    {
+        var probe = item.getOne();
+        probe.Stack = 999;
+        return SingleBlockProcessorRules.TryCreateJob(kind, probe, out job, out _);
     }
 
     private static bool MatchesProcessorFilter(SingleBlockProcessorMachineState processor, Item item)
@@ -1029,7 +1213,7 @@ internal sealed class SingleBlockProcessorService
         return SingleBlockProcessorRules.TryCreateJob(kind, probe, out _, out message);
     }
 
-    private static void AddBufferedInput(IList<BufferedItemStack> buffer, Item item)
+    private static void AddBufferedItem(IList<BufferedItemStack> buffer, Item item)
     {
         var toAdd = item.getOne();
         toAdd.Stack = Math.Max(1, item.Stack);
@@ -1044,6 +1228,40 @@ internal sealed class SingleBlockProcessorService
         }
 
         buffer.Add(BufferedItemCodec.FromItem(toAdd));
+    }
+
+    private static bool TryBufferCompletedSlotOutput(
+        SingleBlockProcessorMachineState processor,
+        SingleBlockProcessorSlotState slot,
+        ProcessorTierInfo tier)
+    {
+        if (!SingleBlockProcessorRules.IsReady(slot) || slot.Output is null)
+            return false;
+
+        var capacity = ProcessorUpgradeRules.GetOutputBufferCapacityItems(processor, tier);
+        var available = capacity - CountBufferedItems(processor.OutputBuffer);
+        if (available <= 0)
+            return false;
+
+        var output = BufferedItemCodec.CreateItem(slot.Output);
+        var moved = Math.Min(Math.Max(0, output.Stack), available);
+        if (moved <= 0)
+            return false;
+
+        var buffered = output.getOne();
+        buffered.Stack = moved;
+        AddBufferedItem(processor.OutputBuffer, buffered);
+        if (moved >= output.Stack)
+        {
+            SingleBlockProcessorRules.ClearSlot(slot);
+        }
+        else
+        {
+            output.Stack -= moved;
+            slot.Output = BufferedItemCodec.FromItem(output);
+        }
+
+        return true;
     }
 
     private int CollectSlot(SingleBlockProcessorSlotState slot, Farmer recipient, bool includeWorkingCask)
@@ -1074,10 +1292,13 @@ internal sealed class SingleBlockProcessorService
         SingleBlockProcessorRules.ClearSlot(slot);
     }
 
-    private long CalculateRequiredWh(int activeSlots, long whPerSlot, double units)
+    private long CalculateRequiredWhForWork(IEnumerable<int> workUnits, long whPerUnit, double unitScale)
     {
+        var totalWork = workUnits.Aggregate(0L, (current, units) => current + Math.Max(0, units));
         var multiplier = Math.Max(0.0, this.getConfig().MachineEnergyCostMultiplier);
-        return Math.Max(0, (long)Math.Ceiling(Math.Max(0, activeSlots) * Math.Max(0, whPerSlot) * Math.Max(0.0, units) * multiplier));
+        return Math.Max(
+            0,
+            (long)Math.Ceiling(totalWork * Math.Max(0, whPerUnit) * Math.Max(0.0, unitScale) * multiplier));
     }
 
     private static int GetElapsedMinutes(int oldTime, int newTime)
@@ -1208,6 +1429,12 @@ internal sealed class SingleBlockProcessorService
         return parts.Count == 0 ? ModText.Get("ui.common.empty", "empty") : string.Join(", ", parts);
     }
 
+    private static int CountBufferedItems(IEnumerable<BufferedItemStack> buffer)
+    {
+        var total = buffer.Aggregate(0L, (current, stack) => current + Math.Max(0, stack.Stack));
+        return (int)Math.Min(int.MaxValue, total);
+    }
+
     private static string FormatKind(SingleBlockProcessorKind kind)
     {
         return kind switch
@@ -1262,6 +1489,11 @@ internal readonly record struct ProcessorSlotView(
 
 internal readonly record struct ProcessorDashboardView(
     bool Available,
+    bool NetworkOnline,
+    bool EnergyOnline,
+    long StoredWh,
+    long CapacityWh,
+    long RequiredWhForNextStep,
     bool AutoPullFromNetwork,
     bool AutoPushOutputToNetwork,
     string InputMode,
@@ -1275,4 +1507,8 @@ internal readonly record struct ProcessorDashboardView(
     decimal EstimatedDailyValue,
     BufferedItemStack? InputPreview,
     BufferedItemStack? ReadyPreview,
-    BufferedItemStack? OutputPreview);
+    BufferedItemStack? OutputPreview,
+    IReadOnlyList<string> UpgradeQualifiedItemIds,
+    int UpgradeSlotCapacity,
+    int SpeedPermille,
+    int OutputBufferCapacityItems);

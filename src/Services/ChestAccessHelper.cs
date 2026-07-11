@@ -6,21 +6,59 @@ namespace SVSAPME.Services;
 
 internal static class ChestAccessHelper
 {
+    private static readonly HashSet<Chest> PendingRequests = new(ReferenceEqualityComparer.Instance);
+
+    public static void Reset() => PendingRequests.Clear();
+
     public static bool IsSupportedNetworkChest(Chest chest)
     {
         return chest.SpecialChestType == Chest.SpecialChestTypes.None
             || chest.SpecialChestType.ToString().Contains("Big", StringComparison.OrdinalIgnoreCase);
     }
 
-    public static bool TryAcquireImmediate(Chest chest, out ChestAccessLease lease)
+    public static bool TryRunWithLock(Chest chest, Action action)
     {
-        lease = ChestAccessLease.NoOp;
-
         if (!IsSupportedNetworkChest(chest) || IsOpenInLocalMenu(chest))
             return false;
+        if (PendingRequests.Contains(chest))
+            return true;
 
         var mutex = chest.GetMutex();
-        return !mutex.IsLocked() || mutex.IsLockHeld();
+        if (mutex.IsLockHeld())
+        {
+            action();
+            return true;
+        }
+
+        if (mutex.IsLocked())
+            return false;
+
+        PendingRequests.Add(chest);
+        try
+        {
+            mutex.RequestLock(
+                () =>
+                {
+                    PendingRequests.Remove(chest);
+                    try
+                    {
+                        if (IsSupportedNetworkChest(chest) && !IsOpenInLocalMenu(chest))
+                            action();
+                    }
+                    finally
+                    {
+                        if (mutex.IsLockHeld())
+                            mutex.ReleaseLock();
+                    }
+                },
+                () => PendingRequests.Remove(chest));
+            return true;
+        }
+        catch
+        {
+            PendingRequests.Remove(chest);
+            throw;
+        }
     }
 
     private static bool IsOpenInLocalMenu(Chest chest)
@@ -31,27 +69,5 @@ internal static class ChestAccessHelper
         return ReferenceEquals(menu.context, chest)
             || ReferenceEquals(menu.sourceItem, chest)
             || ReferenceEquals(menu.ItemsToGrabMenu, chest.Items);
-    }
-}
-
-internal sealed class ChestAccessLease : IDisposable
-{
-    public static readonly ChestAccessLease NoOp = new(null);
-
-    private readonly Action? release;
-    private bool released;
-
-    public ChestAccessLease(Action? release)
-    {
-        this.release = release;
-    }
-
-    public void Dispose()
-    {
-        if (this.released)
-            return;
-
-        this.released = true;
-        this.release?.Invoke();
     }
 }

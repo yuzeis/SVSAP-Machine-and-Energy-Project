@@ -1,7 +1,7 @@
 {
   "Name": "SVSAP Machine Energy",
   "Author": "Koizumi",
-  "Version": "1.4.0-alpha.1.2",
+  "Version": "1.4.1-rc1.0",
   "Description": "Energy networks, powered machines, automated farms, single-block kegs, and casks for SVSAP.",
   "UniqueID": "Koizumi.SVSAPME",
   "EntryDll": "SVSAPME.dll",
@@ -10,7 +10,7 @@
   "Dependencies": [
     {
       "UniqueID": "Koizumi.SVSAP",
-      "MinimumVersion": "1.4.0-alpha.1.2",
+      "MinimumVersion": "1.4.1-rc1.0",
       "IsRequired": true
     }
   ],
